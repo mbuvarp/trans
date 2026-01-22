@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use dialoguer::{Completion, Confirm, Input, Select};
+use dialoguer::{Completion, Confirm, FuzzySelect, Input, Select};
 
 use crate::config::TransConfig;
 use crate::error::Result;
@@ -74,34 +74,7 @@ impl Completion for PathCompletion {
 
 pub fn init_config_interactive(root: impl AsRef<Path>) -> Result<()> {
     let root = root.as_ref();
-    let path_completion = PathCompletion::new(root);
-    let language_files_path = loop {
-        let input = Input::<String>::new()
-            .with_prompt("Location of language files (relative to project root)")
-            .default("translations".to_string())
-            .completion_with(&path_completion)
-            .interact_text()?;
-        let candidate = root.join(&input);
-        if candidate.exists() {
-            if candidate.is_dir() {
-                break input;
-            }
-            eprintln!("Path exists but is not a directory: {}", candidate.display());
-            continue;
-        }
-
-        let create = Confirm::new()
-            .with_prompt(format!(
-                "Directory does not exist at {}. Create it?",
-                candidate.display()
-            ))
-            .default(true)
-            .interact()?;
-        if create {
-            fs::create_dir_all(&candidate)?;
-            break input;
-        }
-    };
+    let language_files_path = prompt_language_files_path(root)?;
 
     let available_languages = prompt_language_list("Available languages (comma-separated)")?;
 
@@ -184,6 +157,132 @@ pub fn run_interactive(root: impl AsRef<Path>) -> Result<()> {
         let values = prompt_required_translations(root, &config, &message_id, false)?;
         add_translation(root, &config, &message_id, &values)
     }
+}
+
+fn prompt_language_files_path(root: &Path) -> Result<String> {
+    let path_completion = PathCompletion::new(root);
+    let choices = build_directory_choices(root)?;
+    let mut labels: Vec<String> = Vec::with_capacity(choices.len());
+    let mut values: Vec<Option<String>> = Vec::with_capacity(choices.len());
+    for choice in &choices {
+        labels.push(choice.label.clone());
+        values.push(choice.value.clone());
+    }
+
+    let default_idx = choices
+        .iter()
+        .position(|choice| choice.value.as_deref() == Some("translations"))
+        .unwrap_or(0);
+
+    let selection = FuzzySelect::new()
+        .with_prompt("Select language files directory")
+        .items(&labels)
+        .default(default_idx)
+        .interact()?;
+
+    if let Some(value) = &values[selection] {
+        return Ok(value.clone());
+    }
+
+    loop {
+        let input = Input::<String>::new()
+            .with_prompt("Enter language files directory (relative to project root)")
+            .default("translations".to_string())
+            .completion_with(&path_completion)
+            .interact_text()?;
+        let candidate = root.join(&input);
+        if candidate.exists() {
+            if candidate.is_dir() {
+                return Ok(input);
+            }
+            eprintln!("Path exists but is not a directory: {}", candidate.display());
+            continue;
+        }
+
+        let create = Confirm::new()
+            .with_prompt(format!(
+                "Directory does not exist at {}. Create it?",
+                candidate.display()
+            ))
+            .default(true)
+            .interact()?;
+        if create {
+            fs::create_dir_all(&candidate)?;
+            return Ok(input);
+        }
+    }
+}
+
+struct DirectoryChoice {
+    label: String,
+    value: Option<String>,
+}
+
+fn build_directory_choices(root: &Path) -> Result<Vec<DirectoryChoice>> {
+    let mut choices = Vec::new();
+    choices.push(DirectoryChoice {
+        label: "Project root (.)".to_string(),
+        value: Some(".".to_string()),
+    });
+
+    let mut dirs = collect_directories(root)?;
+    dirs.sort();
+    for dir in dirs {
+        choices.push(DirectoryChoice {
+            label: dir.clone(),
+            value: Some(dir),
+        });
+    }
+
+    choices.push(DirectoryChoice {
+        label: "Create new directory…".to_string(),
+        value: None,
+    });
+
+    Ok(choices)
+}
+
+fn collect_directories(root: &Path) -> Result<Vec<String>> {
+    let mut dirs = Vec::new();
+    let mut stack = vec![PathBuf::new()];
+
+    while let Some(relative) = stack.pop() {
+        let dir_path = root.join(&relative);
+        let entries = match fs::read_dir(&dir_path) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let name = entry.file_name();
+            let name = match name.to_str() {
+                Some(name) => name,
+                None => continue,
+            };
+            if should_skip_dir(name) {
+                continue;
+            }
+
+            let child = relative.join(name);
+            let display = child.to_string_lossy().replace('\\', "/");
+            dirs.push(display.clone());
+            stack.push(child);
+        }
+    }
+
+    Ok(dirs)
+}
+
+fn should_skip_dir(name: &str) -> bool {
+    matches!(name, ".git" | "target" | "node_modules" | "dist" | "build")
 }
 
 fn prompt_language_list(prompt: &str) -> Result<Vec<String>> {
