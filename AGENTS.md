@@ -87,3 +87,7 @@ Use `sam` for all new work in this repo.
 - If reserving files, only do so in `PROG` and clear them on status change: `sam update task <task_id> --reserve-files "path1,path2"`.
 - Update status as work progresses (`REVU`, `DONE`) and keep titles/descriptions current.
 - Use `sam show task <task_id>` to verify details and history.
+
+## Tests
+
+I want extensive unit tests with wide coverage. Use the Rust testing framework to write tests for all major functions and modules. Make sure to test edge cases and error handling. You should also write integration tests for the CLI commands, to ensure they work as expected. Before creating apull request, make sure all tests pass and that code coverage is high.
