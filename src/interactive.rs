@@ -76,11 +76,19 @@ pub fn init_config_interactive(root: impl AsRef<Path>) -> Result<()> {
     let root = root.as_ref();
     let language_files_path = prompt_language_files_path(root)?;
 
-    let available_languages = prompt_language_list("Available languages (comma-separated)")?;
+    let default_languages = discover_languages(root, &language_files_path)?;
+    let available_languages = prompt_language_list(
+        "Available languages (comma-separated)",
+        if default_languages.is_empty() {
+            None
+        } else {
+            Some(&default_languages)
+        },
+    )?;
 
     let required_languages = loop {
         let required =
-            prompt_language_list("Required languages (comma-separated)")?;
+            prompt_language_list("Required languages (comma-separated)", None)?;
         let missing: Vec<&String> = required
             .iter()
             .filter(|lang| !available_languages.contains(lang))
@@ -285,9 +293,15 @@ fn should_skip_dir(name: &str) -> bool {
     matches!(name, ".git" | "target" | "node_modules" | "dist" | "build")
 }
 
-fn prompt_language_list(prompt: &str) -> Result<Vec<String>> {
+fn prompt_language_list(prompt: &str, default: Option<&[String]>) -> Result<Vec<String>> {
     loop {
-        let input = Input::<String>::new().with_prompt(prompt).interact_text()?;
+        let mut input_prompt = Input::<String>::new().with_prompt(prompt);
+        if let Some(default) = default {
+            if !default.is_empty() {
+                input_prompt = input_prompt.default(default.join(","));
+            }
+        }
+        let input = input_prompt.interact_text()?;
         let values: Vec<String> = input
             .split(',')
             .map(str::trim)
@@ -300,6 +314,38 @@ fn prompt_language_list(prompt: &str) -> Result<Vec<String>> {
         }
         return Ok(values);
     }
+}
+
+fn discover_languages(root: &Path, relative_path: &str) -> Result<Vec<String>> {
+    let dir = root.join(relative_path);
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut languages = Vec::new();
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(stem) if !stem.is_empty() => stem,
+            _ => continue,
+        };
+        languages.push(stem.to_string());
+    }
+
+    languages.sort();
+    languages.dedup();
+    Ok(languages)
 }
 
 fn prompt_message_id() -> Result<String> {
