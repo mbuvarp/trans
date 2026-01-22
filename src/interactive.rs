@@ -1,6 +1,7 @@
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
-use dialoguer::{Input, Select};
+use dialoguer::{Completion, Confirm, Input, Select};
 
 use crate::config::TransConfig;
 use crate::error::Result;
@@ -9,11 +10,98 @@ use crate::operations::{add_translation, delete_translation, update_translation,
 use crate::translations::load_language_translations;
 use crate::verify::verify_language_files;
 
+struct PathCompletion {
+    root: PathBuf,
+}
+
+impl PathCompletion {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+
+    fn candidate_from_input(&self, input: &str) -> Option<(PathBuf, String, String)> {
+        let input = input.trim();
+        if input.is_empty() {
+            return None;
+        }
+
+        if input.ends_with('/') {
+            let dir = self.root.join(input);
+            return Some((dir, String::new(), input.to_string()));
+        }
+
+        let path = Path::new(input);
+        let prefix = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string();
+        let dir = path.parent().unwrap_or_else(|| Path::new(""));
+        let base = if dir.as_os_str().is_empty() {
+            String::new()
+        } else {
+            format!("{}/", dir.display())
+        };
+
+        Some((self.root.join(dir), prefix, base))
+    }
+}
+
+impl Completion for PathCompletion {
+    fn get(&self, input: &str) -> Option<String> {
+        let (dir, prefix, base) = self.candidate_from_input(input)?;
+        let entries = fs::read_dir(dir).ok()?;
+        let mut matches: Vec<String> = entries
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if !entry.file_type().ok()?.is_dir() {
+                    return None;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(&prefix) {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        matches.sort();
+        matches.first().map(|name| format!("{base}{name}"))
+    }
+}
+
 pub fn init_config_interactive(root: impl AsRef<Path>) -> Result<()> {
-    let language_files_path = Input::<String>::new()
-        .with_prompt("Location of language files (relative to project root)")
-        .default("translations".to_string())
-        .interact_text()?;
+    let root = root.as_ref();
+    let path_completion = PathCompletion::new(root);
+    let language_files_path = loop {
+        let input = Input::<String>::new()
+            .with_prompt("Location of language files (relative to project root)")
+            .default("translations".to_string())
+            .completion_with(&path_completion)
+            .interact_text()?;
+        let candidate = root.join(&input);
+        if candidate.exists() {
+            if candidate.is_dir() {
+                break input;
+            }
+            eprintln!("Path exists but is not a directory: {}", candidate.display());
+            continue;
+        }
+
+        let create = Confirm::new()
+            .with_prompt(format!(
+                "Directory does not exist at {}. Create it?",
+                candidate.display()
+            ))
+            .default(true)
+            .interact()?;
+        if create {
+            fs::create_dir_all(&candidate)?;
+            break input;
+        }
+    };
 
     let available_languages = prompt_language_list("Available languages (comma-separated)")?;
 
