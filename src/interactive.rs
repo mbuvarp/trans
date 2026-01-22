@@ -185,28 +185,31 @@ pub fn run_interactive(root: impl AsRef<Path>) -> Result<()> {
 fn prompt_language_files_path(root: &Path) -> Result<String> {
     let path_completion = PathCompletion::new(root);
     let choices = build_directory_choices(root)?;
-    let mut labels: Vec<String> = Vec::with_capacity(choices.len());
-    let mut values: Vec<Option<String>> = Vec::with_capacity(choices.len());
-    for choice in &choices {
-        labels.push(choice.label.clone());
-        values.push(choice.value.clone());
-    }
-
-    let default_idx = choices
-        .iter()
-        .position(|choice| choice.value.as_deref() == Some("translations"))
-        .unwrap_or(0);
-
     print_label("Location of language files (relative to project root)");
-    let selection = FuzzySelect::new()
-        .with_prompt(">")
-        .items(&labels)
-        .default(default_idx)
-        .interact()?;
-    print_spacer();
 
-    if let Some(value) = &values[selection] {
-        return Ok(value.clone());
+    if choices.len() < 7 {
+        let mut labels: Vec<String> = Vec::with_capacity(choices.len());
+        let mut values: Vec<Option<String>> = Vec::with_capacity(choices.len());
+        for choice in &choices {
+            labels.push(choice.label.clone());
+            values.push(choice.value.clone());
+        }
+
+        let default_idx = choices
+            .iter()
+            .position(|choice| choice.value.as_deref() == Some("translations"))
+            .unwrap_or(0);
+
+        let selection = FuzzySelect::new()
+            .with_prompt(">")
+            .items(&labels)
+            .default(default_idx)
+            .interact()?;
+        print_spacer();
+
+        if let Some(value) = &values[selection] {
+            return Ok(value.clone());
+        }
     }
 
     loop {
