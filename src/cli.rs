@@ -8,6 +8,7 @@ use crate::operations::TranslationValues;
 #[derive(Parser, Debug)]
 #[command(name = "trans")]
 #[command(about = "Translation utility for react-intl JSON files")]
+#[command(long_about = "Translation utility for react-intl JSON files.\n\nRun without a subcommand to enter interactive mode, or use a subcommand for scripted usage.")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -15,34 +16,56 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    #[command(about = "Create a .trans.config.json via interactive prompts")]
     Init,
+    #[command(about = "List required languages from the config")]
     ListRequiredLanguages,
+    #[command(about = "Add a new translation id with required language values")]
     Add {
-        #[arg(long)]
+        #[arg(long, value_name = "MESSAGE_ID", help = "Message id with namespace, e.g. app.header.title")]
         id: String,
-        #[arg(long)]
+        #[arg(
+            long,
+            value_name = "LANG:VALUE,...",
+            help = "Comma-separated translations, e.g. en:Hello,nb:Hei"
+        )]
         values: String,
     },
+    #[command(about = "Update an existing translation id")]
     Update {
-        #[arg(long)]
+        #[arg(long, value_name = "MESSAGE_ID", help = "Message id with namespace, e.g. app.header.title")]
         id: String,
-        #[arg(long)]
+        #[arg(
+            long,
+            value_name = "LANG:VALUE,...",
+            help = "Comma-separated translations, e.g. en:Hello,nb:Hei"
+        )]
         values: String,
     },
+    #[command(about = "Delete a translation id from all languages")]
     Delete {
-        #[arg(long)]
+        #[arg(long, value_name = "MESSAGE_ID", help = "Message id with namespace to delete")]
         id: String,
     },
+    #[command(about = "Show translations for a message id")]
     Show {
-        #[arg(long)]
+        #[arg(long, value_name = "MESSAGE_ID", help = "Message id with namespace to display")]
         id: String,
-        #[arg(long)]
+        #[arg(long, value_name = "LANG", help = "Optional language code to show a single translation")]
         lang: Option<String>,
     },
+    #[command(about = "Export translations to CSV or Excel")]
     Export {
-        #[arg(long, value_enum, default_value = "csv")]
+        #[arg(
+            long,
+            value_enum,
+            default_value = "csv",
+            value_name = "FORMAT",
+            help = "Export format: csv or excel"
+        )]
         format: ExportFormat,
     },
+    #[command(about = "Verify that all language files contain the same message ids")]
     Verify,
 }
 
