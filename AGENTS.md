@@ -73,7 +73,7 @@ Written in Rust.
 
 You should use git for version control. You are always allowed to use read-only commands, like `git log`, `git show`, `git status` and `git diff`. Before starting a new major feature, create a new branch with a descriptive name. You can do `git add` and `git commit` on these branches as you see fit. When you have completed a feature, create a pull request to merge your branch into `main`. Make sure to write a descriptive title and description for the pull request. After the pull request has been reviewed and approved, you can merge it into `main`. You can use the `gh` CLI tool to create pull requests.
 
-Do not push directly to the `main` branch. Do not use destructive commands like `git reset --hard` or `git rebase` on the `main` branch.
+Before making any commits, create and switch to a new feature branch (do not commit on `main`). Do not push directly to the `main` branch. Do not use destructive commands like `git reset --hard` or `git rebase` on the `main` branch.
 
 For commit messages, use the convetional commits format detailed here: https://gist.github.com/joshbuchea/6f47e86d2510bce28f8e7f42ae84c716. Be sure to mark commits created by you with "Created by codex" in the commit message body.
 
