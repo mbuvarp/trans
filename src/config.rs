@@ -14,6 +14,7 @@ fn default_untranslated_value() -> String {
 const CONFIG_FILE_NAME: &str = ".trans.config.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TransConfig {
     pub language_files_path: PathBuf,
     pub available_languages: Vec<String>,
@@ -138,10 +139,10 @@ mod tests {
     fn defaults_missing_untranslated_value() {
         let json = r#"
         {
-            "language_files_path": "translations",
-            "available_languages": ["en"],
-            "required_languages": ["en"],
-            "primary_language": "en"
+            "languageFilesPath": "translations",
+            "availableLanguages": ["en"],
+            "requiredLanguages": ["en"],
+            "primaryLanguage": "en"
         }
         "#;
         let config: TransConfig = serde_json::from_str(json).expect("valid json");
