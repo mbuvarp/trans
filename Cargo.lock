@@ -653,6 +653,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "clap",
+ "console",
  "csv",
  "dialoguer",
  "predicates",

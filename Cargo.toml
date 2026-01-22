@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.54", features = ["derive"] }
+console = "0.16.2"
 csv = "1.4.0"
 dialoguer = { version = "0.12.0", features = ["completion", "fuzzy-select"] }
 serde = { version = "1.0.228", features = ["derive"] }

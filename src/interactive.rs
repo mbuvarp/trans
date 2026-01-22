@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use console::style;
 use dialoguer::{Completion, Confirm, FuzzySelect, Input, Select};
 
 use crate::config::TransConfig;
@@ -77,18 +78,23 @@ pub fn init_config_interactive(root: impl AsRef<Path>) -> Result<()> {
     let language_files_path = prompt_language_files_path(root)?;
 
     let default_languages = discover_languages(root, &language_files_path)?;
+    print_label("Available languages (comma-separated)");
     let available_languages = prompt_language_list(
-        "Available languages (comma-separated)",
         if default_languages.is_empty() {
             None
         } else {
             Some(&default_languages)
         },
     )?;
+    print_spacer();
 
     let required_languages = loop {
-        let required =
-            prompt_language_list("Required languages (comma-separated)", None)?;
+        print_label("Required languages (comma-separated)");
+        print_description(
+            "These are the languages required to be input each time a new translation is added.",
+        );
+        let required = prompt_language_list(None)?;
+        print_spacer();
         let missing: Vec<&String> = required
             .iter()
             .filter(|lang| !available_languages.contains(lang))
@@ -107,21 +113,25 @@ pub fn init_config_interactive(root: impl AsRef<Path>) -> Result<()> {
     };
 
     let primary_language = loop {
+        print_label("Primary language");
         let primary = Input::<String>::new()
-            .with_prompt("Primary language")
+            .with_prompt(">")
             .default(available_languages[0].clone())
             .interact_text()?;
+        print_spacer();
         if available_languages.contains(&primary) {
             break primary;
         }
         eprintln!("Primary language must be in available languages.");
     };
 
+    print_label("Default value for untranslated strings");
     let default_untranslated_value = Input::<String>::new()
-        .with_prompt("Default value for untranslated strings")
+        .with_prompt(">")
         .default("".to_string())
         .allow_empty(true)
         .interact_text()?;
+    print_spacer();
 
     let config = TransConfig {
         language_files_path: language_files_path.into(),
@@ -147,12 +157,17 @@ pub fn run_interactive(root: impl AsRef<Path>) -> Result<()> {
     let existing_primary = primary_translations.get(&message_id).cloned();
 
     if let Some(existing) = existing_primary {
-        println!("Existing translation ({}) = {}", config.primary_language, existing);
+        print_label(&format!(
+            "Existing translation ({})",
+            config.primary_language
+        ));
+        println!("{existing}");
         let selection = Select::new()
-            .with_prompt("Update or delete?")
+            .with_prompt(">")
             .items(&["Update", "Delete", "Cancel"])
             .default(0)
             .interact()?;
+        print_spacer();
         match selection {
             0 => {
                 let values = prompt_required_translations(root, &config, &message_id, true)?;
@@ -182,11 +197,13 @@ fn prompt_language_files_path(root: &Path) -> Result<String> {
         .position(|choice| choice.value.as_deref() == Some("translations"))
         .unwrap_or(0);
 
+    print_label("Location of language files (relative to project root)");
     let selection = FuzzySelect::new()
-        .with_prompt("Select language files directory")
+        .with_prompt(">")
         .items(&labels)
         .default(default_idx)
         .interact()?;
+    print_spacer();
 
     if let Some(value) = &values[selection] {
         return Ok(value.clone());
@@ -194,7 +211,7 @@ fn prompt_language_files_path(root: &Path) -> Result<String> {
 
     loop {
         let input = Input::<String>::new()
-            .with_prompt("Enter language files directory (relative to project root)")
+            .with_prompt(">")
             .default("translations".to_string())
             .completion_with(&path_completion)
             .interact_text()?;
@@ -207,13 +224,15 @@ fn prompt_language_files_path(root: &Path) -> Result<String> {
             continue;
         }
 
+        print_label(&format!(
+            "Directory does not exist at {}",
+            candidate.display()
+        ));
         let create = Confirm::new()
-            .with_prompt(format!(
-                "Directory does not exist at {}. Create it?",
-                candidate.display()
-            ))
+            .with_prompt("Create it? (y/n)")
             .default(true)
             .interact()?;
+        print_spacer();
         if create {
             fs::create_dir_all(&candidate)?;
             return Ok(input);
@@ -293,9 +312,9 @@ fn should_skip_dir(name: &str) -> bool {
     matches!(name, ".git" | "target" | "node_modules" | "dist" | "build")
 }
 
-fn prompt_language_list(prompt: &str, default: Option<&[String]>) -> Result<Vec<String>> {
+fn prompt_language_list(default: Option<&[String]>) -> Result<Vec<String>> {
     loop {
-        let mut input_prompt = Input::<String>::new().with_prompt(prompt);
+        let mut input_prompt = Input::<String>::new().with_prompt(">");
         if let Some(default) = default {
             if !default.is_empty() {
                 input_prompt = input_prompt.default(default.join(","));
@@ -350,9 +369,9 @@ fn discover_languages(root: &Path, relative_path: &str) -> Result<Vec<String>> {
 
 fn prompt_message_id() -> Result<String> {
     loop {
-        let input = Input::<String>::new()
-            .with_prompt("Message ID (must include a namespace, e.g. app.header)")
-            .interact_text()?;
+        print_label("Message ID (must include a namespace, e.g. app.header)");
+        let input = Input::<String>::new().with_prompt(">").interact_text()?;
+        print_spacer();
         if let Err(err) = validate_message_id(&input) {
             eprintln!("{err}");
             continue;
@@ -377,14 +396,27 @@ fn prompt_required_translations(
             None
         };
 
-        let mut input = Input::<String>::new();
-        input = input.with_prompt(format!("Translation for {language}"));
+        print_label(&format!("Translation for {language}"));
+        let mut input = Input::<String>::new().with_prompt(">");
         if let Some(default) = default_value {
             input = input.default(default);
         }
         let translation = input.allow_empty(true).interact_text()?;
+        print_spacer();
         values.insert(language.clone(), translation);
     }
 
     Ok(values)
+}
+
+fn print_label(text: &str) {
+    println!("{}", style(text).bold());
+}
+
+fn print_description(text: &str) {
+    println!("{text}");
+}
+
+fn print_spacer() {
+    println!();
 }
