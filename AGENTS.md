@@ -43,6 +43,25 @@ This will be a translation utility for react-intl translation JSON files. Have a
 
 Written in Rust.
 
+## Git usage
+
+You should use git for version control. You are always allowed to use read-only commands, like `git log`, `git show`, `git status` and `git diff`. Before starting a new major feature, create a new branch with a descriptive name. You can do `git add` and `git commit` on these branches as you see fit. When you have completed a feature, create a pull request to merge your branch into `main`. Make sure to write a descriptive title and description for the pull request. After the pull request has been reviewed and approved, you can merge it into `main`. You can use the `gh` CLI tool to create pull requests.
+
+Before making any commits, create and switch to a new feature branch (do not commit on `main`). Do not push directly to the `main` branch. Do not use destructive commands like `git reset --hard` or `git rebase` on the `main` branch. When creating PRs with `gh`, use `--body-file` (or a heredoc) so newlines render correctly in the description.
+
+For commit messages, use the convetional commits format detailed here: https://gist.github.com/joshbuchea/6f47e86d2510bce28f8e7f42ae84c716. Be sure to mark commits created by you with "Created by codex" in the commit message body.
+
+## Task management workflow
+
+Use `sam` for all new work in this repo.
+
+- Check current project context via `.sam.config.json`, then run `sam list task` before starting new work.
+- Create a task for each new unit of work: `sam create task --title "<title>" --prio <LO|MD|HI|UR> [--description "..."] [--depends "..."] [--epic <epic_id>]`.
+- Move a task to `PROG` before doing code changes: `sam update task <task_id> --status PROG`.
+- If reserving files, only do so in `PROG` and clear them on status change: `sam update task <task_id> --reserve-files "path1,path2"`.
+- Update status as work progresses (`REVU`, `DONE`) and keep titles/descriptions current.
+- Use `sam show task <task_id>` to verify details and history.
+
 ### Commands
 
 - `sam install`: Initialize global config and create the database schema at `~/.config/sam/`.
@@ -68,25 +87,6 @@ Written in Rust.
 - `sam create user`: Create a new user.
 - `sam update user --add-org <org_id> [--user <user_id>]`: Add a user to an organization.
 - `sam update user --remove-org <org_id> [--user <user_id>]`: Remove a user from an organization.
-
-## Git usage
-
-You should use git for version control. You are always allowed to use read-only commands, like `git log`, `git show`, `git status` and `git diff`. Before starting a new major feature, create a new branch with a descriptive name. You can do `git add` and `git commit` on these branches as you see fit. When you have completed a feature, create a pull request to merge your branch into `main`. Make sure to write a descriptive title and description for the pull request. After the pull request has been reviewed and approved, you can merge it into `main`. You can use the `gh` CLI tool to create pull requests.
-
-Before making any commits, create and switch to a new feature branch (do not commit on `main`). Do not push directly to the `main` branch. Do not use destructive commands like `git reset --hard` or `git rebase` on the `main` branch.
-
-For commit messages, use the convetional commits format detailed here: https://gist.github.com/joshbuchea/6f47e86d2510bce28f8e7f42ae84c716. Be sure to mark commits created by you with "Created by codex" in the commit message body.
-
-## Task management workflow
-
-Use `sam` for all new work in this repo.
-
-- Check current project context via `.sam.config.json`, then run `sam list task` before starting new work.
-- Create a task for each new unit of work: `sam create task --title "<title>" --prio <LO|MD|HI|UR> [--description "..."] [--depends "..."] [--epic <epic_id>]`.
-- Move a task to `PROG` before doing code changes: `sam update task <task_id> --status PROG`.
-- If reserving files, only do so in `PROG` and clear them on status change: `sam update task <task_id> --reserve-files "path1,path2"`.
-- Update status as work progresses (`REVU`, `DONE`) and keep titles/descriptions current.
-- Use `sam show task <task_id>` to verify details and history.
 
 ## Tests
 

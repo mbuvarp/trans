@@ -59,6 +59,13 @@ pub enum Command {
         #[arg(long, value_name = "LANG", help = "Optional language code to show a single translation")]
         lang: Option<String>,
     },
+    #[command(about = "Rename a message id across all languages")]
+    ChangeId {
+        #[arg(long, value_name = "OLD_ID", help = "Existing message id to rename")]
+        old_id: String,
+        #[arg(long, value_name = "NEW_ID", help = "New message id to replace it with")]
+        new_id: String,
+    },
     #[command(about = "Export translations to CSV or Excel")]
     Export {
         #[arg(

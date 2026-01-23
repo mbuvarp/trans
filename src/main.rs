@@ -8,7 +8,7 @@ use trans::config::TransConfig;
 use trans::error::Result;
 use trans::export::{export_csv, export_excel};
 use trans::interactive::{init_config_interactive, run_interactive};
-use trans::operations::{add_translation, delete_translation, update_translation};
+use trans::operations::{add_translation, change_message_id, delete_translation, update_translation};
 use trans::query::{get_translation, get_translations_all, list_required_languages};
 use trans::verify::verify_language_files;
 
@@ -84,6 +84,11 @@ fn run() -> Result<()> {
                 }
             }
             Ok(())
+        }
+        Some(Command::ChangeId { old_id, new_id }) => {
+            let root = env::current_dir()?;
+            let config = TransConfig::load_from_root(&root)?;
+            change_message_id(&root, &config, &old_id, &new_id)
         }
         Some(Command::Verify) => {
             let root = env::current_dir()?;
