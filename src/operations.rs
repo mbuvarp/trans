@@ -126,6 +126,56 @@ pub fn delete_translation(
     persist_with_rollback(&root, config, &snapshot, &updated)
 }
 
+pub fn change_message_id(
+    root: impl AsRef<Path>,
+    config: &TransConfig,
+    old_id: &str,
+    new_id: &str,
+) -> Result<()> {
+    validate_message_id(old_id)?;
+    validate_message_id(new_id)?;
+    if old_id == new_id {
+        return Err(TransError::InvalidInput(
+            "old and new message ids must differ".to_string(),
+        ));
+    }
+
+    verify_language_files(&root, config)?;
+
+    let snapshot = snapshot_translations(&root, config)?;
+    let mut updated = snapshot.clone();
+
+    let primary = updated
+        .get(&config.primary_language)
+        .ok_or_else(|| {
+            TransError::InvalidInput(format!(
+                "missing primary language '{}' in snapshot",
+                config.primary_language
+            ))
+        })?;
+    if !primary.contains_key(old_id) {
+        return Err(TransError::InvalidInput(format!(
+            "message id '{old_id}' does not exist"
+        )));
+    }
+    if primary.contains_key(new_id) {
+        return Err(TransError::InvalidInput(format!(
+            "message id '{new_id}' already exists"
+        )));
+    }
+
+    for language in &config.available_languages {
+        let entry = updated
+            .get_mut(language)
+            .ok_or_else(|| missing_language_in_snapshot(language))?;
+        if let Some(value) = entry.remove(old_id) {
+            entry.insert(new_id.to_string(), value);
+        }
+    }
+
+    persist_with_rollback(&root, config, &snapshot, &updated)
+}
+
 fn validate_values(
     config: &TransConfig,
     values: &TranslationValues,
@@ -294,5 +344,23 @@ mod tests {
 
         assert!(!en.contains_key("app.title"));
         assert!(!nb.contains_key("app.title"));
+    }
+
+    #[test]
+    fn change_message_id_renames_key() {
+        let dir = tempdir().expect("tempdir");
+        let config = base_config();
+        let root = dir.path();
+        setup_files(root, &config);
+
+        change_message_id(root, &config, "app.title", "app.title.new").expect("change id");
+
+        let en = load_language_translations(root, &config, "en").expect("load en");
+        let nb = load_language_translations(root, &config, "nb").expect("load nb");
+
+        assert!(!en.contains_key("app.title"));
+        assert!(!nb.contains_key("app.title"));
+        assert_eq!(en.get("app.title.new").map(String::as_str), Some("Title"));
+        assert_eq!(nb.get("app.title.new").map(String::as_str), Some("Tittel"));
     }
 }
