@@ -8,8 +8,13 @@ use crate::operations::TranslationValues;
 #[derive(Parser, Debug)]
 #[command(name = "trans")]
 #[command(about = "Translation utility for react-intl JSON files")]
-#[command(long_about = "Translation utility for react-intl JSON files.\n\nRun without a subcommand to enter interactive mode, or use a subcommand for scripted usage.")]
+#[command(long_about = "Translation utility for react-intl JSON files.\n\nRun without a subcommand to enter interactive mode, or pass a MESSAGE_ID to use the interactive add/edit flow for that id.")]
 pub struct Cli {
+    #[arg(
+        value_name = "MESSAGE_ID",
+        help = "Optional message id (e.g. app.header.title) to use in interactive mode"
+    )]
+    pub message_id: Option<String>,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -115,4 +120,16 @@ pub fn parse_values(input: &str) -> Result<TranslationValues> {
     }
 
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_message_id_positional() {
+        let cli = Cli::try_parse_from(["trans", "app.header.title"]).expect("parse");
+        assert_eq!(cli.message_id.as_deref(), Some("app.header.title"));
+        assert!(cli.command.is_none());
+    }
 }

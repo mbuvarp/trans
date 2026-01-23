@@ -24,7 +24,7 @@ fn run() -> Result<()> {
     match cli.command {
         None => {
             let root = env::current_dir()?;
-            run_interactive(&root)
+            run_interactive(&root, cli.message_id)
         }
         Some(Command::Init) => {
             let root = env::current_dir()?;
