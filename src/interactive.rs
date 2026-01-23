@@ -147,12 +147,18 @@ pub fn init_config_interactive(root: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
-pub fn run_interactive(root: impl AsRef<Path>) -> Result<()> {
+pub fn run_interactive(root: impl AsRef<Path>, message_id: Option<String>) -> Result<()> {
     let root = root.as_ref();
     let config = TransConfig::load_from_root(root)?;
     verify_language_files(root, &config)?;
 
-    let message_id = prompt_message_id()?;
+    let message_id = match message_id {
+        Some(candidate) => {
+            validate_message_id(&candidate)?;
+            candidate
+        }
+        None => prompt_message_id()?,
+    };
     let primary_translations = load_language_translations(root, &config, &config.primary_language)?;
     let existing_primary = primary_translations.get(&message_id).cloned();
 
