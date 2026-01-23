@@ -61,9 +61,9 @@ pub enum Command {
     },
     #[command(about = "Rename a message id across all languages")]
     ChangeId {
-        #[arg(long, value_name = "OLD_ID", help = "Existing message id to rename")]
+        #[arg(value_name = "OLD_ID", help = "Existing message id to rename")]
         old_id: String,
-        #[arg(long, value_name = "NEW_ID", help = "New message id to replace it with")]
+        #[arg(value_name = "NEW_ID", help = "New message id to replace it with")]
         new_id: String,
     },
     #[command(about = "Export translations to CSV or Excel")]
