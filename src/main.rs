@@ -3,11 +3,11 @@ use std::process;
 
 use clap::Parser;
 
-use trans::cli::{parse_values, Cli, Command};
+use trans::cli::{parse_values, Cli, Command, ConfigSection};
 use trans::config::TransConfig;
 use trans::error::Result;
 use trans::export::{export_csv, export_excel};
-use trans::interactive::{init_config_interactive, run_interactive};
+use trans::interactive::{configure_ai_interactive, configure_root_interactive, init_config_interactive, run_interactive};
 use trans::operations::{add_translation, change_message_id, delete_translation, update_translation};
 use trans::query::{get_translation, get_translations_all, list_required_languages};
 use trans::verify::verify_language_files;
@@ -84,6 +84,13 @@ fn run() -> Result<()> {
                 }
             }
             Ok(())
+        }
+        Some(Command::Config { section }) => {
+            let root = env::current_dir()?;
+            match section {
+                Some(ConfigSection::Ai) => configure_ai_interactive(&root),
+                None => configure_root_interactive(&root),
+            }
         }
         Some(Command::ChangeId { old_id, new_id }) => {
             let root = env::current_dir()?;

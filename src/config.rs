@@ -11,6 +11,22 @@ fn default_untranslated_value() -> String {
     String::new()
 }
 
+fn default_ai_enabled() -> bool {
+    true
+}
+
+fn default_ai_model() -> String {
+    "gpt-5-mini".to_string()
+}
+
+fn default_ai_api_key_env() -> String {
+    "OPENAI_API_KEY".to_string()
+}
+
+fn default_ai_max_output_tokens() -> u32 {
+    128
+}
+
 const CONFIG_FILE_NAME: &str = ".trans.config.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +38,32 @@ pub struct TransConfig {
     pub primary_language: String,
     #[serde(default = "default_untranslated_value")]
     pub default_untranslated_value: String,
+    #[serde(default)]
+    pub ai: Option<AiConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiConfig {
+    #[serde(default = "default_ai_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_ai_model")]
+    pub model: String,
+    #[serde(default = "default_ai_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default = "default_ai_max_output_tokens")]
+    pub max_output_tokens: u32,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ai_enabled(),
+            model: default_ai_model(),
+            api_key_env: default_ai_api_key_env(),
+            max_output_tokens: default_ai_max_output_tokens(),
+        }
+    }
 }
 
 impl TransConfig {
@@ -132,6 +174,7 @@ mod tests {
             required_languages: vec!["en".to_string()],
             primary_language: "en".to_string(),
             default_untranslated_value: "".to_string(),
+            ai: None,
         }
     }
 
@@ -147,6 +190,7 @@ mod tests {
         "#;
         let config: TransConfig = serde_json::from_str(json).expect("valid json");
         assert_eq!(config.default_untranslated_value, "");
+        assert!(config.ai.is_none());
     }
 
     #[test]

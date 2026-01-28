@@ -59,6 +59,14 @@ pub enum Command {
         #[arg(long, value_name = "LANG", help = "Optional language code to show a single translation")]
         lang: Option<String>,
     },
+    #[command(
+        about = "Update config values interactively",
+        long_about = "Update config values interactively.\n\nRoot config options:\n- languageFilesPath: location of language files\n- availableLanguages: all known languages\n- requiredLanguages: languages required for input\n- primaryLanguage: first language in interactive mode\n- defaultUntranslatedValue: default for non-required languages\n\nUse `trans config ai` to edit AI settings:\n- enabled\n- model\n- apiKeyEnv\n- maxOutputTokens"
+    )]
+    Config {
+        #[command(subcommand)]
+        section: Option<ConfigSection>,
+    },
     #[command(about = "Rename a message id across all languages")]
     ChangeId {
         #[arg(value_name = "OLD_ID", help = "Existing message id to rename")]
@@ -79,6 +87,12 @@ pub enum Command {
     },
     #[command(about = "Verify that all language files contain the same message ids")]
     Verify,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigSection {
+    #[command(about = "Update AI configuration values interactively")]
+    Ai,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
