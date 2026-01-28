@@ -3,12 +3,16 @@ use std::process;
 
 use clap::Parser;
 
-use trans::cli::{parse_values, Cli, Command, ConfigSection, ConfigFormat};
+use trans::cli::{Cli, Command, ConfigFormat, ConfigSection, parse_values};
 use trans::config::{ConfigFormat as ConfigFileFormat, TransConfig};
 use trans::error::{Result, TransError};
 use trans::export::{export_csv, export_excel};
-use trans::interactive::{configure_ai_interactive, configure_root_interactive, init_config_interactive, run_interactive};
-use trans::operations::{add_translation, change_message_id, delete_translation, update_translation};
+use trans::interactive::{
+    configure_ai_interactive, configure_root_interactive, init_config_interactive, run_interactive,
+};
+use trans::operations::{
+    add_translation, change_message_id, delete_translation, update_translation,
+};
 use trans::query::{get_translation, get_translations_all, list_required_languages};
 use trans::verify::verify_language_files;
 
@@ -26,9 +30,15 @@ fn run() -> Result<()> {
             let root = env::current_dir()?;
             run_interactive(&root, cli.message_id)
         }
-        Some(Command::Init) => {
+        Some(Command::Init { format }) => {
             let root = env::current_dir()?;
-            init_config_interactive(&root)
+            init_config_interactive(
+                &root,
+                match format {
+                    ConfigFormat::Json => ConfigFileFormat::Json,
+                    ConfigFormat::Yaml => ConfigFileFormat::Yaml,
+                },
+            )
         }
         Some(Command::Export { format }) => {
             let root = env::current_dir()?;

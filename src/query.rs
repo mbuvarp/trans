@@ -29,14 +29,11 @@ pub fn get_translation(
     }
 
     let translations = load_language_translations(root, config, language)?;
-    translations
-        .get(message_id)
-        .cloned()
-        .ok_or_else(|| {
-            TransError::InvalidInput(format!(
-                "message id '{message_id}' not found for language '{language}'"
-            ))
-        })
+    translations.get(message_id).cloned().ok_or_else(|| {
+        TransError::InvalidInput(format!(
+            "message id '{message_id}' not found for language '{language}'"
+        ))
+    })
 }
 
 pub fn get_translations_all(

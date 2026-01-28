@@ -5,7 +5,9 @@ use crate::config::TransConfig;
 use crate::error::{Result, TransError};
 use crate::message_id::validate_message_id;
 use crate::translations::save_language_translations;
-use crate::verify::{restore_translations, snapshot_translations, verify_language_files, TranslationSnapshot};
+use crate::verify::{
+    TranslationSnapshot, restore_translations, snapshot_translations, verify_language_files,
+};
 
 pub type TranslationValues = BTreeMap<String, String>;
 
@@ -21,14 +23,12 @@ pub fn add_translation(
     let snapshot = snapshot_translations(&root, config)?;
     let mut updated = snapshot.clone();
 
-    let primary = updated
-        .get(&config.primary_language)
-        .ok_or_else(|| {
-            TransError::InvalidInput(format!(
-                "missing primary language '{}' in snapshot",
-                config.primary_language
-            ))
-        })?;
+    let primary = updated.get(&config.primary_language).ok_or_else(|| {
+        TransError::InvalidInput(format!(
+            "missing primary language '{}' in snapshot",
+            config.primary_language
+        ))
+    })?;
     if primary.contains_key(message_id) {
         return Err(TransError::InvalidInput(format!(
             "message id '{message_id}' already exists"
@@ -63,14 +63,12 @@ pub fn update_translation(
     let snapshot = snapshot_translations(&root, config)?;
     let mut updated = snapshot.clone();
 
-    let primary = updated
-        .get(&config.primary_language)
-        .ok_or_else(|| {
-            TransError::InvalidInput(format!(
-                "missing primary language '{}' in snapshot",
-                config.primary_language
-            ))
-        })?;
+    let primary = updated.get(&config.primary_language).ok_or_else(|| {
+        TransError::InvalidInput(format!(
+            "missing primary language '{}' in snapshot",
+            config.primary_language
+        ))
+    })?;
     if !primary.contains_key(message_id) {
         return Err(TransError::InvalidInput(format!(
             "message id '{message_id}' does not exist"
@@ -102,14 +100,12 @@ pub fn delete_translation(
     let snapshot = snapshot_translations(&root, config)?;
     let mut updated = snapshot.clone();
 
-    let primary = updated
-        .get(&config.primary_language)
-        .ok_or_else(|| {
-            TransError::InvalidInput(format!(
-                "missing primary language '{}' in snapshot",
-                config.primary_language
-            ))
-        })?;
+    let primary = updated.get(&config.primary_language).ok_or_else(|| {
+        TransError::InvalidInput(format!(
+            "missing primary language '{}' in snapshot",
+            config.primary_language
+        ))
+    })?;
     if !primary.contains_key(message_id) {
         return Err(TransError::InvalidInput(format!(
             "message id '{message_id}' does not exist"
@@ -145,14 +141,12 @@ pub fn change_message_id(
     let snapshot = snapshot_translations(&root, config)?;
     let mut updated = snapshot.clone();
 
-    let primary = updated
-        .get(&config.primary_language)
-        .ok_or_else(|| {
-            TransError::InvalidInput(format!(
-                "missing primary language '{}' in snapshot",
-                config.primary_language
-            ))
-        })?;
+    let primary = updated.get(&config.primary_language).ok_or_else(|| {
+        TransError::InvalidInput(format!(
+            "missing primary language '{}' in snapshot",
+            config.primary_language
+        ))
+    })?;
     if !primary.contains_key(old_id) {
         return Err(TransError::InvalidInput(format!(
             "message id '{old_id}' does not exist"
@@ -188,7 +182,11 @@ fn validate_values(
     }
 
     for language in values.keys() {
-        if !config.available_languages.iter().any(|lang| lang == language) {
+        if !config
+            .available_languages
+            .iter()
+            .any(|lang| lang == language)
+        {
             return Err(TransError::InvalidInput(format!(
                 "language '{language}' is not in available_languages"
             )));
@@ -229,11 +227,7 @@ fn persist_with_rollback(
     Ok(())
 }
 
-fn write_snapshot(
-    root: &Path,
-    config: &TransConfig,
-    snapshot: &TranslationSnapshot,
-) -> Result<()> {
+fn write_snapshot(root: &Path, config: &TransConfig, snapshot: &TranslationSnapshot) -> Result<()> {
     for language in &config.available_languages {
         let translations = snapshot
             .get(language)
@@ -244,9 +238,7 @@ fn write_snapshot(
 }
 
 fn missing_language_in_snapshot(language: &str) -> TransError {
-    TransError::InvalidInput(format!(
-        "missing translations for language '{language}'"
-    ))
+    TransError::InvalidInput(format!("missing translations for language '{language}'"))
 }
 
 #[cfg(test)]
@@ -256,7 +248,9 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::config::TransConfig;
-    use crate::translations::{load_language_translations, save_language_translations, Translations};
+    use crate::translations::{
+        Translations, load_language_translations, save_language_translations,
+    };
 
     fn base_config() -> TransConfig {
         TransConfig {
@@ -277,13 +271,8 @@ mod tests {
     }
 
     fn setup_files(root: &Path, config: &TransConfig) {
-        save_language_translations(
-            root,
-            config,
-            "en",
-            &translations(&[("app.title", "Title")]),
-        )
-        .expect("save en");
+        save_language_translations(root, config, "en", &translations(&[("app.title", "Title")]))
+            .expect("save en");
         save_language_translations(
             root,
             config,

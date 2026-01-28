@@ -46,9 +46,7 @@ pub async fn suggest_translation(
         "You are a professional translator. Translate from {source_lang} to {target_lang}. Preserve placeholders like {{name}} and ICU plural/select syntax. Return only the translation text."
     );
 
-    let user_prompt = format!(
-        "Message ID: {message_id}\nSource: {source_text}"
-    );
+    let user_prompt = format!("Message ID: {message_id}\nSource: {source_text}");
 
     let request = ResponsesRequest {
         model: settings.model.clone(),

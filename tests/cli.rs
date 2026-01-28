@@ -6,7 +6,7 @@ use predicates::prelude::*;
 use tempfile::tempdir;
 
 use trans::config::TransConfig;
-use trans::translations::{load_language_translations, save_language_translations, Translations};
+use trans::translations::{Translations, load_language_translations, save_language_translations};
 
 fn base_config() -> TransConfig {
     TransConfig {

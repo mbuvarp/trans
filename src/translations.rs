@@ -8,11 +8,7 @@ use crate::error::{Result, TransError};
 
 pub type Translations = BTreeMap<String, String>;
 
-pub fn language_file_path(
-    root: impl AsRef<Path>,
-    config: &TransConfig,
-    language: &str,
-) -> PathBuf {
+pub fn language_file_path(root: impl AsRef<Path>, config: &TransConfig, language: &str) -> PathBuf {
     root.as_ref()
         .join(&config.language_files_path)
         .join(format!("{language}.json"))
