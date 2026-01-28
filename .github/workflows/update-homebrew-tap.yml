@@ -1,0 +1,73 @@
+name: Update Homebrew tap
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  update-tap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set release metadata
+        run: echo "TAG=${{ github.event.release.tag_name }}" >> "$GITHUB_ENV"
+
+      - name: Compute tarball sha256
+        run: |
+          url="https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz"
+          echo "URL=$url" >> "$GITHUB_ENV"
+          sha="$(curl -sL "$url" | shasum -a 256 | awk '{print $1}')"
+          echo "SHA=$sha" >> "$GITHUB_ENV"
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: mbuvarp/homebrew-trans
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-trans
+
+      - name: Update formula
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          tag = os.environ["TAG"]
+          sha = os.environ["SHA"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          path = pathlib.Path("homebrew-trans/Formula/trans.rb")
+          text = path.read_text(encoding="utf-8")
+          text = re.sub(
+              r'^  url ".*"$',
+              f'  url "https://github.com/{repo}/archive/refs/tags/{tag}.tar.gz"',
+              text,
+              flags=re.M,
+          )
+          text = re.sub(
+              r'^  sha256 ".*"$',
+              f'  sha256 "{sha}"',
+              text,
+              flags=re.M,
+          )
+          path.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Create PR in Homebrew tap
+        uses: peter-evans/create-pull-request@v6
+        with:
+          path: homebrew-trans
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          branch: update-trans-${{ env.TAG }}
+          base: main
+          commit-message: "chore: update trans formula for ${{ env.TAG }}"
+          title: "chore: update trans formula for ${{ env.TAG }}"
+          body: |
+            ## Summary
+            - update Homebrew formula to ${{ env.TAG }}
+            - refresh tarball sha256
+
+            ## Testing
+            - not run (formula update only)
