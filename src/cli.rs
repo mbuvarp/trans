@@ -6,12 +6,19 @@ use crate::error::{Result, TransError};
 use crate::operations::TranslationValues;
 
 #[derive(Parser, Debug)]
-#[command(name = "trans")]
+#[command(name = "trans", version, disable_version_flag = true)]
 #[command(about = "Translation utility for react-intl JSON files")]
 #[command(
     long_about = "Translation utility for react-intl JSON files.\n\nRun without a subcommand to enter interactive mode, or pass a MESSAGE_ID to use the interactive add/edit flow for that id."
 )]
 pub struct Cli {
+    #[arg(
+        short = 'v',
+        long = "version",
+        action = clap::ArgAction::SetTrue,
+        help = "Print version information"
+    )]
+    pub version: bool,
     #[arg(
         value_name = "MESSAGE_ID",
         help = "Optional message id (e.g. app.header.title) to use in interactive mode"

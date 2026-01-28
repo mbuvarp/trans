@@ -25,6 +25,10 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    if cli.version {
+        println!("trans {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     match cli.command {
         None => {
             let root = env::current_dir()?;
