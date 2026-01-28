@@ -1,3 +1,4 @@
 /target
 .env
 .trans.config.json
+.trans.config.yaml

@@ -3,9 +3,9 @@ use std::process;
 
 use clap::Parser;
 
-use trans::cli::{parse_values, Cli, Command, ConfigSection};
-use trans::config::TransConfig;
-use trans::error::Result;
+use trans::cli::{parse_values, Cli, Command, ConfigSection, ConfigFormat};
+use trans::config::{ConfigFormat as ConfigFileFormat, TransConfig};
+use trans::error::{Result, TransError};
 use trans::export::{export_csv, export_excel};
 use trans::interactive::{configure_ai_interactive, configure_root_interactive, init_config_interactive, run_interactive};
 use trans::operations::{add_translation, change_message_id, delete_translation, update_translation};
@@ -85,8 +85,26 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Config { section }) => {
+        Some(Command::Config { section, format }) => {
             let root = env::current_dir()?;
+            if let Some(format) = format {
+                if section.is_some() {
+                    return Err(TransError::InvalidInput(
+                        "--format cannot be used with a config section".to_string(),
+                    ));
+                }
+                let config = TransConfig::load_from_root(&root)?;
+                let target = config.save_to_root_format(
+                    &root,
+                    match format {
+                        ConfigFormat::Json => ConfigFileFormat::Json,
+                        ConfigFormat::Yaml => ConfigFileFormat::Yaml,
+                    },
+                    true,
+                )?;
+                println!("Wrote config to {}", target.display());
+                return Ok(());
+            }
             match section {
                 Some(ConfigSection::Ai) => configure_ai_interactive(&root),
                 None => configure_root_interactive(&root),
