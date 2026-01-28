@@ -69,6 +69,7 @@ pub async fn suggest_translation(
             },
         ],
         max_output_tokens: settings.max_output_tokens,
+        reasoning: reasoning_for_model(&settings.model).map(|effort| ReasoningConfig { effort }),
     };
 
     let response = client
@@ -134,6 +135,13 @@ struct ResponsesRequest {
     model: String,
     input: Vec<ResponseInputItem>,
     max_output_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReasoningConfig {
+    effort: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,6 +190,16 @@ fn extract_text_from_value(body: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn reasoning_for_model(model: &str) -> Option<&'static str> {
+    if model.starts_with("gpt-5.1") {
+        Some("none")
+    } else if model.starts_with("gpt-5") {
+        Some("minimal")
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Deserialize)]
