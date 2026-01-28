@@ -82,6 +82,17 @@ pub async fn suggest_translation(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
+        if let Ok(api_error) = serde_json::from_str::<OpenAiErrorResponse>(&body) {
+            if api_error.error.code.as_deref() == Some("insufficient_quota") {
+                return Err(TransError::InvalidInput(
+                    "AI quota exceeded. Update your OpenAI plan or API key.".to_string(),
+                ));
+            }
+            return Err(TransError::InvalidInput(format!(
+                "AI request failed ({status}): {}",
+                api_error.error.message
+            )));
+        }
         return Err(TransError::InvalidInput(format!(
             "AI request failed ({status}): {body}"
         )));
@@ -143,6 +154,18 @@ struct ResponseOutputItem {
 struct ResponseOutputContent {
     #[serde(default)]
     text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiErrorResponse {
+    error: OpenAiErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiErrorBody {
+    message: String,
+    #[serde(default)]
+    code: Option<String>,
 }
 
 #[cfg(test)]
