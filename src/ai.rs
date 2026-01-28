@@ -11,7 +11,6 @@ use crate::error::{Result, TransError};
 pub struct AiSettings {
     pub model: String,
     pub api_key: String,
-    pub temperature: f32,
     pub max_output_tokens: u32,
 }
 
@@ -30,7 +29,6 @@ pub fn resolve_ai_settings(root: &Path, config: &TransConfig) -> Result<Option<A
     Ok(Some(AiSettings {
         model: ai.model.clone(),
         api_key,
-        temperature: ai.temperature,
         max_output_tokens: ai.max_output_tokens,
     }))
 }
@@ -70,7 +68,6 @@ pub async fn suggest_translation(
                 }],
             },
         ],
-        temperature: settings.temperature,
         max_output_tokens: settings.max_output_tokens,
     };
 
@@ -116,7 +113,6 @@ pub async fn suggest_translation(
 struct ResponsesRequest {
     model: String,
     input: Vec<ResponseInputItem>,
-    temperature: f32,
     max_output_tokens: u32,
 }
 
@@ -167,7 +163,6 @@ mod tests {
                 enabled: true,
                 model: "gpt-5-mini".to_string(),
                 api_key_env: "OPENAI_API_KEY".to_string(),
-                temperature: 0.2,
                 max_output_tokens: 128,
             }),
         }

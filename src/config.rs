@@ -23,10 +23,6 @@ fn default_ai_api_key_env() -> String {
     "OPENAI_API_KEY".to_string()
 }
 
-fn default_ai_temperature() -> f32 {
-    0.2
-}
-
 fn default_ai_max_output_tokens() -> u32 {
     128
 }
@@ -55,8 +51,6 @@ pub struct AiConfig {
     pub model: String,
     #[serde(default = "default_ai_api_key_env")]
     pub api_key_env: String,
-    #[serde(default = "default_ai_temperature")]
-    pub temperature: f32,
     #[serde(default = "default_ai_max_output_tokens")]
     pub max_output_tokens: u32,
 }
@@ -67,7 +61,6 @@ impl Default for AiConfig {
             enabled: default_ai_enabled(),
             model: default_ai_model(),
             api_key_env: default_ai_api_key_env(),
-            temperature: default_ai_temperature(),
             max_output_tokens: default_ai_max_output_tokens(),
         }
     }

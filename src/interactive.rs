@@ -257,13 +257,6 @@ pub fn configure_ai_interactive(root: impl AsRef<Path>) -> Result<()> {
         .interact_text()?;
     print_spacer();
 
-    print_label("Temperature");
-    let temperature = Input::<f32>::new()
-        .with_prompt(">")
-        .default(defaults.temperature)
-        .interact_text()?;
-    print_spacer();
-
     print_label("Max output tokens");
     let max_output_tokens = Input::<u32>::new()
         .with_prompt(">")
@@ -275,7 +268,6 @@ pub fn configure_ai_interactive(root: impl AsRef<Path>) -> Result<()> {
         enabled,
         model,
         api_key_env,
-        temperature,
         max_output_tokens,
     });
 
