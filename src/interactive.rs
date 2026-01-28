@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use console::style;
 use dialoguer::{Completion, Confirm, FuzzySelect, Input, Select};
 
+use crate::ai::{resolve_ai_settings, suggest_translation, AiSettings};
 use crate::config::TransConfig;
 use crate::error::Result;
 use crate::message_id::validate_message_id;
@@ -139,6 +140,7 @@ pub fn init_config_interactive(root: impl AsRef<Path>) -> Result<()> {
         required_languages,
         primary_language,
         default_untranslated_value,
+        ai: None,
     };
 
     config.validate()?;
@@ -151,6 +153,7 @@ pub fn run_interactive(root: impl AsRef<Path>, message_id: Option<String>) -> Re
     let root = root.as_ref();
     let config = TransConfig::load_from_root(root)?;
     verify_language_files(root, &config)?;
+    let ai_settings = resolve_ai_settings(root, &config)?;
 
     let message_id = match message_id {
         Some(candidate) => {
@@ -176,14 +179,14 @@ pub fn run_interactive(root: impl AsRef<Path>, message_id: Option<String>) -> Re
         print_spacer();
         match selection {
             0 => {
-                let values = prompt_required_translations(root, &config, &message_id, true)?;
+                let values = prompt_required_translations(root, &config, &message_id, &ai_settings, true)?;
                 update_translation(root, &config, &message_id, &values)
             }
             1 => delete_translation(root, &config, &message_id),
             _ => Ok(()),
         }
     } else {
-        let values = prompt_required_translations(root, &config, &message_id, false)?;
+        let values = prompt_required_translations(root, &config, &message_id, &ai_settings, false)?;
         add_translation(root, &config, &message_id, &values)
     }
 }
@@ -393,6 +396,7 @@ fn prompt_required_translations(
     root: &Path,
     config: &TransConfig,
     message_id: &str,
+    ai_settings: &Option<AiSettings>,
     use_existing_defaults: bool,
 ) -> Result<TranslationValues> {
     let mut values = TranslationValues::new();
@@ -410,12 +414,89 @@ fn prompt_required_translations(
         if let Some(default) = default_value {
             input = input.default(default);
         }
-        let translation = input.allow_empty(true).interact_text()?;
+        let mut translation = input.allow_empty(true).interact_text()?;
+        if translation.trim() == "/ai" {
+            if language == &config.primary_language {
+                eprintln!("AI mode requires a manual entry for the primary language first.");
+                translation = Input::<String>::new()
+                    .with_prompt(">")
+                    .allow_empty(true)
+                    .interact_text()?;
+            } else {
+                let source_text = values
+                    .get(&config.primary_language)
+                    .cloned()
+                    .unwrap_or_default();
+                if source_text.trim().is_empty() {
+                    eprintln!("Primary language value is required before using /ai.");
+                    translation = Input::<String>::new()
+                        .with_prompt(">")
+                        .allow_empty(true)
+                        .interact_text()?;
+                } else if let Some(settings) = ai_settings {
+                    translation = loop {
+                        match suggest_translation_blocking(
+                            settings,
+                            &config.primary_language,
+                            language,
+                            message_id,
+                            &source_text,
+                        ) {
+                            Ok(suggestion) => {
+                                print_label("AI suggestion");
+                                println!("{suggestion}");
+                                let reviewed = Input::<String>::new()
+                                    .with_prompt(">")
+                                    .allow_empty(true)
+                                    .default(suggestion.clone())
+                                    .interact_text()?;
+                                if reviewed.trim() == "/ai" {
+                                    continue;
+                                }
+                                break reviewed;
+                            }
+                            Err(err) => {
+                                eprintln!("AI error: {err}");
+                                let manual = Input::<String>::new()
+                                    .with_prompt(">")
+                                    .allow_empty(true)
+                                    .interact_text()?;
+                                break manual;
+                            }
+                        }
+                    };
+                } else {
+                    eprintln!("AI is not configured. Enter translation manually.");
+                    translation = Input::<String>::new()
+                        .with_prompt(">")
+                        .allow_empty(true)
+                        .interact_text()?;
+                }
+            }
+        }
         print_spacer();
         values.insert(language.clone(), translation);
     }
 
     Ok(values)
+}
+
+fn suggest_translation_blocking(
+    settings: &AiSettings,
+    source_lang: &str,
+    target_lang: &str,
+    message_id: &str,
+    source_text: &str,
+) -> Result<String> {
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|err| crate::error::TransError::InvalidInput(format!("AI runtime error: {err}")))?;
+    runtime.block_on(suggest_translation(
+        settings,
+        source_lang,
+        target_lang,
+        message_id,
+        source_text,
+    ))
 }
 
 fn print_label(text: &str) {

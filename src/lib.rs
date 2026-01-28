@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod config;
 pub mod cli;
 pub mod error;
