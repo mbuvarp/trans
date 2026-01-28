@@ -5,7 +5,7 @@ use console::style;
 use dialoguer::{Completion, Confirm, FuzzySelect, Input, Select};
 
 use crate::ai::{resolve_ai_settings, suggest_translation, AiSettings};
-use crate::config::TransConfig;
+use crate::config::{AiConfig, TransConfig};
 use crate::error::Result;
 use crate::message_id::validate_message_id;
 use crate::operations::{add_translation, delete_translation, update_translation, TranslationValues};
@@ -149,6 +149,140 @@ pub fn init_config_interactive(root: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
+pub fn configure_root_interactive(root: impl AsRef<Path>) -> Result<()> {
+    let root = root.as_ref();
+    let mut config = TransConfig::load_from_root(root)?;
+
+    let language_files_path = prompt_language_files_path_with_default(
+        root,
+        &config.language_files_path.to_string_lossy(),
+    )?;
+
+    let available_languages = {
+        print_label("Available languages (comma-separated)");
+        let defaults = if config.available_languages.is_empty() {
+            None
+        } else {
+            Some(config.available_languages.as_slice())
+        };
+        let values = prompt_language_list(defaults)?;
+        print_spacer();
+        values
+    };
+
+    let required_languages = loop {
+        print_label("Required languages (comma-separated)");
+        print_description(
+            "These are the languages required to be input each time a new translation is added.",
+        );
+        let defaults = if config.required_languages.is_empty() {
+            None
+        } else {
+            Some(config.required_languages.as_slice())
+        };
+        let required = prompt_language_list(defaults)?;
+        print_spacer();
+        let missing: Vec<&String> = required
+            .iter()
+            .filter(|lang| !available_languages.contains(lang))
+            .collect();
+        if missing.is_empty() {
+            break required;
+        }
+        eprintln!(
+            "Required languages must be in available languages. Missing: {}",
+            missing
+                .into_iter()
+                .map(|lang| lang.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    };
+
+    let primary_language = loop {
+        print_label("Primary language");
+        let primary = Input::<String>::new()
+            .with_prompt(">")
+            .default(config.primary_language.clone())
+            .interact_text()?;
+        print_spacer();
+        if available_languages.contains(&primary) {
+            break primary;
+        }
+        eprintln!("Primary language must be in available languages.");
+    };
+
+    print_label("Default value for untranslated strings");
+    let default_untranslated_value = Input::<String>::new()
+        .with_prompt(">")
+        .default(config.default_untranslated_value.clone())
+        .allow_empty(true)
+        .interact_text()?;
+    print_spacer();
+
+    config.language_files_path = language_files_path.into();
+    config.available_languages = available_languages;
+    config.required_languages = required_languages;
+    config.primary_language = primary_language;
+    config.default_untranslated_value = default_untranslated_value;
+
+    config.validate()?;
+    config.save_to_root(root)?;
+    Ok(())
+}
+
+pub fn configure_ai_interactive(root: impl AsRef<Path>) -> Result<()> {
+    let root = root.as_ref();
+    let mut config = TransConfig::load_from_root(root)?;
+    let defaults = config.ai.clone().unwrap_or_default();
+
+    print_label("AI enabled");
+    let enabled = Confirm::new()
+        .with_prompt(">")
+        .default(defaults.enabled)
+        .interact()?;
+    print_spacer();
+
+    print_label("AI model");
+    let model = Input::<String>::new()
+        .with_prompt(">")
+        .default(defaults.model.clone())
+        .interact_text()?;
+    print_spacer();
+
+    print_label("API key environment variable");
+    let api_key_env = Input::<String>::new()
+        .with_prompt(">")
+        .default(defaults.api_key_env.clone())
+        .interact_text()?;
+    print_spacer();
+
+    print_label("Temperature");
+    let temperature = Input::<f32>::new()
+        .with_prompt(">")
+        .default(defaults.temperature)
+        .interact_text()?;
+    print_spacer();
+
+    print_label("Max output tokens");
+    let max_output_tokens = Input::<u32>::new()
+        .with_prompt(">")
+        .default(defaults.max_output_tokens)
+        .interact_text()?;
+    print_spacer();
+
+    config.ai = Some(AiConfig {
+        enabled,
+        model,
+        api_key_env,
+        temperature,
+        max_output_tokens,
+    });
+
+    config.save_to_root(root)?;
+    Ok(())
+}
+
 pub fn run_interactive(root: impl AsRef<Path>, message_id: Option<String>) -> Result<()> {
     let root = root.as_ref();
     let config = TransConfig::load_from_root(root)?;
@@ -192,6 +326,10 @@ pub fn run_interactive(root: impl AsRef<Path>, message_id: Option<String>) -> Re
 }
 
 fn prompt_language_files_path(root: &Path) -> Result<String> {
+    prompt_language_files_path_with_default(root, "translations")
+}
+
+fn prompt_language_files_path_with_default(root: &Path, default_value: &str) -> Result<String> {
     let path_completion = PathCompletion::new(root);
     let choices = build_directory_choices(root)?;
     print_label("Location of language files (relative to project root)");
@@ -206,7 +344,7 @@ fn prompt_language_files_path(root: &Path) -> Result<String> {
 
         let default_idx = choices
             .iter()
-            .position(|choice| choice.value.as_deref() == Some("translations"))
+            .position(|choice| choice.value.as_deref() == Some(default_value))
             .unwrap_or(0);
 
         let selection = FuzzySelect::new()
@@ -224,7 +362,7 @@ fn prompt_language_files_path(root: &Path) -> Result<String> {
     loop {
         let input = Input::<String>::new()
             .with_prompt(">")
-            .default("translations".to_string())
+            .default(default_value.to_string())
             .completion_with(&path_completion)
             .interact_text()?;
         let candidate = root.join(&input);

@@ -61,6 +61,18 @@ pub struct AiConfig {
     pub max_output_tokens: u32,
 }
 
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ai_enabled(),
+            model: default_ai_model(),
+            api_key_env: default_ai_api_key_env(),
+            temperature: default_ai_temperature(),
+            max_output_tokens: default_ai_max_output_tokens(),
+        }
+    }
+}
+
 impl TransConfig {
     pub fn config_path(root: impl AsRef<Path>) -> PathBuf {
         root.as_ref().join(CONFIG_FILE_NAME)
