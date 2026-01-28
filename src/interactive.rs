@@ -4,11 +4,13 @@ use std::path::{Path, PathBuf};
 use console::style;
 use dialoguer::{Completion, Confirm, FuzzySelect, Input, Select};
 
-use crate::ai::{resolve_ai_settings, suggest_translation, AiSettings};
+use crate::ai::{AiSettings, resolve_ai_settings, suggest_translation};
 use crate::config::{AiConfig, TransConfig};
 use crate::error::Result;
 use crate::message_id::validate_message_id;
-use crate::operations::{add_translation, delete_translation, update_translation, TranslationValues};
+use crate::operations::{
+    TranslationValues, add_translation, delete_translation, update_translation,
+};
 use crate::translations::load_language_translations;
 use crate::verify::verify_language_files;
 
@@ -74,19 +76,20 @@ impl Completion for PathCompletion {
     }
 }
 
-pub fn init_config_interactive(root: impl AsRef<Path>) -> Result<()> {
+pub fn init_config_interactive(
+    root: impl AsRef<Path>,
+    format: crate::config::ConfigFormat,
+) -> Result<()> {
     let root = root.as_ref();
     let language_files_path = prompt_language_files_path(root)?;
 
     let default_languages = discover_languages(root, &language_files_path)?;
     print_label("Available languages (comma-separated)");
-    let available_languages = prompt_language_list(
-        if default_languages.is_empty() {
-            None
-        } else {
-            Some(&default_languages)
-        },
-    )?;
+    let available_languages = prompt_language_list(if default_languages.is_empty() {
+        None
+    } else {
+        Some(&default_languages)
+    })?;
     print_spacer();
 
     let required_languages = loop {
@@ -144,7 +147,7 @@ pub fn init_config_interactive(root: impl AsRef<Path>) -> Result<()> {
     };
 
     config.validate()?;
-    config.save_to_root(root)?;
+    config.save_to_root_format(root, format, true)?;
 
     Ok(())
 }
@@ -305,7 +308,8 @@ pub fn run_interactive(root: impl AsRef<Path>, message_id: Option<String>) -> Re
         print_spacer();
         match selection {
             0 => {
-                let values = prompt_required_translations(root, &config, &message_id, &ai_settings, true)?;
+                let values =
+                    prompt_required_translations(root, &config, &message_id, &ai_settings, true)?;
                 update_translation(root, &config, &message_id, &values)
             }
             1 => delete_translation(root, &config, &message_id),
@@ -362,7 +366,10 @@ fn prompt_language_files_path_with_default(root: &Path, default_value: &str) -> 
             if candidate.is_dir() {
                 return Ok(input);
             }
-            eprintln!("Path exists but is not a directory: {}", candidate.display());
+            eprintln!(
+                "Path exists but is not a directory: {}",
+                candidate.display()
+            );
             continue;
         }
 
@@ -618,8 +625,9 @@ fn suggest_translation_blocking(
     message_id: &str,
     source_text: &str,
 ) -> Result<String> {
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|err| crate::error::TransError::InvalidInput(format!("AI runtime error: {err}")))?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|err| {
+        crate::error::TransError::InvalidInput(format!("AI runtime error: {err}"))
+    })?;
     runtime.block_on(suggest_translation(
         settings,
         source_lang,

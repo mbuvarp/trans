@@ -27,7 +27,41 @@ fn default_ai_max_output_tokens() -> u32 {
     128
 }
 
-const CONFIG_FILE_NAME: &str = ".trans.config.json";
+const CONFIG_JSON_FILE_NAME: &str = ".trans.config.json";
+const CONFIG_YAML_FILE_NAME: &str = ".trans.config.yaml";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFormat {
+    Json,
+    Yaml,
+}
+
+impl ConfigFormat {
+    pub fn file_name(self) -> &'static str {
+        match self {
+            ConfigFormat::Json => CONFIG_JSON_FILE_NAME,
+            ConfigFormat::Yaml => CONFIG_YAML_FILE_NAME,
+        }
+    }
+
+    pub fn other(self) -> Self {
+        match self {
+            ConfigFormat::Json => ConfigFormat::Yaml,
+            ConfigFormat::Yaml => ConfigFormat::Json,
+        }
+    }
+
+    pub fn from_path(path: &Path) -> Result<Self> {
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("json") => Ok(ConfigFormat::Json),
+            Some("yaml") | Some("yml") => Ok(ConfigFormat::Yaml),
+            _ => Err(TransError::InvalidConfig(format!(
+                "unsupported config format for path {}",
+                path.display()
+            ))),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -68,36 +102,105 @@ impl Default for AiConfig {
 
 impl TransConfig {
     pub fn config_path(root: impl AsRef<Path>) -> PathBuf {
-        root.as_ref().join(CONFIG_FILE_NAME)
+        root.as_ref().join(CONFIG_JSON_FILE_NAME)
+    }
+
+    pub fn config_path_for_format(root: impl AsRef<Path>, format: ConfigFormat) -> PathBuf {
+        root.as_ref().join(format.file_name())
+    }
+
+    pub fn config_paths(root: impl AsRef<Path>) -> (PathBuf, PathBuf) {
+        (
+            Self::config_path_for_format(&root, ConfigFormat::Json),
+            Self::config_path_for_format(root, ConfigFormat::Yaml),
+        )
     }
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        let format = ConfigFormat::from_path(path)?;
         let contents = match fs::read_to_string(path) {
             Ok(contents) => contents,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Err(TransError::MissingConfig(path.to_path_buf()));
+                return Err(TransError::MissingConfig(path.display().to_string()));
             }
             Err(err) => return Err(err.into()),
         };
 
-        let config: TransConfig = serde_json::from_str(&contents)?;
+        let config: TransConfig = match format {
+            ConfigFormat::Json => serde_json::from_str(&contents)?,
+            ConfigFormat::Yaml => serde_yaml::from_str(&contents)?,
+        };
         config.validate()?;
         Ok(config)
     }
 
     pub fn load_from_root(root: impl AsRef<Path>) -> Result<Self> {
-        Self::load_from_path(Self::config_path(root))
+        let (json_path, yaml_path) = Self::config_paths(root);
+        let json_exists = json_path.exists();
+        let yaml_exists = yaml_path.exists();
+        match (json_exists, yaml_exists) {
+            (true, true) => Err(TransError::InvalidConfig(
+                "both .trans.config.json and .trans.config.yaml exist; keep only one".to_string(),
+            )),
+            (true, false) => Self::load_from_path(json_path),
+            (false, true) => Self::load_from_path(yaml_path),
+            (false, false) => Err(TransError::MissingConfig(format!(
+                "{} or {}",
+                json_path.display(),
+                yaml_path.display()
+            ))),
+        }
     }
 
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
-        let payload = serde_json::to_string_pretty(self)?;
-        fs::write(path, payload)?;
+        let path = path.as_ref();
+        let format = ConfigFormat::from_path(path)?;
+        match format {
+            ConfigFormat::Json => {
+                let payload = serde_json::to_string_pretty(self)?;
+                fs::write(path, payload)?;
+            }
+            ConfigFormat::Yaml => {
+                let payload = serde_yaml::to_string(self)?;
+                fs::write(path, payload)?;
+            }
+        }
         Ok(())
     }
 
     pub fn save_to_root(&self, root: impl AsRef<Path>) -> Result<()> {
-        self.save_to_path(Self::config_path(root))
+        let (json_path, yaml_path) = Self::config_paths(root.as_ref());
+        let json_exists = json_path.exists();
+        let yaml_exists = yaml_path.exists();
+        let target = match (json_exists, yaml_exists) {
+            (true, true) => {
+                return Err(TransError::InvalidConfig(
+                    "both .trans.config.json and .trans.config.yaml exist; keep only one"
+                        .to_string(),
+                ));
+            }
+            (false, true) => yaml_path,
+            _ => json_path,
+        };
+        self.save_to_path(target)
+    }
+
+    pub fn save_to_root_format(
+        &self,
+        root: impl AsRef<Path>,
+        format: ConfigFormat,
+        remove_other: bool,
+    ) -> Result<PathBuf> {
+        let target = Self::config_path_for_format(&root, format);
+        self.save_to_path(&target)?;
+        if remove_other {
+            let other = Self::config_path_for_format(root, format.other());
+            if other.exists() {
+                fs::remove_file(other)?;
+            }
+        }
+        Ok(target)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -166,6 +269,7 @@ fn validate_language_list(name: &str, values: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn base_config() -> TransConfig {
         TransConfig {
@@ -226,5 +330,30 @@ mod tests {
         let mut config = base_config();
         config.available_languages.push("en".to_string());
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn load_from_root_prefers_yaml_when_present() {
+        let dir = tempdir().expect("tempdir");
+        let config = base_config();
+        let yaml_path = TransConfig::config_path_for_format(dir.path(), ConfigFormat::Yaml);
+        config.save_to_path(&yaml_path).expect("save yaml");
+
+        let loaded = TransConfig::load_from_root(dir.path()).expect("load");
+        assert_eq!(loaded.primary_language, "en");
+    }
+
+    #[test]
+    fn save_to_root_format_removes_other_file() {
+        let dir = tempdir().expect("tempdir");
+        let config = base_config();
+        let json_path = TransConfig::config_path_for_format(dir.path(), ConfigFormat::Json);
+        config.save_to_path(&json_path).expect("save json");
+
+        let yaml_path = config
+            .save_to_root_format(dir.path(), ConfigFormat::Yaml, true)
+            .expect("save yaml");
+        assert!(yaml_path.exists());
+        assert!(!json_path.exists());
     }
 }

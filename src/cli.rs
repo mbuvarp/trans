@@ -8,7 +8,9 @@ use crate::operations::TranslationValues;
 #[derive(Parser, Debug)]
 #[command(name = "trans")]
 #[command(about = "Translation utility for react-intl JSON files")]
-#[command(long_about = "Translation utility for react-intl JSON files.\n\nRun without a subcommand to enter interactive mode, or pass a MESSAGE_ID to use the interactive add/edit flow for that id.")]
+#[command(
+    long_about = "Translation utility for react-intl JSON files.\n\nRun without a subcommand to enter interactive mode, or pass a MESSAGE_ID to use the interactive add/edit flow for that id."
+)]
 pub struct Cli {
     #[arg(
         value_name = "MESSAGE_ID",
@@ -21,13 +23,26 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    #[command(about = "Create a .trans.config.json via interactive prompts")]
-    Init,
+    #[command(about = "Create a .trans.config.json or .trans.config.yaml via interactive prompts")]
+    Init {
+        #[arg(
+            long,
+            value_enum,
+            default_value = "json",
+            value_name = "FORMAT",
+            help = "Config format to write: json or yaml"
+        )]
+        format: ConfigFormat,
+    },
     #[command(about = "List required languages from the config")]
     ListRequiredLanguages,
     #[command(about = "Add a new translation id with required language values")]
     Add {
-        #[arg(long, value_name = "MESSAGE_ID", help = "Message id with namespace, e.g. app.header.title")]
+        #[arg(
+            long,
+            value_name = "MESSAGE_ID",
+            help = "Message id with namespace, e.g. app.header.title"
+        )]
         id: String,
         #[arg(
             long,
@@ -38,7 +53,11 @@ pub enum Command {
     },
     #[command(about = "Update an existing translation id")]
     Update {
-        #[arg(long, value_name = "MESSAGE_ID", help = "Message id with namespace, e.g. app.header.title")]
+        #[arg(
+            long,
+            value_name = "MESSAGE_ID",
+            help = "Message id with namespace, e.g. app.header.title"
+        )]
         id: String,
         #[arg(
             long,
@@ -49,21 +68,40 @@ pub enum Command {
     },
     #[command(about = "Delete a translation id from all languages")]
     Delete {
-        #[arg(long, value_name = "MESSAGE_ID", help = "Message id with namespace to delete")]
+        #[arg(
+            long,
+            value_name = "MESSAGE_ID",
+            help = "Message id with namespace to delete"
+        )]
         id: String,
     },
     #[command(about = "Show translations for a message id")]
     Show {
-        #[arg(long, value_name = "MESSAGE_ID", help = "Message id with namespace to display")]
+        #[arg(
+            long,
+            value_name = "MESSAGE_ID",
+            help = "Message id with namespace to display"
+        )]
         id: String,
-        #[arg(long, value_name = "LANG", help = "Optional language code to show a single translation")]
+        #[arg(
+            long,
+            value_name = "LANG",
+            help = "Optional language code to show a single translation"
+        )]
         lang: Option<String>,
     },
     #[command(
         about = "Update config values interactively",
-        long_about = "Update config values interactively.\n\nRoot config options:\n- languageFilesPath: location of language files\n- availableLanguages: all known languages\n- requiredLanguages: languages required for input\n- primaryLanguage: first language in interactive mode\n- defaultUntranslatedValue: default for non-required languages\n\nUse `trans config ai` to edit AI settings:\n- enabled\n- model\n- apiKeyEnv\n- maxOutputTokens"
+        long_about = "Update config values interactively.\n\nRoot config options:\n- languageFilesPath: location of language files\n- availableLanguages: all known languages\n- requiredLanguages: languages required for input\n- primaryLanguage: first language in interactive mode\n- defaultUntranslatedValue: default for non-required languages\n\nUse `trans config ai` to edit AI settings:\n- enabled\n- model\n- apiKeyEnv\n- maxOutputTokens\n\nUse `trans config --format json|yaml` to convert the config file format."
     )]
     Config {
+        #[arg(
+            long,
+            value_enum,
+            value_name = "FORMAT",
+            help = "Convert config file to format: json or yaml"
+        )]
+        format: Option<ConfigFormat>,
         #[command(subcommand)]
         section: Option<ConfigSection>,
     },
@@ -93,6 +131,12 @@ pub enum Command {
 pub enum ConfigSection {
     #[command(about = "Update AI configuration values interactively")]
     Ai,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+pub enum ConfigFormat {
+    Json,
+    Yaml,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]

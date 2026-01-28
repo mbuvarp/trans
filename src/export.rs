@@ -6,7 +6,7 @@ use rust_xlsxwriter::Workbook;
 
 use crate::config::TransConfig;
 use crate::error::{Result, TransError};
-use crate::translations::{load_language_translations, Translations};
+use crate::translations::{Translations, load_language_translations};
 use crate::verify::verify_language_files;
 
 pub fn export_csv(root: impl AsRef<Path>, config: &TransConfig) -> Result<PathBuf> {
@@ -75,10 +75,7 @@ pub fn export_excel(root: impl AsRef<Path>, config: &TransConfig) -> Result<Path
     Ok(output_path)
 }
 
-fn load_all_languages(
-    root: &Path,
-    config: &TransConfig,
-) -> Result<BTreeMap<String, Translations>> {
+fn load_all_languages(root: &Path, config: &TransConfig) -> Result<BTreeMap<String, Translations>> {
     let mut map = BTreeMap::new();
     for language in &config.available_languages {
         let translations = load_language_translations(root, config, language)?;

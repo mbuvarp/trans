@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::config::TransConfig;
 use crate::error::{Result, TransError};
-use crate::translations::{load_language_translations, save_language_translations, Translations};
+use crate::translations::{Translations, load_language_translations, save_language_translations};
 
 pub type TranslationSnapshot = BTreeMap<String, Translations>;
 
@@ -80,7 +80,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::config::TransConfig;
-    use crate::translations::{save_language_translations, Translations};
+    use crate::translations::{Translations, save_language_translations};
 
     fn base_config() -> TransConfig {
         TransConfig {

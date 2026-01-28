@@ -10,8 +10,8 @@ pub enum TransError {
     InvalidMessageId(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
-    #[error("missing config file at {0:?}; run `trans init` first")]
-    MissingConfig(PathBuf),
+    #[error("missing config file at {0}; run `trans init` first")]
+    MissingConfig(String),
     #[error("missing language file at {0:?}")]
     MissingLanguageFile(PathBuf),
     #[error("verification failed: {0}")]
@@ -20,6 +20,8 @@ pub enum TransError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Yaml(#[from] serde_yaml::Error),
     #[error(transparent)]
     Csv(#[from] csv::Error),
     #[error(transparent)]
