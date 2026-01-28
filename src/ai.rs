@@ -102,6 +102,11 @@ pub async fn suggest_translation(
         .text()
         .await
         .map_err(|err| TransError::InvalidInput(format!("AI response read failed: {err}")))?;
+    if body.trim().is_empty() {
+        return Err(TransError::InvalidInput(
+            "AI response was empty".to_string(),
+        ));
+    }
 
     let text = match serde_json::from_str::<ResponsesResponse>(&body) {
         Ok(payload) => payload
@@ -115,9 +120,10 @@ pub async fn suggest_translation(
     .unwrap_or_default();
 
     if text.trim().is_empty() {
-        return Err(TransError::InvalidInput(
-            "AI response was empty".to_string(),
-        ));
+        let preview = body.chars().take(800).collect::<String>();
+        return Err(TransError::InvalidInput(format!(
+            "AI response was empty. Raw response (truncated): {preview}"
+        )));
     }
 
     Ok(text.trim().to_string())
