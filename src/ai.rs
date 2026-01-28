@@ -98,18 +98,21 @@ pub async fn suggest_translation(
         )));
     }
 
-    let payload: ResponsesResponse = response
-        .json()
+    let body = response
+        .text()
         .await
-        .map_err(|err| TransError::InvalidInput(format!("AI response parse failed: {err}")))?;
+        .map_err(|err| TransError::InvalidInput(format!("AI response read failed: {err}")))?;
 
-    let text = payload
-        .output
-        .iter()
-        .flat_map(|item| &item.content)
-        .find_map(|content| content.text.as_ref())
-        .map(String::from)
-        .unwrap_or_default();
+    let text = match serde_json::from_str::<ResponsesResponse>(&body) {
+        Ok(payload) => payload
+            .output
+            .iter()
+            .flat_map(|item| &item.content)
+            .find_map(|content| content.text.as_ref())
+            .map(String::from),
+        Err(_) => extract_text_from_value(&body),
+    }
+    .unwrap_or_default();
 
     if text.trim().is_empty() {
         return Err(TransError::InvalidInput(
@@ -154,6 +157,25 @@ struct ResponseOutputItem {
 struct ResponseOutputContent {
     #[serde(default)]
     text: Option<String>,
+}
+
+fn extract_text_from_value(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let output = value.get("output")?.as_array()?;
+    for item in output {
+        let contents = match item.get("content").and_then(|c| c.as_array()) {
+            Some(contents) => contents,
+            None => continue,
+        };
+        for content in contents {
+            if let Some(text) = content.get("text").and_then(|t| t.as_str()) {
+                if !text.trim().is_empty() {
+                    return Some(text.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]
