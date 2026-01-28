@@ -57,11 +57,17 @@ pub async fn suggest_translation(
         input: vec![
             ResponseInputItem {
                 role: "system",
-                content: vec![ResponseContent { text: system_prompt }],
+                content: vec![ResponseContent {
+                    kind: "input_text",
+                    text: system_prompt,
+                }],
             },
             ResponseInputItem {
                 role: "user",
-                content: vec![ResponseContent { text: user_prompt }],
+                content: vec![ResponseContent {
+                    kind: "input_text",
+                    text: user_prompt,
+                }],
             },
         ],
         temperature: settings.temperature,
@@ -122,6 +128,8 @@ struct ResponseInputItem {
 
 #[derive(Debug, Serialize)]
 struct ResponseContent {
+    #[serde(rename = "type")]
+    kind: &'static str,
     text: String,
 }
 
