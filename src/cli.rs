@@ -15,7 +15,7 @@ pub struct Cli {
     #[arg(
         short = 'v',
         long = "version",
-        action = clap::ArgAction::Version,
+        action = clap::ArgAction::SetTrue,
         help = "Print version information"
     )]
     pub version: bool,
