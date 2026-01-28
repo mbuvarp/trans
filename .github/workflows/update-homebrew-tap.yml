@@ -12,13 +12,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Set release metadata
-        run: echo "TAG=${{ github.event.release.tag_name }}" >> "$GITHUB_ENV"
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.release.tag_name }}"
+          if [[ -z "$tag" ]]; then
+            echo "Release tag is empty." >&2
+            exit 1
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
 
       - name: Compute tarball sha256
         run: |
+          set -euo pipefail
           url="https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz"
           echo "URL=$url" >> "$GITHUB_ENV"
-          sha="$(curl -sL "$url" | shasum -a 256 | awk '{print $1}')"
+          sha="$(curl -fL --retry 3 --retry-delay 2 "$url" | shasum -a 256 | awk '{print $1}')"
+          if [[ ! "$sha" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Computed SHA is invalid: $sha" >&2
+            exit 1
+          fi
           echo "SHA=$sha" >> "$GITHUB_ENV"
 
       - name: Checkout Homebrew tap
