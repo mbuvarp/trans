@@ -178,11 +178,11 @@ jobs:
           for line in lines:
             out.append(line)
             if line.strip().startswith("sha256 "):
-              out.append(bottle_block.rstrip("\\n"))
+              out.append(bottle_block.rstrip("\n"))
               inserted = True
           if not inserted:
-            out.append(bottle_block.rstrip("\\n"))
-          path.write_text("\\n".join(out) + "\\n", encoding="utf-8")
+            out.append(bottle_block.rstrip("\n"))
+          path.write_text("\n".join(out) + "\n", encoding="utf-8")
           PY
 
       - name: Create PR in Homebrew tap
