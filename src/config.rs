@@ -275,12 +275,7 @@ pub fn format_config_list(config: &TransConfig, config_path: Option<&Path>) -> V
         &format_value(&config.default_untranslated_value),
     ));
 
-    let ai_configured = config.ai.is_some();
     let ai = config.ai.clone().unwrap_or_default();
-    lines.push(format_label_value(
-        "aiConfigured",
-        &ai_configured.to_string(),
-    ));
     lines.push(format_label_value("ai.enabled", &ai.enabled.to_string()));
     lines.push(format_label_value("ai.model", &ai.model));
     lines.push(format_label_value("ai.apiKeyEnv", &ai.api_key_env));
