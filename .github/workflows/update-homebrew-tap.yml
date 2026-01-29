@@ -85,7 +85,9 @@ jobs:
       - name: Build bottle
         run: |
           set -euo pipefail
-          brew tap mbuvarp/trans "$PWD/homebrew-trans"
+          brew tap mbuvarp/trans
+          tap_path="$(brew --repo mbuvarp/trans)"
+          cp "homebrew-trans/Formula/trans.rb" "$tap_path/Formula/trans.rb"
           brew install --build-bottle mbuvarp/trans/trans
           brew bottle --json --root-url "https://github.com/${{ github.repository }}/releases/download/${TAG}" trans
           bottle_json="$(ls -1 *.json | head -n 1)"
