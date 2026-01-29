@@ -137,13 +137,23 @@ pub fn init_config_interactive(
         .interact_text()?;
     print_spacer();
 
+    print_label("Do you want to set up AI?");
+    let setup_ai = Confirm::new().with_prompt(">").default(true).interact()?;
+    print_spacer();
+
+    let ai = if setup_ai {
+        Some(prompt_ai_config(&AiConfig::default())?)
+    } else {
+        None
+    };
+
     let config = TransConfig {
         language_files_path: language_files_path.into(),
         available_languages,
         required_languages,
         primary_language,
         default_untranslated_value,
-        ai: None,
+        ai,
     };
 
     config.validate()?;
@@ -238,7 +248,13 @@ pub fn configure_ai_interactive(root: impl AsRef<Path>) -> Result<()> {
     let root = root.as_ref();
     let mut config = TransConfig::load_from_root(root)?;
     let defaults = config.ai.clone().unwrap_or_default();
+    config.ai = Some(prompt_ai_config(&defaults)?);
 
+    config.save_to_root(root)?;
+    Ok(())
+}
+
+fn prompt_ai_config(defaults: &AiConfig) -> Result<AiConfig> {
     print_label("AI enabled");
     let enabled = Confirm::new()
         .with_prompt(">")
@@ -267,15 +283,12 @@ pub fn configure_ai_interactive(root: impl AsRef<Path>) -> Result<()> {
         .interact_text()?;
     print_spacer();
 
-    config.ai = Some(AiConfig {
+    Ok(AiConfig {
         enabled,
         model,
         api_key_env,
         max_output_tokens,
-    });
-
-    config.save_to_root(root)?;
-    Ok(())
+    })
 }
 
 pub fn run_interactive(root: impl AsRef<Path>, message_id: Option<String>) -> Result<()> {

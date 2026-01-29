@@ -4,7 +4,7 @@ use std::process;
 use clap::Parser;
 
 use trans::cli::{Cli, Command, ConfigFormat, ConfigSection, parse_values};
-use trans::config::{ConfigFormat as ConfigFileFormat, TransConfig};
+use trans::config::{ConfigFormat as ConfigFileFormat, TransConfig, format_config_list};
 use trans::error::{Result, TransError};
 use trans::export::{export_csv, export_excel};
 use trans::interactive::{
@@ -121,6 +121,13 @@ fn run() -> Result<()> {
             }
             match section {
                 Some(ConfigSection::Ai) => configure_ai_interactive(&root),
+                Some(ConfigSection::Show) => {
+                    let (config, path) = TransConfig::load_from_root_with_path(&root)?;
+                    for line in format_config_list(&config, Some(&path)) {
+                        println!("{line}");
+                    }
+                    Ok(())
+                }
                 None => configure_root_interactive(&root),
             }
         }

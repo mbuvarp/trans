@@ -136,6 +136,10 @@ impl TransConfig {
     }
 
     pub fn load_from_root(root: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self::load_from_root_with_path(root)?.0)
+    }
+
+    pub fn load_from_root_with_path(root: impl AsRef<Path>) -> Result<(Self, PathBuf)> {
         let (json_path, yaml_path) = Self::config_paths(root);
         let json_exists = json_path.exists();
         let yaml_exists = yaml_path.exists();
@@ -143,8 +147,8 @@ impl TransConfig {
             (true, true) => Err(TransError::InvalidConfig(
                 "both .trans.config.json and .trans.config.yaml exist; keep only one".to_string(),
             )),
-            (true, false) => Self::load_from_path(json_path),
-            (false, true) => Self::load_from_path(yaml_path),
+            (true, false) => Ok((Self::load_from_path(&json_path)?, json_path)),
+            (false, true) => Ok((Self::load_from_path(&yaml_path)?, yaml_path)),
             (false, false) => Err(TransError::MissingConfig(format!(
                 "{} or {}",
                 json_path.display(),
@@ -238,6 +242,47 @@ impl TransConfig {
         }
 
         Ok(())
+    }
+}
+
+pub fn format_config_list(config: &TransConfig, config_path: Option<&Path>) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(path) = config_path {
+        lines.push(format!("configPath: {}", path.display()));
+    }
+    lines.push(format!(
+        "languageFilesPath: {}",
+        config.language_files_path.display()
+    ));
+    lines.push(format!(
+        "availableLanguages: {}",
+        config.available_languages.join(", ")
+    ));
+    lines.push(format!(
+        "requiredLanguages: {}",
+        config.required_languages.join(", ")
+    ));
+    lines.push(format!("primaryLanguage: {}", config.primary_language));
+    lines.push(format!(
+        "defaultUntranslatedValue: {}",
+        format_value(&config.default_untranslated_value)
+    ));
+
+    let ai_configured = config.ai.is_some();
+    let ai = config.ai.clone().unwrap_or_default();
+    lines.push(format!("aiConfigured: {ai_configured}"));
+    lines.push(format!("ai.enabled: {}", ai.enabled));
+    lines.push(format!("ai.model: {}", ai.model));
+    lines.push(format!("ai.apiKeyEnv: {}", ai.api_key_env));
+    lines.push(format!("ai.maxOutputTokens: {}", ai.max_output_tokens));
+    lines
+}
+
+fn format_value(value: &str) -> String {
+    if value.is_empty() {
+        "<empty>".to_string()
+    } else {
+        value.to_string()
     }
 }
 
