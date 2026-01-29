@@ -84,7 +84,7 @@ pub fn init_config_interactive(
     let root = root.as_ref();
     let (json_path, yaml_path) = TransConfig::config_paths(root);
     if json_path.exists() || yaml_path.exists() {
-        print_label("Config file already exists");
+        print_label("Config file already exists, do you wish to overwrite?");
         println!(
             "Found {}{}",
             json_path.display(),
