@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use csv::Writer;
-use rust_xlsxwriter::Workbook;
+use rust_xlsxwriter::{Color, Format, Workbook};
 
 use crate::config::TransConfig;
 use crate::error::{Result, TransError};
@@ -113,6 +113,7 @@ pub fn export_excel_with_options(
     let ids = message_ids(translations_by_language, &config.primary_language)?;
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
+    let missing_format = Format::new().set_background_color(Color::RGB(0xFFC7CE));
 
     worksheet.write_string(0, 0, "id")?;
     for (idx, language) in languages.iter().enumerate() {
@@ -138,7 +139,17 @@ pub fn export_excel_with_options(
             let row = (row_index + 1) as u32;
             worksheet.write_string(row, 0, message_id.as_str())?;
             for (col_index, value) in values.iter().enumerate() {
-                worksheet.write_string(row, (col_index + 1) as u16, value.as_str())?;
+                let col = (col_index + 1) as u16;
+                if value == &config.default_untranslated_value {
+                    worksheet.write_string_with_format(
+                        row,
+                        col,
+                        value.as_str(),
+                        &missing_format,
+                    )?;
+                } else {
+                    worksheet.write_string(row, col, value.as_str())?;
+                }
             }
             row_index += 1;
         }
