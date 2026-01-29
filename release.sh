@@ -115,8 +115,50 @@ PROMPT
     local ai_output
     ai_output="$(codex exec "${prompt}"$'\n'"${commits}")" || true
     if [[ -n "${ai_output// }" ]]; then
-      printf "%s\n" "$ai_output" >"$tmp_file"
-      return 0
+      local cleaned
+      cleaned="$(printf "%s\n" "$ai_output" | python3 - <<'PY'
+import sys
+
+lines = sys.stdin.read().splitlines()
+start = None
+for idx, line in enumerate(lines):
+  if line.startswith("#"):
+    start = idx
+    break
+if start is None:
+  sys.exit(0)
+
+stop_patterns = (
+  "tokens used",
+  "OpenAI Codex",
+  "workdir:",
+  "model:",
+  "provider:",
+  "approval:",
+  "sandbox:",
+  "reasoning effort:",
+  "reasoning summaries:",
+  "session id:",
+  "----",
+  "user",
+  "thinking",
+)
+out = []
+for line in lines[start:]:
+  if any(line.startswith(p) for p in stop_patterns):
+    break
+  out.append(line)
+
+while out and not out[-1].strip():
+  out.pop()
+
+print("\n".join(out))
+PY
+)"
+      if [[ -n "${cleaned// }" ]]; then
+        printf "%s\n" "$cleaned" >"$tmp_file"
+        return 0
+      fi
     fi
   fi
 
