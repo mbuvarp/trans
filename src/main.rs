@@ -14,7 +14,6 @@ use trans::config::{
 use trans::error::{Result, TransError};
 use trans::export::{export_csv, export_csv_with_options, export_excel, export_excel_with_options};
 use trans::format_validation::validate_message_formats;
-use trans::import::import_translations;
 use trans::interactive::{
     configure_ai_interactive, configure_edit_interactive, configure_root_interactive,
     init_config_interactive, run_interactive,
@@ -157,6 +156,7 @@ fn run() -> Result<()> {
             lang,
             extra_langs,
             trim,
+            ai,
         }) => {
             let root = env::current_dir()?;
             let config = TransConfig::load_from_root(&root)?;
@@ -164,13 +164,14 @@ fn run() -> Result<()> {
                 Some(lang) => Some(parse_lang_list(&lang)?),
                 None => None,
             };
-            import_translations(
+            trans::import::import_translations_with_ai(
                 &root,
                 &config,
                 Path::new(&path),
                 lang_filter,
                 extra_langs,
                 trim,
+                ai,
             )
         }
         Some(Command::ListRequiredLanguages) => {

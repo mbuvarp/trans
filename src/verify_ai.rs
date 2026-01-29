@@ -8,7 +8,9 @@ use crate::ai::{AiSettings, resolve_ai_settings, suggest_custom, suggest_transla
 use crate::config::TransConfig;
 use crate::error::{Result, TransError};
 use crate::export::load_all_languages;
-use crate::format_validation::{FormatValidationIssue, collect_format_validation_issues};
+use crate::format_validation::{
+    FormatValidationIssue, collect_format_validation_issues, validate_message_formats,
+};
 use crate::translations::save_language_translations;
 use crate::verify::{KeyMismatch, key_mismatches, verify_language_files};
 
@@ -40,15 +42,12 @@ pub fn verify_with_ai(root: &Path, config: &TransConfig) -> Result<()> {
         )?;
     }
 
-    for issue in format_issues {
-        handle_format_issue(
-            &settings,
-            config,
-            &mut translations_by_language,
-            &mut languages_changed,
-            issue,
-        )?;
-    }
+    apply_format_fixes_with_ai(
+        root,
+        config,
+        &mut translations_by_language,
+        &mut languages_changed,
+    )?;
 
     for language in &languages_changed {
         if let Some(translations) = translations_by_language.get(language) {
@@ -61,8 +60,35 @@ pub fn verify_with_ai(root: &Path, config: &TransConfig) -> Result<()> {
     }
 
     verify_language_files(root, config)?;
-    crate::format_validation::validate_message_formats(config, &translations_by_language)?;
+    validate_message_formats(config, &translations_by_language)?;
     println!("OK");
+    Ok(())
+}
+
+pub fn apply_format_fixes_with_ai(
+    root: &Path,
+    config: &TransConfig,
+    translations_by_language: &mut std::collections::BTreeMap<
+        String,
+        crate::translations::Translations,
+    >,
+    languages_changed: &mut HashSet<String>,
+) -> Result<()> {
+    let settings = resolve_ai_settings(root, config)?.ok_or_else(|| {
+        TransError::InvalidInput(
+            "AI is not configured. Run `trans config ai` to set it up.".to_string(),
+        )
+    })?;
+    let format_issues = collect_format_validation_issues(config, translations_by_language)?;
+    for issue in format_issues {
+        handle_format_issue(
+            &settings,
+            config,
+            translations_by_language,
+            languages_changed,
+            issue,
+        )?;
+    }
     Ok(())
 }
 
