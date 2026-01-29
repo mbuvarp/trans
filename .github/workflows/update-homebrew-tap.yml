@@ -64,6 +64,12 @@ jobs:
               text,
               flags=re.M,
           )
+          text = re.sub(
+              r'^  version ".*"$',
+              f'  version "{tag.lstrip("v")}"',
+              text,
+              flags=re.M,
+          )
           path.write_text(text, encoding="utf-8")
           PY
 
@@ -109,13 +115,13 @@ jobs:
           repo = os.environ["GITHUB_REPOSITORY"]
           bottle_json = pathlib.Path(os.environ["BOTTLE_JSON"])
           data = json.loads(bottle_json.read_text(encoding="utf-8"))
-          def extract_bottle_files(payload):
+          def extract_bottle_tags(payload):
             formula = payload.get("formula", {}).get("trans")
             if isinstance(formula, dict):
               bottle = formula.get("bottle", {})
-              files = bottle.get("files") or bottle.get("stable", {}).get("files", {})
-              if files:
-                return files
+              tags = bottle.get("tags") or bottle.get("files") or bottle.get("stable", {}).get("files", {})
+              if tags:
+                return tags
 
             formulae = payload.get("formulae")
             if isinstance(formulae, list):
@@ -125,22 +131,32 @@ jobs:
                 if entry.get("name") not in ("trans", None):
                   continue
                 bottle = entry.get("bottle", {})
-                files = bottle.get("files") or bottle.get("stable", {}).get("files", {})
-                if files:
-                  return files
+                tags = bottle.get("tags") or bottle.get("files") or bottle.get("stable", {}).get("files", {})
+                if tags:
+                  return tags
+
+            for value in payload.values():
+              if not isinstance(value, dict):
+                continue
+              bottle = value.get("bottle")
+              if not isinstance(bottle, dict):
+                continue
+              tags = bottle.get("tags") or bottle.get("files") or bottle.get("stable", {}).get("files", {})
+              if tags:
+                return tags
 
             bottles = payload.get("bottles")
             if isinstance(bottles, dict):
-              files = bottles.get("files")
-              if files:
-                return files
+              tags = bottles.get("tags") or bottles.get("files")
+              if tags:
+                return tags
 
             return {}
 
-          files = extract_bottle_files(data)
-          if not files:
+          tags = extract_bottle_tags(data)
+          if not tags:
             raise SystemExit("Bottle JSON missing files")
-          platform, info = next(iter(files.items()))
+          platform, info = next(iter(tags.items()))
           sha = info.get("sha256")
           if not sha:
             raise SystemExit("Bottle JSON missing sha256")
