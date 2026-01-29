@@ -12,6 +12,7 @@ use crate::export::load_selected_languages;
 use crate::format_validation::validate_message_formats;
 use crate::translations::save_language_translations;
 use crate::verify::verify_language_files;
+use crate::verify_ai::apply_format_fixes_with_ai;
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtraLangsStrategy {
@@ -30,6 +31,18 @@ pub fn import_translations(
     lang_filter: Option<Vec<String>>,
     extra_langs: Option<ExtraLangsStrategy>,
     trim: bool,
+) -> Result<()> {
+    import_translations_with_ai(root, config, path, lang_filter, extra_langs, trim, false)
+}
+
+pub fn import_translations_with_ai(
+    root: &Path,
+    config: &TransConfig,
+    path: &Path,
+    lang_filter: Option<Vec<String>>,
+    extra_langs: Option<ExtraLangsStrategy>,
+    trim: bool,
+    use_ai: bool,
 ) -> Result<()> {
     verify_language_files(root, config)?;
     let mut config = config.clone();
@@ -197,7 +210,16 @@ pub fn import_translations(
         return Ok(());
     }
 
-    validate_message_formats(&config, &translations_by_language)?;
+    if use_ai {
+        apply_format_fixes_with_ai(
+            root,
+            &config,
+            &mut translations_by_language,
+            &mut languages_to_save,
+        )?;
+    } else {
+        validate_message_formats(&config, &translations_by_language)?;
+    }
 
     for language in &languages_to_save {
         if let Some(translations) = translations_by_language.get(language) {

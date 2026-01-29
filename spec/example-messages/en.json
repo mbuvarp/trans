@@ -2107,6 +2107,7 @@
   "terminal.user-no-activity-period": "{user} has no registered activity for chosen period",
   "terminal.your-activity": "Your activity",
   "terminal.your-activity-today": "Your activity today",
+  "this.is.a.test": "This is just a test for {name} variables",
   "thread.success-creation": "Created new thread",
   "timesheets.absence-approved": "Approved",
   "timesheets.absence-create-type": "Create new absence type",

@@ -177,6 +177,11 @@ pub enum Command {
         extra_langs: Option<ExtraLangsStrategy>,
         #[arg(long = "trim", help = "Trim whitespace around imported values")]
         trim: bool,
+        #[arg(
+            long = "ai",
+            help = "Use AI to suggest fixes for format/placeholder issues"
+        )]
+        ai: bool,
     },
     #[command(about = "Verify that all language files contain the same message ids")]
     Verify {

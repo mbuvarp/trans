@@ -9,6 +9,7 @@ pub mod interactive;
 pub mod message_id;
 pub mod operations;
 pub mod query;
+pub mod spinner;
 pub mod translations;
 pub mod verify;
 pub mod verify_ai;
