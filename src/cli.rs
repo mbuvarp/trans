@@ -99,7 +99,7 @@ pub enum Command {
     },
     #[command(
         about = "Update config values interactively",
-        long_about = "Update config values interactively.\n\nRoot config options:\n- languageFilesPath: location of language files\n- availableLanguages: all known languages\n- requiredLanguages: languages required for input\n- primaryLanguage: first language in interactive mode\n- defaultUntranslatedValue: default for non-required languages\n\nUse `trans config ai` to edit AI settings:\n- enabled\n- model\n- apiKeyEnv\n- maxOutputTokens\n\nUse `trans config show` to print current configuration values.\nUse `trans config --format json|yaml` to convert the config file format."
+        long_about = "Update config values interactively.\n\nRoot config options:\n- languageFilesPath: location of language files\n- availableLanguages: all known languages\n- requiredLanguages: languages required for input\n- primaryLanguage: first language in interactive mode\n- defaultUntranslatedValue: default for non-required languages\n\nUse `trans config ai` to edit AI settings:\n- enabled\n- model\n- apiKeyEnv\n- maxOutputTokens\n\nUse `trans config show` to print current configuration values.\nUse `trans config edit [key]` to edit all values or a single key.\nUse `trans config --format json|yaml` to convert the config file format."
     )]
     Config {
         #[arg(
@@ -140,6 +140,11 @@ pub enum ConfigSection {
     Ai,
     #[command(about = "Show current configuration values")]
     Show,
+    #[command(about = "Edit all config values or a single key")]
+    Edit {
+        #[arg(value_enum, value_name = "KEY", help = "Config key to edit")]
+        key: Option<ConfigKey>,
+    },
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -152,6 +157,28 @@ pub enum ConfigFormat {
 pub enum ExportFormat {
     Csv,
     Excel,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+pub enum ConfigKey {
+    #[value(name = "languageFilesPath")]
+    LanguageFilesPath,
+    #[value(name = "availableLanguages")]
+    AvailableLanguages,
+    #[value(name = "requiredLanguages")]
+    RequiredLanguages,
+    #[value(name = "primaryLanguage")]
+    PrimaryLanguage,
+    #[value(name = "defaultUntranslatedValue")]
+    DefaultUntranslatedValue,
+    #[value(name = "ai.enabled")]
+    AiEnabled,
+    #[value(name = "ai.model")]
+    AiModel,
+    #[value(name = "ai.apiKeyEnv")]
+    AiApiKeyEnv,
+    #[value(name = "ai.maxOutputTokens")]
+    AiMaxOutputTokens,
 }
 
 pub fn parse_values(input: &str) -> Result<TranslationValues> {

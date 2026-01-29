@@ -291,6 +291,19 @@ pub fn format_config_list(config: &TransConfig, config_path: Option<&Path>) -> V
     lines
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ConfigField {
+    LanguageFilesPath,
+    AvailableLanguages,
+    RequiredLanguages,
+    PrimaryLanguage,
+    DefaultUntranslatedValue,
+    AiEnabled,
+    AiModel,
+    AiApiKeyEnv,
+    AiMaxOutputTokens,
+}
+
 fn format_value(value: &str) -> String {
     if value.is_empty() {
         "<empty>".to_string()
