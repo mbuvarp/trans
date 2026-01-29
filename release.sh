@@ -107,6 +107,7 @@ prepare_changelog() {
 You are drafting release notes for the trans CLI. Summarize changes since ${last_tag:-the last release}.
 Group related changes into sections when it improves readability. Use concise, user-facing descriptions (not raw commit prefixes).
 Keep the output in markdown and do not include any extra commentary.
+Do not run any commands. Do not create tasks or modify git. Only return the changelog text.
 
 Commit subjects:
 PROMPT
