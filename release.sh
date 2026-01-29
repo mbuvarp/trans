@@ -13,6 +13,7 @@ Examples:
 Notes:
   - If the tag starts with "v", Cargo.toml is set to the version without the prefix.
   - Cargo.toml and Cargo.lock are updated and committed automatically when needed.
+  - If no notes are provided, a changelog draft is generated and you will be prompted to approve/edit it.
 USAGE
 }
 
@@ -130,6 +131,100 @@ fi
 if git rev-parse "$version" >/dev/null 2>&1; then
   echo "Tag $version already exists." >&2
   exit 1
+fi
+
+prepare_changelog() {
+  local tmp_file="$1"
+  local last_tag
+  last_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+  local range="HEAD"
+  if [[ -n "$last_tag" ]]; then
+    range="${last_tag}..HEAD"
+  fi
+
+  local commits
+  commits="$(git log "$range" --pretty=%s --no-merges)"
+
+  python3 - "$commits" <<'PY' >"$tmp_file"
+import sys
+
+raw = sys.argv[1]
+lines = [line.strip() for line in raw.splitlines() if line.strip()]
+
+sections = {
+    "Highlights": [],
+    "Translation workflows": [],
+    "AI + validation": [],
+    "Release/CI": [],
+    "Other": [],
+}
+
+def add(section, text):
+    if text not in sections[section]:
+        sections[section].append(text)
+
+for line in lines:
+    lower = line.lower()
+    if lower.startswith("feat:"):
+        text = line.split(":", 1)[1].strip()
+        if "import" in lower:
+            add("Translation workflows", text)
+        elif "ai" in lower or "verify" in lower:
+            add("AI + validation", text)
+        else:
+            add("Highlights", text)
+    elif lower.startswith("fix:"):
+        add("Highlights", line.split(":", 1)[1].strip())
+    elif lower.startswith(("ci:", "chore:")) and ("brew" in lower or "release" in lower or "workflow" in lower):
+        add("Release/CI", line.split(":", 1)[1].strip())
+    elif lower.startswith(("ci:", "chore:", "docs:", "refactor:", "test:")):
+        add("Other", line.split(":", 1)[1].strip())
+    else:
+        add("Other", line)
+
+print("## Changes")
+for section, items in sections.items():
+    if not items:
+        continue
+    print()
+    print(f"### {section}")
+    for item in items:
+        print(f"- {item}")
+PY
+}
+
+approve_changelog() {
+  local file="$1"
+  echo
+  echo "Draft changelog:"
+  echo "----------------------------------------"
+  cat "$file"
+  echo "----------------------------------------"
+  echo
+  read -r -p "Use this changelog? [Y/n] " reply
+  reply="${reply:-Y}"
+  if [[ "$reply" =~ ^[Yy]$ ]]; then
+    return 0
+  fi
+
+  local editor="${EDITOR:-vi}"
+  "$editor" "$file"
+  read -r -p "Use the edited changelog? [Y/n] " reply2
+  reply2="${reply2:-Y}"
+  if [[ "$reply2" =~ ^[Yy]$ ]]; then
+    return 0
+  fi
+
+  echo "Aborted." >&2
+  return 1
+}
+
+if [[ -z "$notes" && -z "$notes_file" ]]; then
+  tmp_notes="$(mktemp -t trans-release-notes.XXXXXX)"
+  trap 'rm -f "$tmp_notes"' EXIT
+  prepare_changelog "$tmp_notes"
+  approve_changelog "$tmp_notes"
+  notes_file="$tmp_notes"
 fi
 
 git tag "$version"
