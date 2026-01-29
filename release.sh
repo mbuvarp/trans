@@ -14,6 +14,7 @@ Notes:
   - If the tag starts with "v", Cargo.toml is set to the version without the prefix.
   - Cargo.toml and Cargo.lock are updated and committed automatically when needed.
   - If no notes are provided, a changelog draft is generated and you will be prompted to approve/edit it.
+  - If the `codex` CLI is available, it is used to draft the changelog; otherwise a local heuristic is used.
 USAGE
 }
 
@@ -144,6 +145,45 @@ prepare_changelog() {
 
   local commits
   commits="$(git log "$range" --pretty=%s --no-merges)"
+
+  if command -v codex >/dev/null 2>&1; then
+    local prompt
+    prompt="$(
+      cat <<PROMPT
+You are drafting release notes for the trans CLI. Summarize changes since ${last_tag:-the last release}. Use the commit subjects below to produce a concise changelog like:
+
+## Changes
+
+### Highlights
+- ...
+
+### Translation workflows
+- ...
+
+### AI + validation
+- ...
+
+### Release/CI
+- ...
+
+### Misc
+- ...
+
+Rules:
+- Group items into the most relevant section. Only include sections that have items.
+- Use short, user-facing descriptions (not raw commit prefixes).
+- Keep the output in markdown and do not include any extra commentary.
+
+Commit subjects:
+PROMPT
+    )"
+    local ai_output
+    ai_output="$(codex exec "${prompt}"$'\n'"${commits}")" || true
+    if [[ -n "${ai_output// }" ]]; then
+      printf "%s\n" "$ai_output" >"$tmp_file"
+      return 0
+    fi
+  fi
 
   python3 - "$commits" <<'PY' >"$tmp_file"
 import sys
