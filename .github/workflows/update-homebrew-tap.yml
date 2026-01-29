@@ -111,7 +111,7 @@ jobs:
           data = json.loads(bottle_json.read_text(encoding="utf-8"))
           formula = data.get("formula", {}).get("trans", {})
           bottle = formula.get("bottle", {})
-          files = bottle.get("files", {})
+          files = bottle.get("files") or bottle.get("stable", {}).get("files", {})
           if not files:
             raise SystemExit("Bottle JSON missing files")
           platform, info = next(iter(files.items()))
