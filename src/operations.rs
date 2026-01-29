@@ -170,6 +170,34 @@ pub fn change_message_id(
     persist_with_rollback(&root, config, &snapshot, &updated)
 }
 
+pub fn replace_default_untranslated_value(
+    root: impl AsRef<Path>,
+    config: &TransConfig,
+    old_value: &str,
+    new_value: &str,
+) -> Result<usize> {
+    verify_language_files(&root, config)?;
+
+    let snapshot = snapshot_translations(&root, config)?;
+    let mut updated = snapshot.clone();
+    let mut replaced = 0usize;
+
+    for language in &config.available_languages {
+        let entry = updated
+            .get_mut(language)
+            .ok_or_else(|| missing_language_in_snapshot(language))?;
+        for value in entry.values_mut() {
+            if value == old_value {
+                *value = new_value.to_string();
+                replaced += 1;
+            }
+        }
+    }
+
+    persist_with_rollback(&root, config, &snapshot, &updated)?;
+    Ok(replaced)
+}
+
 fn validate_values(
     config: &TransConfig,
     values: &TranslationValues,
@@ -352,5 +380,30 @@ mod tests {
         assert!(!nb.contains_key("app.title"));
         assert_eq!(en.get("app.title.new").map(String::as_str), Some("Title"));
         assert_eq!(nb.get("app.title.new").map(String::as_str), Some("Tittel"));
+    }
+
+    #[test]
+    fn replace_default_untranslated_value_updates_matching_entries() {
+        let dir = tempdir().expect("tempdir");
+        let mut config = base_config();
+        config.default_untranslated_value = "".to_string();
+        let root = dir.path();
+
+        save_language_translations(
+            root,
+            &config,
+            "en",
+            &translations(&[("app.title", "Title")]),
+        )
+        .expect("save en");
+        save_language_translations(root, &config, "nb", &translations(&[("app.title", "")]))
+            .expect("save nb");
+
+        let replaced =
+            replace_default_untranslated_value(root, &config, "", "TODO").expect("replace");
+        assert_eq!(replaced, 1);
+
+        let nb = load_language_translations(root, &config, "nb").expect("load nb");
+        assert_eq!(nb.get("app.title").map(String::as_str), Some("TODO"));
     }
 }

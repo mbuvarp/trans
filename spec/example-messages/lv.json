@@ -343,7 +343,7 @@
   "common.items": "Preces",
   "common.kilometers": "{abbreviate, select, true {km} other {kilometri}}",
   "common.km": "km",
-  "common.km-per-hour-short": "NEEDS TRANSLATIOn",
+  "common.km-per-hour-short": "NEEDS TRANSLATION",
   "common.language": "Valoda",
   "common.last-revision": "NEEDS TRANSLATION",
   "common.lastName": "Uzvārds",
