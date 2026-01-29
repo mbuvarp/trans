@@ -122,6 +122,7 @@ pub enum Command {
     #[command(about = "Export translations to CSV or Excel")]
     Export {
         #[arg(
+            short = 'f',
             long,
             value_enum,
             default_value = "csv",
@@ -136,6 +137,19 @@ pub enum Command {
             help = "Comma-separated locales to include (primary language is always included)"
         )]
         lang: Option<String>,
+        #[arg(
+            short = 'o',
+            long = "output",
+            value_name = "FILE",
+            help = "Output filename (defaults to translations)"
+        )]
+        output: Option<String>,
+        #[arg(
+            short = 'm',
+            long = "missing",
+            help = "Only export rows with missing values"
+        )]
+        missing: bool,
     },
     #[command(about = "Verify that all language files contain the same message ids")]
     Verify,
