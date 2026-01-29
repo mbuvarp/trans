@@ -83,63 +83,6 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
-cargo_version="${version#v}"
-
-current_version="$(python3 - <<'PY'
-from pathlib import Path
-
-lines = Path("Cargo.toml").read_text(encoding="utf-8").splitlines()
-in_pkg = False
-for line in lines:
-  stripped = line.strip()
-  if stripped == "[package]":
-    in_pkg = True
-    continue
-  if in_pkg and stripped.startswith("[") and stripped.endswith("]"):
-    break
-  if in_pkg and stripped.startswith("version"):
-    value = stripped.split("=", 1)[1].strip().strip('"')
-    print(value)
-    break
-else:
-  raise SystemExit("version not found in Cargo.toml")
-PY
-)"
-
-if [[ "$current_version" != "$cargo_version" ]]; then
-  echo "Updating Cargo.toml version $current_version -> $cargo_version"
-  python3 - <<PY
-from pathlib import Path
-
-new_version = "${cargo_version}"
-path = Path("Cargo.toml")
-lines = path.read_text(encoding="utf-8").splitlines()
-out = []
-in_pkg = False
-updated = False
-for line in lines:
-  stripped = line.strip()
-  if stripped == "[package]":
-    in_pkg = True
-    out.append(line)
-    continue
-  if in_pkg and stripped.startswith("[") and stripped.endswith("]"):
-    in_pkg = False
-  if in_pkg and stripped.startswith("version"):
-    prefix = line.split("=", 1)[0]
-    out.append(f"{prefix}= \"{new_version}\"")
-    updated = True
-    continue
-  out.append(line)
-if not updated:
-  raise SystemExit("version not found in Cargo.toml")
-path.write_text("\n".join(out) + "\n", encoding="utf-8")
-PY
-  cargo check -q
-  git add Cargo.toml Cargo.lock
-  git commit -m "chore: release ${version}"
-fi
-
 if git rev-parse "$version" >/dev/null 2>&1; then
   echo "Tag $version already exists." >&2
   exit 1
@@ -259,8 +202,65 @@ if [[ -z "$notes" && -z "$notes_file" ]]; then
 fi
 
 if [[ "$dry_run" == "true" ]]; then
-  echo "Dry run complete. No tag or release created."
+  echo "Dry run complete. No version bump, tag, or release created."
   exit 0
+fi
+
+cargo_version="${version#v}"
+
+current_version="$(python3 - <<'PY'
+from pathlib import Path
+
+lines = Path("Cargo.toml").read_text(encoding="utf-8").splitlines()
+in_pkg = False
+for line in lines:
+  stripped = line.strip()
+  if stripped == "[package]":
+    in_pkg = True
+    continue
+  if in_pkg and stripped.startswith("[") and stripped.endswith("]"):
+    break
+  if in_pkg and stripped.startswith("version"):
+    value = stripped.split("=", 1)[1].strip().strip('"')
+    print(value)
+    break
+else:
+  raise SystemExit("version not found in Cargo.toml")
+PY
+)"
+
+if [[ "$current_version" != "$cargo_version" ]]; then
+  echo "Updating Cargo.toml version $current_version -> $cargo_version"
+  python3 - <<PY
+from pathlib import Path
+
+new_version = "${cargo_version}"
+path = Path("Cargo.toml")
+lines = path.read_text(encoding="utf-8").splitlines()
+out = []
+in_pkg = False
+updated = False
+for line in lines:
+  stripped = line.strip()
+  if stripped == "[package]":
+    in_pkg = True
+    out.append(line)
+    continue
+  if in_pkg and stripped.startswith("[") and stripped.endswith("]"):
+    in_pkg = False
+  if in_pkg and stripped.startswith("version"):
+    prefix = line.split("=", 1)[0]
+    out.append(f"{prefix}= \"{new_version}\"")
+    updated = True
+    continue
+  out.append(line)
+if not updated:
+  raise SystemExit("version not found in Cargo.toml")
+path.write_text("\n".join(out) + "\n", encoding="utf-8")
+PY
+  cargo check -q
+  git add Cargo.toml Cargo.lock
+  git commit -m "chore: release ${version}"
 fi
 
 git tag "$version"
