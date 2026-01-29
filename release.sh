@@ -3,12 +3,13 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: ./release.sh <version> [--notes <text>] [--notes-file <path>]
+Usage: ./release.sh <version> [--notes <text>] [--notes-file <path>] [--dry-run]
 
 Examples:
   ./release.sh v0.1.1
   ./release.sh v0.1.1 --notes "Bug fixes"
   ./release.sh v0.1.1 --notes-file /path/to/notes.md
+  ./release.sh v0.1.1 --dry-run
 
 Notes:
   - If the tag starts with "v", Cargo.toml is set to the version without the prefix.
@@ -28,6 +29,7 @@ shift || true
 
 notes=""
 notes_file=""
+dry_run="false"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,6 +40,10 @@ while [[ $# -gt 0 ]]; do
     --notes-file)
       notes_file="$2"
       shift 2
+      ;;
+    --dry-run)
+      dry_run="true"
+      shift 1
       ;;
     *)
       echo "Unknown argument: $1" >&2
@@ -64,6 +70,11 @@ fi
 
 if [[ -n "$notes" && -n "$notes_file" ]]; then
   echo "Use either --notes or --notes-file, not both." >&2
+  exit 1
+fi
+
+if [[ "$dry_run" == "true" && (-n "$notes" || -n "$notes_file") ]]; then
+  echo "--dry-run cannot be used with --notes or --notes-file." >&2
   exit 1
 fi
 
@@ -245,6 +256,11 @@ if [[ -z "$notes" && -z "$notes_file" ]]; then
   prepare_changelog "$tmp_notes"
   approve_changelog "$tmp_notes"
   notes_file="$tmp_notes"
+fi
+
+if [[ "$dry_run" == "true" ]]; then
+  echo "Dry run complete. No tag or release created."
+  exit 0
 fi
 
 git tag "$version"
