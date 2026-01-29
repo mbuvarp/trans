@@ -115,13 +115,13 @@ jobs:
           repo = os.environ["GITHUB_REPOSITORY"]
           bottle_json = pathlib.Path(os.environ["BOTTLE_JSON"])
           data = json.loads(bottle_json.read_text(encoding="utf-8"))
-          def extract_bottle_tags(payload):
+          def extract_bottle_metadata(payload):
             formula = payload.get("formula", {}).get("trans")
             if isinstance(formula, dict):
               bottle = formula.get("bottle", {})
               tags = bottle.get("tags") or bottle.get("files") or bottle.get("stable", {}).get("files", {})
               if tags:
-                return tags
+                return bottle, tags
 
             formulae = payload.get("formulae")
             if isinstance(formulae, list):
@@ -133,27 +133,33 @@ jobs:
                 bottle = entry.get("bottle", {})
                 tags = bottle.get("tags") or bottle.get("files") or bottle.get("stable", {}).get("files", {})
                 if tags:
-                  return tags
+                  return bottle, tags
 
             for value in payload.values():
               if not isinstance(value, dict):
                 continue
+              formula = value.get("formula")
+              if isinstance(formula, dict):
+                bottle = formula.get("bottle", {})
+                tags = bottle.get("tags") or bottle.get("files") or bottle.get("stable", {}).get("files", {})
+                if tags:
+                  return bottle, tags
               bottle = value.get("bottle")
               if not isinstance(bottle, dict):
                 continue
               tags = bottle.get("tags") or bottle.get("files") or bottle.get("stable", {}).get("files", {})
               if tags:
-                return tags
+                return bottle, tags
 
             bottles = payload.get("bottles")
             if isinstance(bottles, dict):
               tags = bottles.get("tags") or bottles.get("files")
               if tags:
-                return tags
+                return bottles, tags
 
-            return {}
+            return {}, {}
 
-          tags = extract_bottle_tags(data)
+          bottle, tags = extract_bottle_metadata(data)
           if not tags:
             raise SystemExit("Bottle JSON missing files")
           platform, info = next(iter(tags.items()))
@@ -162,12 +168,19 @@ jobs:
             raise SystemExit("Bottle JSON missing sha256")
 
           root_url = f"https://github.com/{repo}/releases/download/{tag}"
-          bottle_block = (
-              "  bottle do\n"
-              f"    root_url \"{root_url}\"\n"
-              f"    sha256 {platform}: \"{sha}\"\n"
-              "  end\n"
-          )
+          bottle_block_lines = [
+              "  bottle do",
+              f"    root_url \"{root_url}\"",
+          ]
+          cellar = bottle.get("cellar") or bottle.get("stable", {}).get("cellar")
+          if cellar:
+            bottle_block_lines.append(f"    cellar :{cellar}")
+          rebuild = bottle.get("rebuild") or bottle.get("stable", {}).get("rebuild")
+          if isinstance(rebuild, int) and rebuild > 0:
+            bottle_block_lines.append(f"    rebuild {rebuild}")
+          bottle_block_lines.append(f"    sha256 {platform}: \"{sha}\"")
+          bottle_block_lines.append("  end")
+          bottle_block = "\n".join(bottle_block_lines) + "\n"
 
           path = pathlib.Path("homebrew-trans/Formula/trans.rb")
           text = path.read_text(encoding="utf-8")
