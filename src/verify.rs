@@ -7,31 +7,61 @@ use crate::translations::{Translations, load_language_translations, save_languag
 
 pub type TranslationSnapshot = BTreeMap<String, Translations>;
 
+#[derive(Debug, Clone)]
+pub struct KeyMismatch {
+    pub language: String,
+    pub missing: BTreeSet<String>,
+    pub extra: BTreeSet<String>,
+}
+
 pub fn verify_language_files(root: impl AsRef<Path>, config: &TransConfig) -> Result<()> {
     let root = root.as_ref();
-    let mut base_keys: Option<BTreeSet<String>> = None;
-    let mut base_language: Option<&str> = None;
-
+    let mut translations_by_language = BTreeMap::new();
     for language in &config.available_languages {
         let translations = load_language_translations(root, config, language)?;
-        let keys: BTreeSet<String> = translations.keys().cloned().collect();
+        translations_by_language.insert(language.clone(), translations);
+    }
 
-        if let Some(base) = &base_keys {
-            if &keys != base {
-                let missing = format_key_list(&base.difference(&keys).cloned().collect());
-                let extra = format_key_list(&keys.difference(base).cloned().collect());
-                return Err(TransError::VerificationFailed(format!(
-                    "language '{language}' mismatch vs '{}' (missing: {missing}, extra: {extra})",
-                    base_language.unwrap_or("<unknown>")
-                )));
-            }
-        } else {
-            base_keys = Some(keys);
-            base_language = Some(language);
-        }
+    let base_language = &config.primary_language;
+    let mismatches = key_mismatches(&translations_by_language, base_language);
+    if let Some(mismatch) = mismatches.first() {
+        let missing = format_key_list(&mismatch.missing);
+        let extra = format_key_list(&mismatch.extra);
+        return Err(TransError::VerificationFailed(format!(
+            "language '{}' mismatch vs '{base_language}' (missing: {missing}, extra: {extra})",
+            mismatch.language
+        )));
     }
 
     Ok(())
+}
+
+pub fn key_mismatches(
+    translations_by_language: &BTreeMap<String, Translations>,
+    base_language: &str,
+) -> Vec<KeyMismatch> {
+    let base_keys = translations_by_language
+        .get(base_language)
+        .map(|translations| translations.keys().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+
+    let mut mismatches = Vec::new();
+    for (language, translations) in translations_by_language {
+        if language == base_language {
+            continue;
+        }
+        let keys: BTreeSet<String> = translations.keys().cloned().collect();
+        if keys != base_keys {
+            let missing = base_keys.difference(&keys).cloned().collect();
+            let extra = keys.difference(&base_keys).cloned().collect();
+            mismatches.push(KeyMismatch {
+                language: language.clone(),
+                missing,
+                extra,
+            });
+        }
+    }
+    mismatches
 }
 
 pub fn snapshot_translations(
@@ -89,6 +119,8 @@ mod tests {
             required_languages: vec!["en".to_string()],
             primary_language: "en".to_string(),
             default_untranslated_value: "".to_string(),
+            default_export_format: crate::config::ExportFormat::Excel,
+            excel_password: "unlock".to_string(),
             ai: None,
         }
     }

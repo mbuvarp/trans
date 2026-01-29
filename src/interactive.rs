@@ -5,7 +5,7 @@ use console::style;
 use dialoguer::{Completion, Confirm, FuzzySelect, Input, Select};
 
 use crate::ai::{AiSettings, resolve_ai_settings, suggest_translation};
-use crate::config::{AiConfig, ConfigField, TransConfig};
+use crate::config::{AiConfig, ConfigField, ExportFormat, TransConfig};
 use crate::error::Result;
 use crate::message_id::validate_message_id;
 use crate::operations::{
@@ -157,6 +157,8 @@ pub fn init_config_interactive(
         .interact_text()?;
     print_spacer();
 
+    let default_export_format = prompt_default_export_format(ExportFormat::Excel)?;
+
     print_label("Do you want to set up AI?");
     let setup_ai = Confirm::new().with_prompt(">").default(true).interact()?;
     print_spacer();
@@ -173,6 +175,8 @@ pub fn init_config_interactive(
         required_languages,
         primary_language,
         default_untranslated_value,
+        default_export_format,
+        excel_password: "unlock".to_string(),
         ai,
     };
 
@@ -253,11 +257,14 @@ pub fn configure_root_interactive(root: impl AsRef<Path>) -> Result<()> {
         .interact_text()?;
     print_spacer();
 
+    let default_export_format = prompt_default_export_format(config.default_export_format)?;
+
     config.language_files_path = language_files_path.into();
     config.available_languages = available_languages;
     config.required_languages = required_languages;
     config.primary_language = primary_language;
     config.default_untranslated_value = default_untranslated_value;
+    config.default_export_format = default_export_format;
 
     config.validate()?;
     config.save_to_root(root)?;
@@ -440,6 +447,8 @@ pub fn configure_edit_interactive(
                 false
             };
 
+            let default_export_format = prompt_default_export_format(config.default_export_format)?;
+
             print_label("Do you want to set up AI?");
             let setup_ai = Confirm::new()
                 .with_prompt(">")
@@ -458,6 +467,7 @@ pub fn configure_edit_interactive(
             config.required_languages = required_languages;
             config.primary_language = primary_language;
             config.default_untranslated_value = default_untranslated_value;
+            config.default_export_format = default_export_format;
             config.ai = ai;
 
             config.validate()?;
@@ -577,6 +587,20 @@ pub fn configure_edit_interactive(
                 )?;
                 println!("Replaced {replaced} values.");
             }
+        }
+        Some(ConfigField::DefaultExportFormat) => {
+            config.default_export_format =
+                prompt_default_export_format(config.default_export_format)?;
+        }
+        Some(ConfigField::ExcelPassword) => {
+            print_label("Excel password");
+            let excel_password = Input::<String>::new()
+                .with_prompt(">")
+                .default(config.excel_password.clone())
+                .allow_empty(true)
+                .interact_text()?;
+            print_spacer();
+            config.excel_password = excel_password;
         }
         Some(ConfigField::AiEnabled) => {
             let defaults = config.ai.clone().unwrap_or_default();
@@ -795,6 +819,25 @@ fn prompt_language_list(default: Option<&[String]>) -> Result<Vec<String>> {
         }
         return Ok(values);
     }
+}
+
+fn prompt_default_export_format(current: ExportFormat) -> Result<ExportFormat> {
+    print_label("Default export format");
+    let choices = ["excel", "csv"];
+    let default_index = match current {
+        ExportFormat::Excel => 0,
+        ExportFormat::Csv => 1,
+    };
+    let selection = Select::new()
+        .with_prompt(">")
+        .items(&choices)
+        .default(default_index)
+        .interact()?;
+    print_spacer();
+    Ok(match selection {
+        0 => ExportFormat::Excel,
+        _ => ExportFormat::Csv,
+    })
 }
 
 fn discover_languages(root: &Path, relative_path: &str) -> Result<Vec<String>> {

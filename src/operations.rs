@@ -287,6 +287,8 @@ mod tests {
             required_languages: vec!["en".to_string()],
             primary_language: "en".to_string(),
             default_untranslated_value: "".to_string(),
+            default_export_format: crate::config::ExportFormat::Excel,
+            excel_password: "unlock".to_string(),
             ai: None,
         }
     }

@@ -99,6 +99,7 @@ pub fn export_excel(root: impl AsRef<Path>, config: &TransConfig) -> Result<Path
         &config.available_languages,
         &output_path,
         false,
+        true,
     )?;
     Ok(output_path)
 }
@@ -109,18 +110,48 @@ pub fn export_excel_with_options(
     languages: &[String],
     output_path: &Path,
     missing_only: bool,
+    lock: bool,
 ) -> Result<()> {
     let ids = message_ids(translations_by_language, &config.primary_language)?;
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
-    let missing_format = Format::new().set_background_color(Color::RGB(0xFFC7CE));
+    let missing_format = if lock {
+        Format::new()
+            .set_unlocked()
+            .set_background_color(Color::RGB(0xFFC7CE))
+    } else {
+        Format::new().set_background_color(Color::RGB(0xFFC7CE))
+    };
+    let unlocked_format = if lock {
+        Some(Format::new().set_unlocked())
+    } else {
+        None
+    };
+    let locked_format = if lock {
+        Some(Format::new().set_locked())
+    } else {
+        None
+    };
+    let header_format = if lock {
+        Format::new().set_locked().set_bold()
+    } else {
+        Format::new().set_bold()
+    };
 
-    worksheet.write_string(0, 0, "id")?;
+    worksheet.write_string_with_format(0, 0, "id", &header_format)?;
     for (idx, language) in languages.iter().enumerate() {
-        worksheet.write_string(0, (idx + 1) as u16, language.as_str())?;
+        worksheet.write_string_with_format(
+            0,
+            (idx + 1) as u16,
+            language.as_str(),
+            &header_format,
+        )?;
     }
 
     let mut row_index = 0usize;
+    let primary_col = languages
+        .iter()
+        .position(|lang| lang == &config.primary_language);
     for message_id in ids {
         let mut values = Vec::with_capacity(languages.len());
         let mut has_missing = false;
@@ -137,9 +168,22 @@ pub fn export_excel_with_options(
         }
         if !missing_only || has_missing {
             let row = (row_index + 1) as u32;
-            worksheet.write_string(row, 0, message_id.as_str())?;
+            if let Some(format) = locked_format.as_ref() {
+                worksheet.write_string_with_format(row, 0, message_id.as_str(), format)?;
+            } else {
+                worksheet.write_string(row, 0, message_id.as_str())?;
+            }
             for (col_index, value) in values.iter().enumerate() {
                 let col = (col_index + 1) as u16;
+                let is_primary = primary_col == Some(col_index);
+                if is_primary {
+                    if let Some(format) = locked_format.as_ref() {
+                        worksheet.write_string_with_format(row, col, value.as_str(), format)?;
+                    } else {
+                        worksheet.write_string(row, col, value.as_str())?;
+                    }
+                    continue;
+                }
                 if value == &config.default_untranslated_value {
                     worksheet.write_string_with_format(
                         row,
@@ -147,6 +191,8 @@ pub fn export_excel_with_options(
                         value.as_str(),
                         &missing_format,
                     )?;
+                } else if let Some(format) = unlocked_format.as_ref() {
+                    worksheet.write_string_with_format(row, col, value.as_str(), format)?;
                 } else {
                     worksheet.write_string(row, col, value.as_str())?;
                 }
@@ -155,6 +201,9 @@ pub fn export_excel_with_options(
         }
     }
 
+    if lock {
+        worksheet.protect_with_password(&config.excel_password);
+    }
     workbook.save(output_path)?;
     Ok(())
 }
@@ -176,6 +225,7 @@ pub fn export_excel_filtered(
         languages,
         &output_path,
         false,
+        true,
     )?;
     Ok(output_path)
 }

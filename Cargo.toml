@@ -10,6 +10,8 @@ console = "0.16.2"
 csv = "1.4.0"
 dialoguer = { version = "0.12.0", features = ["completion", "fuzzy-select"] }
 dotenvy = "0.15.7"
+formatjs_icu_messageformat_parser = "0.2.2"
+calamine = "0.26.1"
 reqwest = { version = "0.12.14", features = ["json", "rustls-tls"] }
 tokio = { version = "1.43.0", features = ["rt-multi-thread"] }
 serde = { version = "1.0.228", features = ["derive"] }

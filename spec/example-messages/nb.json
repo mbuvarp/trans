@@ -210,7 +210,7 @@
   "common.data-to": "Til",
   "common.date": "Dato",
   "common.date-for-type": "Dato for {type}",
-  "common.date-range": "NEEDS TRANSLATION",
+  "common.date-range": "Periode",
   "common.date-start": "Etter startdato",
   "common.date-validation-not-in-future": "Dato må være gyldig og ikke i fremtiden",
   "common.day": "Dag",

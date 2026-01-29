@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::config::ExportFormat;
 use crate::error::{Result, TransError};
+use crate::import::ExtraLangsStrategy;
 use crate::operations::TranslationValues;
 
 #[derive(Parser, Debug)]
@@ -99,7 +101,7 @@ pub enum Command {
     },
     #[command(
         about = "Update config values interactively",
-        long_about = "Update config values interactively.\n\nRoot config options:\n- languageFilesPath: location of language files\n- availableLanguages: all known languages\n- requiredLanguages: languages required for input\n- primaryLanguage: first language in interactive mode\n- defaultUntranslatedValue: default for non-required languages\n\nUse `trans config ai` to edit AI settings:\n- enabled\n- model\n- apiKeyEnv\n- maxOutputTokens\n\nUse `trans config show` to print current configuration values.\nUse `trans config edit [key]` to edit all values or a single key.\nUse `trans config --format json|yaml` to convert the config file format."
+        long_about = "Update config values interactively.\n\nRoot config options:\n- languageFilesPath: location of language files\n- availableLanguages: all known languages\n- requiredLanguages: languages required for input\n- primaryLanguage: first language in interactive mode\n- defaultUntranslatedValue: default for non-required languages\n- defaultExportFormat: csv or excel\n- excelPassword: password for Excel sheet protection\n\nUse `trans config ai` to edit AI settings:\n- enabled\n- model\n- apiKeyEnv\n- maxOutputTokens\n\nUse `trans config show` to print current configuration values.\nUse `trans config edit [key]` to edit all values or a single key.\nUse `trans config --format json|yaml` to convert the config file format."
     )]
     Config {
         #[arg(
@@ -125,11 +127,10 @@ pub enum Command {
             short = 'f',
             long,
             value_enum,
-            default_value = "csv",
             value_name = "FORMAT",
             help = "Export format: csv or excel"
         )]
-        format: ExportFormat,
+        format: Option<ExportFormat>,
         #[arg(
             short = 'l',
             long = "lang",
@@ -150,9 +151,38 @@ pub enum Command {
             help = "Only export rows with missing values"
         )]
         missing: bool,
+        #[arg(
+            long = "no-lock",
+            help = "Disable worksheet protection in Excel exports"
+        )]
+        no_lock: bool,
+    },
+    #[command(about = "Import translations from a CSV or Excel file")]
+    Import {
+        #[arg(value_name = "FILE", help = "Path to a .csv or .xlsx file to import")]
+        path: String,
+        #[arg(
+            short = 'l',
+            long = "lang",
+            value_name = "LANGS",
+            help = "Comma-separated locales to import (primary language is ignored)"
+        )]
+        lang: Option<String>,
+        #[arg(
+            long = "extra-langs",
+            value_enum,
+            value_name = "STRATEGY",
+            help = "How to handle extra languages in the import file: ignore, create, or abort"
+        )]
+        extra_langs: Option<ExtraLangsStrategy>,
+        #[arg(long = "trim", help = "Trim whitespace around imported values")]
+        trim: bool,
     },
     #[command(about = "Verify that all language files contain the same message ids")]
-    Verify,
+    Verify {
+        #[arg(long = "ai", help = "Use AI to suggest fixes for verification errors")]
+        ai: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -175,12 +205,6 @@ pub enum ConfigFormat {
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
-pub enum ExportFormat {
-    Csv,
-    Excel,
-}
-
-#[derive(ValueEnum, Debug, Clone, Copy)]
 pub enum ConfigKey {
     #[value(name = "languageFilesPath")]
     LanguageFilesPath,
@@ -192,6 +216,10 @@ pub enum ConfigKey {
     PrimaryLanguage,
     #[value(name = "defaultUntranslatedValue")]
     DefaultUntranslatedValue,
+    #[value(name = "defaultExportFormat")]
+    DefaultExportFormat,
+    #[value(name = "excelPassword")]
+    ExcelPassword,
     #[value(name = "ai.enabled")]
     AiEnabled,
     #[value(name = "ai.model")]

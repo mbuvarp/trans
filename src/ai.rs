@@ -40,13 +40,34 @@ pub async fn suggest_translation(
     message_id: &str,
     source_text: &str,
 ) -> Result<String> {
-    let client = Client::new();
-
     let system_prompt = format!(
         "You are a professional translator. Translate from {source_lang} to {target_lang}. Preserve placeholders like {{name}} and ICU plural/select syntax. Return only the translation text."
     );
 
     let user_prompt = format!("Message ID: {message_id}\nSource: {source_text}");
+    suggest_custom(settings, &system_prompt, &user_prompt).await
+}
+
+pub async fn suggest_custom(
+    settings: &AiSettings,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<String> {
+    if let Ok(mock) = env::var("TRANS_AI_MOCK") {
+        let trimmed = mock.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    if let Ok(value) = env::var("TRANS_AI_DISABLE") {
+        let value = value.trim().to_ascii_lowercase();
+        if value == "1" || value == "true" || value == "yes" {
+            return Err(TransError::InvalidInput(
+                "AI is disabled via TRANS_AI_DISABLE".to_string(),
+            ));
+        }
+    }
+    let client = Client::new();
 
     let request = ResponsesRequest {
         model: settings.model.clone(),
@@ -55,14 +76,14 @@ pub async fn suggest_translation(
                 role: "system",
                 content: vec![ResponseContent {
                     kind: "input_text",
-                    text: system_prompt,
+                    text: system_prompt.to_string(),
                 }],
             },
             ResponseInputItem {
                 role: "user",
                 content: vec![ResponseContent {
                     kind: "input_text",
-                    text: user_prompt,
+                    text: user_prompt.to_string(),
                 }],
             },
         ],
@@ -226,6 +247,8 @@ mod tests {
             required_languages: vec!["en".to_string()],
             primary_language: "en".to_string(),
             default_untranslated_value: "".to_string(),
+            default_export_format: crate::config::ExportFormat::Excel,
+            excel_password: "unlock".to_string(),
             ai: Some(AiConfig {
                 enabled: true,
                 model: "gpt-5-mini".to_string(),

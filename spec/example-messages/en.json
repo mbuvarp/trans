@@ -1880,7 +1880,7 @@
   "settings.prompts.absence-type-delete": "Are you sure you want to delete the absence type \"{name}\"?",
   "settings.prompts.absence-type-delete-title": "Delete absence type",
   "settings.prompts.create-user-type": "What should be the name of the new user type?",
-  "settings.prompts.delete": "Do you really want to delete {}?",
+  "settings.prompts.delete": "Do you really want to delete {name}?",
   "settings.prompts.delete-checklist-template": "Delete checklist template",
   "settings.prompts.delete-checklist-template-description": "Do you want to delete the checklist template?",
   "settings.prompts.delete-time-entry-project": "Are you sure you want to delete the project \"{name}\"?",
