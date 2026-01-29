@@ -5,7 +5,7 @@ use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
-use trans::config::TransConfig;
+use trans::config::{AiConfig, TransConfig};
 use trans::translations::{Translations, load_language_translations, save_language_translations};
 
 fn base_config() -> TransConfig {
@@ -15,6 +15,8 @@ fn base_config() -> TransConfig {
         required_languages: vec!["en".to_string()],
         primary_language: "en".to_string(),
         default_untranslated_value: "".to_string(),
+        default_export_format: trans::config::ExportFormat::Excel,
+        excel_password: "unlock".to_string(),
         ai: None,
     }
 }
@@ -48,8 +50,32 @@ fn setup_project(root: &std::path::Path) -> TransConfig {
     config
 }
 
+fn setup_project_with_ai(root: &std::path::Path) -> TransConfig {
+    let mut config = base_config();
+    config.ai = Some(AiConfig {
+        enabled: true,
+        model: "gpt-5-mini".to_string(),
+        api_key_env: "OPENAI_API_KEY".to_string(),
+        max_output_tokens: 64,
+    });
+    config.save_to_root(root).expect("save config");
+
+    save_language_translations(
+        root,
+        &config,
+        "en",
+        &translations(&[("app.title", "Title")]),
+    )
+    .expect("save en");
+    save_language_translations(root, &config, "nb", &Translations::new()).expect("save nb");
+
+    config
+}
+
 fn trans_cmd() -> Command {
-    Command::new(assert_cmd::cargo::cargo_bin!("trans"))
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("trans"));
+    cmd.env("TRANS_AI_DISABLE", "1");
+    cmd
 }
 
 #[test]
@@ -131,6 +157,38 @@ fn verify_and_export_commands() {
         .success();
 
     assert!(dir.path().join("translations.xlsx").exists());
+}
+
+#[test]
+fn verify_ai_applies_mock_suggestion_for_missing_id() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_project_with_ai(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["verify", "--ai"])
+        .env("OPENAI_API_KEY", "test-key")
+        .env("TRANS_AI_MOCK", "Suggested")
+        .env("TRANS_AI_ASSUME_YES", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK"));
+
+    let nb = load_language_translations(dir.path(), &config, "nb").expect("load nb");
+    assert_eq!(nb.get("app.title").map(String::as_str), Some("Suggested"));
+}
+
+#[test]
+fn verify_ai_requires_configuration() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["verify", "--ai"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("AI is not configured"));
 }
 
 #[test]

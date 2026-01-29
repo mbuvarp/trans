@@ -9,10 +9,12 @@ use trans::cli::{
     Cli, Command, ConfigFormat, ConfigKey, ConfigSection, parse_lang_list, parse_values,
 };
 use trans::config::{
-    ConfigField, ConfigFormat as ConfigFileFormat, TransConfig, format_config_list,
+    ConfigField, ConfigFormat as ConfigFileFormat, ExportFormat, TransConfig, format_config_list,
 };
 use trans::error::{Result, TransError};
 use trans::export::{export_csv, export_csv_with_options, export_excel, export_excel_with_options};
+use trans::format_validation::validate_message_formats;
+use trans::import::import_translations;
 use trans::interactive::{
     configure_ai_interactive, configure_edit_interactive, configure_root_interactive,
     init_config_interactive, run_interactive,
@@ -22,6 +24,7 @@ use trans::operations::{
 };
 use trans::query::{get_translation, get_translations_all, list_required_languages};
 use trans::verify::verify_language_files;
+use trans::verify_ai::verify_with_ai;
 
 fn main() {
     if let Err(err) = run() {
@@ -56,10 +59,12 @@ fn run() -> Result<()> {
             lang,
             output,
             missing,
+            no_lock,
         }) => {
             let root = env::current_dir()?;
             let config = TransConfig::load_from_root(&root)?;
-            let use_custom = lang.is_some() || output.is_some() || missing;
+            let format = format.unwrap_or(config.default_export_format);
+            let use_custom = lang.is_some() || output.is_some() || missing || no_lock;
             let selected = if let Some(lang) = lang {
                 let langs = parse_lang_list(&lang)?;
                 let selected = resolve_export_languages(&config, &langs)?;
@@ -79,7 +84,7 @@ fn run() -> Result<()> {
             }
             let output_path = build_export_path(&root, output.as_deref(), format);
             match format {
-                trans::cli::ExportFormat::Csv => {
+                ExportFormat::Csv => {
                     if let Some(langs) = selected.as_ref() {
                         let translations =
                             trans::export::load_selected_languages(&root, &config, langs)?;
@@ -111,7 +116,7 @@ fn run() -> Result<()> {
                         }
                     }
                 }
-                trans::cli::ExportFormat::Excel => {
+                ExportFormat::Excel => {
                     if let Some(langs) = selected.as_ref() {
                         let translations =
                             trans::export::load_selected_languages(&root, &config, langs)?;
@@ -121,6 +126,7 @@ fn run() -> Result<()> {
                             langs,
                             &output_path,
                             missing,
+                            !no_lock,
                         )?;
                         println!("Exported Excel to {}", output_path.display());
                         Ok(())
@@ -133,6 +139,7 @@ fn run() -> Result<()> {
                                 &config.available_languages,
                                 &output_path,
                                 missing,
+                                !no_lock,
                             )?;
                             println!("Exported Excel to {}", output_path.display());
                             Ok(())
@@ -144,6 +151,27 @@ fn run() -> Result<()> {
                     }
                 }
             }
+        }
+        Some(Command::Import {
+            path,
+            lang,
+            extra_langs,
+            trim,
+        }) => {
+            let root = env::current_dir()?;
+            let config = TransConfig::load_from_root(&root)?;
+            let lang_filter = match lang {
+                Some(lang) => Some(parse_lang_list(&lang)?),
+                None => None,
+            };
+            import_translations(
+                &root,
+                &config,
+                Path::new(&path),
+                lang_filter,
+                extra_langs,
+                trim,
+            )
         }
         Some(Command::ListRequiredLanguages) => {
             let root = env::current_dir()?;
@@ -225,12 +253,18 @@ fn run() -> Result<()> {
             let config = TransConfig::load_from_root(&root)?;
             change_message_id(&root, &config, &old_id, &new_id)
         }
-        Some(Command::Verify) => {
+        Some(Command::Verify { ai }) => {
             let root = env::current_dir()?;
             let config = TransConfig::load_from_root(&root)?;
-            verify_language_files(&root, &config)?;
-            println!("OK");
-            Ok(())
+            if ai {
+                verify_with_ai(&root, &config)
+            } else {
+                verify_language_files(&root, &config)?;
+                let translations = trans::export::load_all_languages(&root, &config)?;
+                validate_message_formats(&config, &translations)?;
+                println!("OK");
+                Ok(())
+            }
         }
     }
 }
@@ -242,6 +276,8 @@ fn map_config_key(key: ConfigKey) -> ConfigField {
         ConfigKey::RequiredLanguages => ConfigField::RequiredLanguages,
         ConfigKey::PrimaryLanguage => ConfigField::PrimaryLanguage,
         ConfigKey::DefaultUntranslatedValue => ConfigField::DefaultUntranslatedValue,
+        ConfigKey::DefaultExportFormat => ConfigField::DefaultExportFormat,
+        ConfigKey::ExcelPassword => ConfigField::ExcelPassword,
         ConfigKey::AiEnabled => ConfigField::AiEnabled,
         ConfigKey::AiModel => ConfigField::AiModel,
         ConfigKey::AiApiKeyEnv => ConfigField::AiApiKeyEnv,
@@ -280,17 +316,13 @@ fn resolve_export_languages(config: &TransConfig, requested: &[String]) -> Resul
     Ok(selected)
 }
 
-fn build_export_path(
-    root: &Path,
-    output: Option<&str>,
-    format: trans::cli::ExportFormat,
-) -> PathBuf {
+fn build_export_path(root: &Path, output: Option<&str>, format: ExportFormat) -> PathBuf {
     let base = output.unwrap_or("translations");
     let mut path = PathBuf::from(base);
     if path.extension().is_none() {
         let ext = match format {
-            trans::cli::ExportFormat::Csv => "csv",
-            trans::cli::ExportFormat::Excel => "xlsx",
+            ExportFormat::Csv => "csv",
+            ExportFormat::Excel => "xlsx",
         };
         path.set_extension(ext);
     }

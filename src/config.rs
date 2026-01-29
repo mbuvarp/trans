@@ -3,6 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use clap::ValueEnum;
 use console::style;
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +29,14 @@ fn default_ai_max_output_tokens() -> u32 {
     128
 }
 
+fn default_export_format() -> ExportFormat {
+    ExportFormat::Excel
+}
+
+fn default_excel_password() -> String {
+    "unlock".to_string()
+}
+
 const CONFIG_JSON_FILE_NAME: &str = ".trans.config.json";
 const CONFIG_YAML_FILE_NAME: &str = ".trans.config.yaml";
 
@@ -35,6 +44,22 @@ const CONFIG_YAML_FILE_NAME: &str = ".trans.config.yaml";
 pub enum ConfigFormat {
     Json,
     Yaml,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    Csv,
+    Excel,
+}
+
+impl ExportFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExportFormat::Csv => "csv",
+            ExportFormat::Excel => "excel",
+        }
+    }
 }
 
 impl ConfigFormat {
@@ -73,6 +98,10 @@ pub struct TransConfig {
     pub primary_language: String,
     #[serde(default = "default_untranslated_value")]
     pub default_untranslated_value: String,
+    #[serde(default = "default_export_format")]
+    pub default_export_format: ExportFormat,
+    #[serde(default = "default_excel_password")]
+    pub excel_password: String,
     #[serde(default)]
     pub ai: Option<AiConfig>,
 }
@@ -274,6 +303,14 @@ pub fn format_config_list(config: &TransConfig, config_path: Option<&Path>) -> V
         "defaultUntranslatedValue",
         &format_value(&config.default_untranslated_value),
     ));
+    lines.push(format_label_value(
+        "defaultExportFormat",
+        config.default_export_format.as_str(),
+    ));
+    lines.push(format_label_value(
+        "excelPassword",
+        &format_value(&config.excel_password),
+    ));
 
     let ai = config.ai.clone().unwrap_or_default();
     lines.push(format_label_value("ai.enabled", &ai.enabled.to_string()));
@@ -293,6 +330,8 @@ pub enum ConfigField {
     RequiredLanguages,
     PrimaryLanguage,
     DefaultUntranslatedValue,
+    DefaultExportFormat,
+    ExcelPassword,
     AiEnabled,
     AiModel,
     AiApiKeyEnv,
@@ -348,6 +387,8 @@ mod tests {
             required_languages: vec!["en".to_string()],
             primary_language: "en".to_string(),
             default_untranslated_value: "".to_string(),
+            default_export_format: ExportFormat::Excel,
+            excel_password: "unlock".to_string(),
             ai: None,
         }
     }
@@ -364,6 +405,8 @@ mod tests {
         "#;
         let config: TransConfig = serde_json::from_str(json).expect("valid json");
         assert_eq!(config.default_untranslated_value, "");
+        assert_eq!(config.default_export_format, ExportFormat::Excel);
+        assert_eq!(config.excel_password, "unlock");
         assert!(config.ai.is_none());
     }
 
