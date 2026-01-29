@@ -122,6 +122,7 @@ pub enum Command {
     #[command(about = "Export translations to CSV or Excel")]
     Export {
         #[arg(
+            short = 'f',
             long,
             value_enum,
             default_value = "csv",
@@ -129,6 +130,26 @@ pub enum Command {
             help = "Export format: csv or excel"
         )]
         format: ExportFormat,
+        #[arg(
+            short = 'l',
+            long = "lang",
+            value_name = "LANGS",
+            help = "Comma-separated locales to include (primary language is always included)"
+        )]
+        lang: Option<String>,
+        #[arg(
+            short = 'o',
+            long = "output",
+            value_name = "FILE",
+            help = "Output filename (defaults to translations)"
+        )]
+        output: Option<String>,
+        #[arg(
+            short = 'm',
+            long = "missing",
+            help = "Only export rows with missing values"
+        )]
+        missing: bool,
     },
     #[command(about = "Verify that all language files contain the same message ids")]
     Verify,
@@ -221,6 +242,28 @@ pub fn parse_values(input: &str) -> Result<TranslationValues> {
     }
 
     Ok(map)
+}
+
+pub fn parse_lang_list(input: &str) -> Result<Vec<String>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(TransError::InvalidInput(
+            "languages must not be empty".to_string(),
+        ));
+    }
+
+    let mut values = Vec::new();
+    for value in trimmed.split(',') {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(TransError::InvalidInput(
+                "language value must not be empty".to_string(),
+            ));
+        }
+        values.push(value.to_string());
+    }
+
+    Ok(values)
 }
 
 #[cfg(test)]

@@ -132,3 +132,74 @@ fn verify_and_export_commands() {
 
     assert!(dir.path().join("translations.xlsx").exists());
 }
+
+#[test]
+fn export_with_lang_filter_includes_primary_and_selected() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["export", "--format", "csv", "--lang", "nb"])
+        .assert()
+        .success();
+
+    let csv_path = dir.path().join("translations.csv");
+    let contents = std::fs::read_to_string(csv_path).expect("read csv");
+    let header = contents.lines().next().unwrap_or_default();
+    assert_eq!(header, "id,en,nb");
+}
+
+#[test]
+fn export_with_only_primary_lang_warns_and_skips() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["export", "--format", "csv", "--lang", "en"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Warning"));
+
+    assert!(!dir.path().join("translations.csv").exists());
+}
+
+#[test]
+fn export_with_output_without_extension_appends_format() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["export", "--format", "csv", "--output", "custom-name"])
+        .assert()
+        .success();
+
+    assert!(dir.path().join("custom-name.csv").exists());
+}
+
+#[test]
+fn export_missing_only_filters_rows() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["add", "--id", "app.missing", "--values", "en:Missing"])
+        .assert()
+        .success();
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["export", "--format", "csv", "--missing"])
+        .assert()
+        .success();
+
+    let csv_path = dir.path().join("translations.csv");
+    let contents = std::fs::read_to_string(csv_path).expect("read csv");
+    let rows: Vec<&str> = contents.lines().collect();
+    assert_eq!(rows[0], "id,en,nb");
+    assert_eq!(rows.len(), 2);
+    assert!(rows[1].starts_with("app.missing,"));
+}
