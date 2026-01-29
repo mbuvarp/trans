@@ -150,29 +150,9 @@ prepare_changelog() {
     local prompt
     prompt="$(
       cat <<PROMPT
-You are drafting release notes for the trans CLI. Summarize changes since ${last_tag:-the last release}. Use the commit subjects below to produce a concise changelog like:
-
-## Changes
-
-### Highlights
-- ...
-
-### Translation workflows
-- ...
-
-### AI + validation
-- ...
-
-### Release/CI
-- ...
-
-### Misc
-- ...
-
-Rules:
-- Group items into the most relevant section. Only include sections that have items.
-- Use short, user-facing descriptions (not raw commit prefixes).
-- Keep the output in markdown and do not include any extra commentary.
+You are drafting release notes for the trans CLI. Summarize changes since ${last_tag:-the last release}.
+Group related changes into sections when it improves readability. Use concise, user-facing descriptions (not raw commit prefixes).
+Keep the output in markdown and do not include any extra commentary.
 
 Commit subjects:
 PROMPT
