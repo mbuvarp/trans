@@ -3,6 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use console::style;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, TransError};
@@ -248,33 +249,45 @@ impl TransConfig {
 pub fn format_config_list(config: &TransConfig, config_path: Option<&Path>) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(path) = config_path {
-        lines.push(format!("configPath: {}", path.display()));
+        lines.push(format_label_value(
+            "configPath",
+            &path.display().to_string(),
+        ));
     }
-    lines.push(format!(
-        "languageFilesPath: {}",
-        config.language_files_path.display()
+    lines.push(format_label_value(
+        "languageFilesPath",
+        &config.language_files_path.display().to_string(),
     ));
-    lines.push(format!(
-        "availableLanguages: {}",
-        config.available_languages.join(", ")
+    lines.push(format_label_value(
+        "availableLanguages",
+        &config.available_languages.join(", "),
     ));
-    lines.push(format!(
-        "requiredLanguages: {}",
-        config.required_languages.join(", ")
+    lines.push(format_label_value(
+        "requiredLanguages",
+        &config.required_languages.join(", "),
     ));
-    lines.push(format!("primaryLanguage: {}", config.primary_language));
-    lines.push(format!(
-        "defaultUntranslatedValue: {}",
-        format_value(&config.default_untranslated_value)
+    lines.push(format_label_value(
+        "primaryLanguage",
+        &config.primary_language,
+    ));
+    lines.push(format_label_value(
+        "defaultUntranslatedValue",
+        &format_value(&config.default_untranslated_value),
     ));
 
     let ai_configured = config.ai.is_some();
     let ai = config.ai.clone().unwrap_or_default();
-    lines.push(format!("aiConfigured: {ai_configured}"));
-    lines.push(format!("ai.enabled: {}", ai.enabled));
-    lines.push(format!("ai.model: {}", ai.model));
-    lines.push(format!("ai.apiKeyEnv: {}", ai.api_key_env));
-    lines.push(format!("ai.maxOutputTokens: {}", ai.max_output_tokens));
+    lines.push(format_label_value(
+        "aiConfigured",
+        &ai_configured.to_string(),
+    ));
+    lines.push(format_label_value("ai.enabled", &ai.enabled.to_string()));
+    lines.push(format_label_value("ai.model", &ai.model));
+    lines.push(format_label_value("ai.apiKeyEnv", &ai.api_key_env));
+    lines.push(format_label_value(
+        "ai.maxOutputTokens",
+        &ai.max_output_tokens.to_string(),
+    ));
     lines
 }
 
@@ -284,6 +297,10 @@ fn format_value(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn format_label_value(label: &str, value: &str) -> String {
+    format!("{}: {}", style(label).bold(), value)
 }
 
 fn validate_language_list(name: &str, values: &[String]) -> Result<()> {
