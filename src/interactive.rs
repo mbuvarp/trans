@@ -82,6 +82,25 @@ pub fn init_config_interactive(
     format: crate::config::ConfigFormat,
 ) -> Result<()> {
     let root = root.as_ref();
+    let (json_path, yaml_path) = TransConfig::config_paths(root);
+    if json_path.exists() || yaml_path.exists() {
+        print_label("Config file already exists, do you wish to overwrite?");
+        println!(
+            "Found {}{}",
+            json_path.display(),
+            if yaml_path.exists() {
+                format!(", {}", yaml_path.display())
+            } else {
+                "".to_string()
+            }
+        );
+        let overwrite = Confirm::new().with_prompt(">").default(false).interact()?;
+        print_spacer();
+        if !overwrite {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
     let language_files_path = prompt_language_files_path(root)?;
 
     let default_languages = discover_languages(root, &language_files_path)?;
