@@ -109,9 +109,35 @@ jobs:
           repo = os.environ["GITHUB_REPOSITORY"]
           bottle_json = pathlib.Path(os.environ["BOTTLE_JSON"])
           data = json.loads(bottle_json.read_text(encoding="utf-8"))
-          formula = data.get("formula", {}).get("trans", {})
-          bottle = formula.get("bottle", {})
-          files = bottle.get("files") or bottle.get("stable", {}).get("files", {})
+          def extract_bottle_files(payload):
+            formula = payload.get("formula", {}).get("trans")
+            if isinstance(formula, dict):
+              bottle = formula.get("bottle", {})
+              files = bottle.get("files") or bottle.get("stable", {}).get("files", {})
+              if files:
+                return files
+
+            formulae = payload.get("formulae")
+            if isinstance(formulae, list):
+              for entry in formulae:
+                if not isinstance(entry, dict):
+                  continue
+                if entry.get("name") not in ("trans", None):
+                  continue
+                bottle = entry.get("bottle", {})
+                files = bottle.get("files") or bottle.get("stable", {}).get("files", {})
+                if files:
+                  return files
+
+            bottles = payload.get("bottles")
+            if isinstance(bottles, dict):
+              files = bottles.get("files")
+              if files:
+                return files
+
+            return {}
+
+          files = extract_bottle_files(data)
           if not files:
             raise SystemExit("Bottle JSON missing files")
           platform, info = next(iter(files.items()))
