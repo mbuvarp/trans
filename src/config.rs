@@ -3,6 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use console::style;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, TransError};
@@ -136,6 +137,10 @@ impl TransConfig {
     }
 
     pub fn load_from_root(root: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self::load_from_root_with_path(root)?.0)
+    }
+
+    pub fn load_from_root_with_path(root: impl AsRef<Path>) -> Result<(Self, PathBuf)> {
         let (json_path, yaml_path) = Self::config_paths(root);
         let json_exists = json_path.exists();
         let yaml_exists = yaml_path.exists();
@@ -143,8 +148,8 @@ impl TransConfig {
             (true, true) => Err(TransError::InvalidConfig(
                 "both .trans.config.json and .trans.config.yaml exist; keep only one".to_string(),
             )),
-            (true, false) => Self::load_from_path(json_path),
-            (false, true) => Self::load_from_path(yaml_path),
+            (true, false) => Ok((Self::load_from_path(&json_path)?, json_path)),
+            (false, true) => Ok((Self::load_from_path(&yaml_path)?, yaml_path)),
             (false, false) => Err(TransError::MissingConfig(format!(
                 "{} or {}",
                 json_path.display(),
@@ -239,6 +244,71 @@ impl TransConfig {
 
         Ok(())
     }
+}
+
+pub fn format_config_list(config: &TransConfig, config_path: Option<&Path>) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(path) = config_path {
+        lines.push(format_label_value(
+            "configPath",
+            &path.display().to_string(),
+        ));
+    }
+    lines.push(format_label_value(
+        "languageFilesPath",
+        &config.language_files_path.display().to_string(),
+    ));
+    lines.push(format_label_value(
+        "availableLanguages",
+        &config.available_languages.join(", "),
+    ));
+    lines.push(format_label_value(
+        "requiredLanguages",
+        &config.required_languages.join(", "),
+    ));
+    lines.push(format_label_value(
+        "primaryLanguage",
+        &config.primary_language,
+    ));
+    lines.push(format_label_value(
+        "defaultUntranslatedValue",
+        &format_value(&config.default_untranslated_value),
+    ));
+
+    let ai = config.ai.clone().unwrap_or_default();
+    lines.push(format_label_value("ai.enabled", &ai.enabled.to_string()));
+    lines.push(format_label_value("ai.model", &ai.model));
+    lines.push(format_label_value("ai.apiKeyEnv", &ai.api_key_env));
+    lines.push(format_label_value(
+        "ai.maxOutputTokens",
+        &ai.max_output_tokens.to_string(),
+    ));
+    lines
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ConfigField {
+    LanguageFilesPath,
+    AvailableLanguages,
+    RequiredLanguages,
+    PrimaryLanguage,
+    DefaultUntranslatedValue,
+    AiEnabled,
+    AiModel,
+    AiApiKeyEnv,
+    AiMaxOutputTokens,
+}
+
+fn format_value(value: &str) -> String {
+    if value.is_empty() {
+        "<empty>".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_label_value(label: &str, value: &str) -> String {
+    format!("{}: {}", style(label).bold(), value)
 }
 
 fn validate_language_list(name: &str, values: &[String]) -> Result<()> {

@@ -5,7 +5,7 @@ use console::style;
 use dialoguer::{Completion, Confirm, FuzzySelect, Input, Select};
 
 use crate::ai::{AiSettings, resolve_ai_settings, suggest_translation};
-use crate::config::{AiConfig, TransConfig};
+use crate::config::{AiConfig, ConfigField, TransConfig};
 use crate::error::Result;
 use crate::message_id::validate_message_id;
 use crate::operations::{
@@ -137,13 +137,23 @@ pub fn init_config_interactive(
         .interact_text()?;
     print_spacer();
 
+    print_label("Do you want to set up AI?");
+    let setup_ai = Confirm::new().with_prompt(">").default(true).interact()?;
+    print_spacer();
+
+    let ai = if setup_ai {
+        Some(prompt_ai_config(&AiConfig::default())?)
+    } else {
+        None
+    };
+
     let config = TransConfig {
         language_files_path: language_files_path.into(),
         available_languages,
         required_languages,
         primary_language,
         default_untranslated_value,
-        ai: None,
+        ai,
     };
 
     config.validate()?;
@@ -238,7 +248,13 @@ pub fn configure_ai_interactive(root: impl AsRef<Path>) -> Result<()> {
     let root = root.as_ref();
     let mut config = TransConfig::load_from_root(root)?;
     let defaults = config.ai.clone().unwrap_or_default();
+    config.ai = Some(prompt_ai_config(&defaults)?);
 
+    config.save_to_root(root)?;
+    Ok(())
+}
+
+fn prompt_ai_config(defaults: &AiConfig) -> Result<AiConfig> {
     print_label("AI enabled");
     let enabled = Confirm::new()
         .with_prompt(">")
@@ -267,15 +283,12 @@ pub fn configure_ai_interactive(root: impl AsRef<Path>) -> Result<()> {
         .interact_text()?;
     print_spacer();
 
-    config.ai = Some(AiConfig {
+    Ok(AiConfig {
         enabled,
         model,
         api_key_env,
         max_output_tokens,
-    });
-
-    config.save_to_root(root)?;
-    Ok(())
+    })
 }
 
 pub fn run_interactive(root: impl AsRef<Path>, message_id: Option<String>) -> Result<()> {
@@ -319,6 +332,249 @@ pub fn run_interactive(root: impl AsRef<Path>, message_id: Option<String>) -> Re
         let values = prompt_required_translations(root, &config, &message_id, &ai_settings, false)?;
         add_translation(root, &config, &message_id, &values)
     }
+}
+
+pub fn configure_edit_interactive(
+    root: impl AsRef<Path>,
+    field: Option<ConfigField>,
+) -> Result<()> {
+    let root = root.as_ref();
+    let mut config = TransConfig::load_from_root(root)?;
+
+    match field {
+        None => {
+            let language_files_path = prompt_language_files_path_with_default(
+                root,
+                &config.language_files_path.to_string_lossy(),
+            )?;
+
+            let available_languages = {
+                print_label("Available languages (comma-separated)");
+                let defaults = if config.available_languages.is_empty() {
+                    None
+                } else {
+                    Some(config.available_languages.as_slice())
+                };
+                let values = prompt_language_list(defaults)?;
+                print_spacer();
+                values
+            };
+
+            let required_languages = loop {
+                print_label("Required languages (comma-separated)");
+                print_description(
+                    "These are the languages required to be input each time a new translation is added.",
+                );
+                let defaults = if config.required_languages.is_empty() {
+                    None
+                } else {
+                    Some(config.required_languages.as_slice())
+                };
+                let required = prompt_language_list(defaults)?;
+                print_spacer();
+                let missing: Vec<&String> = required
+                    .iter()
+                    .filter(|lang| !available_languages.contains(lang))
+                    .collect();
+                if missing.is_empty() {
+                    break required;
+                }
+                eprintln!(
+                    "Required languages must be in available languages. Missing: {}",
+                    missing
+                        .into_iter()
+                        .map(|lang| lang.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            };
+
+            let primary_language = loop {
+                print_label("Primary language");
+                let primary = Input::<String>::new()
+                    .with_prompt(">")
+                    .default(config.primary_language.clone())
+                    .interact_text()?;
+                print_spacer();
+                if available_languages.contains(&primary) {
+                    break primary;
+                }
+                eprintln!("Primary language must be in available languages.");
+            };
+
+            print_label("Default value for untranslated strings");
+            let default_untranslated_value = Input::<String>::new()
+                .with_prompt(">")
+                .default(config.default_untranslated_value.clone())
+                .allow_empty(true)
+                .interact_text()?;
+            print_spacer();
+
+            print_label("Do you want to set up AI?");
+            let setup_ai = Confirm::new()
+                .with_prompt(">")
+                .default(config.ai.is_some())
+                .interact()?;
+            print_spacer();
+
+            let ai = if setup_ai {
+                Some(prompt_ai_config(&config.ai.clone().unwrap_or_default())?)
+            } else {
+                None
+            };
+
+            config.language_files_path = language_files_path.into();
+            config.available_languages = available_languages;
+            config.required_languages = required_languages;
+            config.primary_language = primary_language;
+            config.default_untranslated_value = default_untranslated_value;
+            config.ai = ai;
+
+            config.validate()?;
+            config.save_to_root(root)?;
+            return Ok(());
+        }
+        Some(ConfigField::LanguageFilesPath) => {
+            let language_files_path = prompt_language_files_path_with_default(
+                root,
+                &config.language_files_path.to_string_lossy(),
+            )?;
+            config.language_files_path = language_files_path.into();
+        }
+        Some(ConfigField::AvailableLanguages) => {
+            let available_languages = loop {
+                print_label("Available languages (comma-separated)");
+                let defaults = if config.available_languages.is_empty() {
+                    None
+                } else {
+                    Some(config.available_languages.as_slice())
+                };
+                let values = prompt_language_list(defaults)?;
+                print_spacer();
+                if values.contains(&config.primary_language)
+                    && config
+                        .required_languages
+                        .iter()
+                        .all(|lang| values.contains(lang))
+                {
+                    break values;
+                }
+                eprintln!(
+                    "Available languages must include the primary language and all required languages."
+                );
+            };
+            config.available_languages = available_languages;
+        }
+        Some(ConfigField::RequiredLanguages) => {
+            let required_languages = loop {
+                print_label("Required languages (comma-separated)");
+                print_description(
+                    "These are the languages required to be input each time a new translation is added.",
+                );
+                let defaults = if config.required_languages.is_empty() {
+                    None
+                } else {
+                    Some(config.required_languages.as_slice())
+                };
+                let required = prompt_language_list(defaults)?;
+                print_spacer();
+                let missing: Vec<&String> = required
+                    .iter()
+                    .filter(|lang| !config.available_languages.contains(lang))
+                    .collect();
+                if missing.is_empty() {
+                    break required;
+                }
+                eprintln!(
+                    "Required languages must be in available languages. Missing: {}",
+                    missing
+                        .into_iter()
+                        .map(|lang| lang.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            };
+            config.required_languages = required_languages;
+        }
+        Some(ConfigField::PrimaryLanguage) => {
+            let primary_language = loop {
+                print_label("Primary language");
+                let primary = Input::<String>::new()
+                    .with_prompt(">")
+                    .default(config.primary_language.clone())
+                    .interact_text()?;
+                print_spacer();
+                if config.available_languages.contains(&primary) {
+                    break primary;
+                }
+                eprintln!("Primary language must be in available languages.");
+            };
+            config.primary_language = primary_language;
+        }
+        Some(ConfigField::DefaultUntranslatedValue) => {
+            print_label("Default value for untranslated strings");
+            let default_untranslated_value = Input::<String>::new()
+                .with_prompt(">")
+                .default(config.default_untranslated_value.clone())
+                .allow_empty(true)
+                .interact_text()?;
+            print_spacer();
+            config.default_untranslated_value = default_untranslated_value;
+        }
+        Some(ConfigField::AiEnabled) => {
+            let defaults = config.ai.clone().unwrap_or_default();
+            print_label("AI enabled");
+            let enabled = Confirm::new()
+                .with_prompt(">")
+                .default(defaults.enabled)
+                .interact()?;
+            print_spacer();
+            config.ai = Some(AiConfig {
+                enabled,
+                ..defaults
+            });
+        }
+        Some(ConfigField::AiModel) => {
+            let defaults = config.ai.clone().unwrap_or_default();
+            print_label("AI model");
+            let model = Input::<String>::new()
+                .with_prompt(">")
+                .default(defaults.model.clone())
+                .interact_text()?;
+            print_spacer();
+            config.ai = Some(AiConfig { model, ..defaults });
+        }
+        Some(ConfigField::AiApiKeyEnv) => {
+            let defaults = config.ai.clone().unwrap_or_default();
+            print_label("API key environment variable");
+            let api_key_env = Input::<String>::new()
+                .with_prompt(">")
+                .default(defaults.api_key_env.clone())
+                .interact_text()?;
+            print_spacer();
+            config.ai = Some(AiConfig {
+                api_key_env,
+                ..defaults
+            });
+        }
+        Some(ConfigField::AiMaxOutputTokens) => {
+            let defaults = config.ai.clone().unwrap_or_default();
+            print_label("Max output tokens");
+            let max_output_tokens = Input::<u32>::new()
+                .with_prompt(">")
+                .default(defaults.max_output_tokens)
+                .interact_text()?;
+            print_spacer();
+            config.ai = Some(AiConfig {
+                max_output_tokens,
+                ..defaults
+            });
+        }
+    }
+
+    config.validate()?;
+    config.save_to_root(root)?;
+    Ok(())
 }
 
 fn prompt_language_files_path(root: &Path) -> Result<String> {

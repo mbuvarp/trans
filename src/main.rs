@@ -3,12 +3,15 @@ use std::process;
 
 use clap::Parser;
 
-use trans::cli::{Cli, Command, ConfigFormat, ConfigSection, parse_values};
-use trans::config::{ConfigFormat as ConfigFileFormat, TransConfig};
+use trans::cli::{Cli, Command, ConfigFormat, ConfigKey, ConfigSection, parse_values};
+use trans::config::{
+    ConfigField, ConfigFormat as ConfigFileFormat, TransConfig, format_config_list,
+};
 use trans::error::{Result, TransError};
 use trans::export::{export_csv, export_excel};
 use trans::interactive::{
-    configure_ai_interactive, configure_root_interactive, init_config_interactive, run_interactive,
+    configure_ai_interactive, configure_edit_interactive, configure_root_interactive,
+    init_config_interactive, run_interactive,
 };
 use trans::operations::{
     add_translation, change_message_id, delete_translation, update_translation,
@@ -121,6 +124,17 @@ fn run() -> Result<()> {
             }
             match section {
                 Some(ConfigSection::Ai) => configure_ai_interactive(&root),
+                Some(ConfigSection::Show) => {
+                    let (config, path) = TransConfig::load_from_root_with_path(&root)?;
+                    for line in format_config_list(&config, Some(&path)) {
+                        println!("{line}");
+                    }
+                    Ok(())
+                }
+                Some(ConfigSection::Edit { key }) => {
+                    let field = key.map(map_config_key);
+                    configure_edit_interactive(&root, field)
+                }
                 None => configure_root_interactive(&root),
             }
         }
@@ -136,5 +150,19 @@ fn run() -> Result<()> {
             println!("OK");
             Ok(())
         }
+    }
+}
+
+fn map_config_key(key: ConfigKey) -> ConfigField {
+    match key {
+        ConfigKey::LanguageFilesPath => ConfigField::LanguageFilesPath,
+        ConfigKey::AvailableLanguages => ConfigField::AvailableLanguages,
+        ConfigKey::RequiredLanguages => ConfigField::RequiredLanguages,
+        ConfigKey::PrimaryLanguage => ConfigField::PrimaryLanguage,
+        ConfigKey::DefaultUntranslatedValue => ConfigField::DefaultUntranslatedValue,
+        ConfigKey::AiEnabled => ConfigField::AiEnabled,
+        ConfigKey::AiModel => ConfigField::AiModel,
+        ConfigKey::AiApiKeyEnv => ConfigField::AiApiKeyEnv,
+        ConfigKey::AiMaxOutputTokens => ConfigField::AiMaxOutputTokens,
     }
 }
