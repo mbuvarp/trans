@@ -93,7 +93,7 @@ jobs:
           echo "BOTTLE_TGZ=$bottle_tgz" >> "$GITHUB_ENV"
 
       - name: Upload bottle to release
-        run: gh release upload "$TAG" "$BOTTLE_TGZ" --clobber
+        run: gh release upload "$TAG" "$BOTTLE_TGZ" --clobber --repo "${{ github.repository }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
