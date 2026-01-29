@@ -1,14 +1,17 @@
+use std::collections::HashSet;
 use std::env;
 use std::process;
 
 use clap::Parser;
 
-use trans::cli::{Cli, Command, ConfigFormat, ConfigKey, ConfigSection, parse_values};
+use trans::cli::{
+    Cli, Command, ConfigFormat, ConfigKey, ConfigSection, parse_lang_list, parse_values,
+};
 use trans::config::{
     ConfigField, ConfigFormat as ConfigFileFormat, TransConfig, format_config_list,
 };
 use trans::error::{Result, TransError};
-use trans::export::{export_csv, export_excel};
+use trans::export::{export_csv, export_csv_filtered, export_excel, export_excel_filtered};
 use trans::interactive::{
     configure_ai_interactive, configure_edit_interactive, configure_root_interactive,
     init_config_interactive, run_interactive,
@@ -47,17 +50,39 @@ fn run() -> Result<()> {
                 },
             )
         }
-        Some(Command::Export { format }) => {
+        Some(Command::Export { format, lang }) => {
             let root = env::current_dir()?;
             let config = TransConfig::load_from_root(&root)?;
+            let selected = if let Some(lang) = lang {
+                let langs = parse_lang_list(&lang)?;
+                let selected = resolve_export_languages(&config, &langs)?;
+                if langs.iter().all(|value| value == &config.primary_language) {
+                    eprintln!(
+                        "Warning: only the primary language '{}' was provided; nothing to export.",
+                        config.primary_language
+                    );
+                    return Ok(());
+                }
+                Some(selected)
+            } else {
+                None
+            };
             match format {
                 trans::cli::ExportFormat::Csv => {
-                    let path = export_csv(&root, &config)?;
+                    let path = if let Some(langs) = selected.as_ref() {
+                        export_csv_filtered(&root, &config, langs)?
+                    } else {
+                        export_csv(&root, &config)?
+                    };
                     println!("Exported CSV to {}", path.display());
                     Ok(())
                 }
                 trans::cli::ExportFormat::Excel => {
-                    let path = export_excel(&root, &config)?;
+                    let path = if let Some(langs) = selected.as_ref() {
+                        export_excel_filtered(&root, &config, langs)?
+                    } else {
+                        export_excel(&root, &config)?
+                    };
                     println!("Exported Excel to {}", path.display());
                     Ok(())
                 }
@@ -165,4 +190,35 @@ fn map_config_key(key: ConfigKey) -> ConfigField {
         ConfigKey::AiApiKeyEnv => ConfigField::AiApiKeyEnv,
         ConfigKey::AiMaxOutputTokens => ConfigField::AiMaxOutputTokens,
     }
+}
+
+fn resolve_export_languages(config: &TransConfig, requested: &[String]) -> Result<Vec<String>> {
+    if requested.is_empty() {
+        return Err(TransError::InvalidInput(
+            "languages must not be empty".to_string(),
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    let mut selected = Vec::new();
+
+    seen.insert(config.primary_language.clone());
+    selected.push(config.primary_language.clone());
+
+    for language in requested {
+        if !config
+            .available_languages
+            .iter()
+            .any(|lang| lang == language)
+        {
+            return Err(TransError::InvalidInput(format!(
+                "language '{language}' is not in available_languages"
+            )));
+        }
+        if seen.insert(language.clone()) {
+            selected.push(language.clone());
+        }
+    }
+
+    Ok(selected)
 }

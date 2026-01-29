@@ -132,3 +132,35 @@ fn verify_and_export_commands() {
 
     assert!(dir.path().join("translations.xlsx").exists());
 }
+
+#[test]
+fn export_with_lang_filter_includes_primary_and_selected() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["export", "--format", "csv", "--lang", "nb"])
+        .assert()
+        .success();
+
+    let csv_path = dir.path().join("translations.csv");
+    let contents = std::fs::read_to_string(csv_path).expect("read csv");
+    let header = contents.lines().next().unwrap_or_default();
+    assert_eq!(header, "id,en,nb");
+}
+
+#[test]
+fn export_with_only_primary_lang_warns_and_skips() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["export", "--format", "csv", "--lang", "en"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Warning"));
+
+    assert!(!dir.path().join("translations.csv").exists());
+}
