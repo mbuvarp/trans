@@ -11,6 +11,7 @@ use crate::export::load_all_languages;
 use crate::format_validation::{
     FormatValidationIssue, collect_format_validation_issues, validate_message_formats,
 };
+use crate::spinner::start_spinner;
 use crate::translations::save_language_translations;
 use crate::verify::{KeyMismatch, key_mismatches, verify_language_files};
 
@@ -245,7 +246,10 @@ fn run_custom_suggestion(
 ) -> Result<String> {
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|err| TransError::InvalidInput(format!("AI runtime error: {err}")))?;
-    runtime.block_on(suggest_custom(settings, system_prompt, user_prompt))
+    let spinner = start_spinner(format!("Consulting {}", settings.model));
+    let result = runtime.block_on(suggest_custom(settings, system_prompt, user_prompt));
+    drop(spinner);
+    result
 }
 
 fn print_issue_header(text: &str) {

@@ -12,6 +12,7 @@ use crate::operations::{
     TranslationValues, add_translation, delete_translation, replace_default_untranslated_value,
     update_translation,
 };
+use crate::spinner::start_spinner;
 use crate::translations::load_language_translations;
 use crate::verify::verify_language_files;
 
@@ -984,13 +985,16 @@ fn suggest_translation_blocking(
     let runtime = tokio::runtime::Runtime::new().map_err(|err| {
         crate::error::TransError::InvalidInput(format!("AI runtime error: {err}"))
     })?;
-    runtime.block_on(suggest_translation(
+    let spinner = start_spinner(format!("Consulting {}", settings.model));
+    let result = runtime.block_on(suggest_translation(
         settings,
         source_lang,
         target_lang,
         message_id,
         source_text,
-    ))
+    ));
+    drop(spinner);
+    result
 }
 
 fn print_label(text: &str) {
