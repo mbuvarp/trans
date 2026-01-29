@@ -9,7 +9,8 @@ use crate::config::{AiConfig, ConfigField, TransConfig};
 use crate::error::Result;
 use crate::message_id::validate_message_id;
 use crate::operations::{
-    TranslationValues, add_translation, delete_translation, update_translation,
+    TranslationValues, add_translation, delete_translation, replace_default_untranslated_value,
+    update_translation,
 };
 use crate::translations::load_language_translations;
 use crate::verify::verify_language_files;
@@ -403,12 +404,22 @@ pub fn configure_edit_interactive(
             };
 
             print_label("Default value for untranslated strings");
+            let old_default_value = config.default_untranslated_value.clone();
             let default_untranslated_value = Input::<String>::new()
                 .with_prompt(">")
-                .default(config.default_untranslated_value.clone())
+                .default(old_default_value.clone())
                 .allow_empty(true)
                 .interact_text()?;
             print_spacer();
+
+            let replace_default = if default_untranslated_value != old_default_value {
+                print_label("Replace existing default values in translations?");
+                let confirmed = Confirm::new().with_prompt(">").default(true).interact()?;
+                print_spacer();
+                confirmed
+            } else {
+                false
+            };
 
             print_label("Do you want to set up AI?");
             let setup_ai = Confirm::new()
@@ -431,6 +442,15 @@ pub fn configure_edit_interactive(
             config.ai = ai;
 
             config.validate()?;
+            if replace_default {
+                let replaced = replace_default_untranslated_value(
+                    root,
+                    &config,
+                    &old_default_value,
+                    &config.default_untranslated_value,
+                )?;
+                println!("Replaced {replaced} values.");
+            }
             config.save_to_root(root)?;
             return Ok(());
         }
@@ -513,13 +533,31 @@ pub fn configure_edit_interactive(
         }
         Some(ConfigField::DefaultUntranslatedValue) => {
             print_label("Default value for untranslated strings");
+            let old_default_value = config.default_untranslated_value.clone();
             let default_untranslated_value = Input::<String>::new()
                 .with_prompt(">")
-                .default(config.default_untranslated_value.clone())
+                .default(old_default_value.clone())
                 .allow_empty(true)
                 .interact_text()?;
             print_spacer();
+            let replace_default = if default_untranslated_value != old_default_value {
+                print_label("Replace existing default values in translations?");
+                let confirmed = Confirm::new().with_prompt(">").default(true).interact()?;
+                print_spacer();
+                confirmed
+            } else {
+                false
+            };
             config.default_untranslated_value = default_untranslated_value;
+            if replace_default {
+                let replaced = replace_default_untranslated_value(
+                    root,
+                    &config,
+                    &old_default_value,
+                    &config.default_untranslated_value,
+                )?;
+                println!("Replaced {replaced} values.");
+            }
         }
         Some(ConfigField::AiEnabled) => {
             let defaults = config.ai.clone().unwrap_or_default();
