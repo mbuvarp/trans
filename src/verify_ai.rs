@@ -82,12 +82,15 @@ pub fn apply_format_fixes_with_ai(
     })?;
     let format_issues = collect_format_validation_issues(config, translations_by_language)?;
     for issue in format_issues {
+        let references =
+            reference_translations(config, translations_by_language, &issue.id, &issue.language);
         handle_format_issue(
             &settings,
             config,
             translations_by_language,
             languages_changed,
             issue,
+            &references,
         )?;
     }
     Ok(())
@@ -165,6 +168,7 @@ fn handle_format_issue(
     >,
     languages_changed: &mut HashSet<String>,
     issue: FormatValidationIssue,
+    references: &[(String, String)],
 ) -> Result<()> {
     print_issue_header(&format!(
         "Format issue in '{}': {} ({})",
@@ -176,6 +180,7 @@ fn handle_format_issue(
         &issue.primary_value,
         &issue.value,
         &issue.message,
+        references,
     )?;
     print_suggestion(&issue.value, &suggestion);
     if confirm_apply()? {
@@ -218,11 +223,18 @@ fn run_format_suggestion(
     primary_value: &str,
     current_value: &str,
     error: &str,
+    references: &[(String, String)],
 ) -> Result<String> {
     let system_prompt = "You are a professional translator. Fix the translation so it matches ICU MessageFormat placeholders and syntax from the primary language. Return only the corrected translation text.";
-    let user_prompt = format!(
+    let mut user_prompt = format!(
         "Message ID: {message_id}\nPrimary: {primary_value}\nCurrent: {current_value}\nIssue: {error}"
     );
+    if !references.is_empty() {
+        user_prompt.push_str("\nOther translations:\n");
+        for (language, value) in references.iter().take(5) {
+            user_prompt.push_str(&format!("- {language}: {value}\n"));
+        }
+    }
     run_custom_suggestion(settings, system_prompt, &user_prompt)
 }
 
@@ -272,4 +284,31 @@ fn confirm_apply() -> Result<bool> {
         .with_prompt("Apply suggestion?")
         .default(true)
         .interact()?)
+}
+
+fn reference_translations(
+    config: &TransConfig,
+    translations_by_language: &std::collections::BTreeMap<
+        String,
+        crate::translations::Translations,
+    >,
+    message_id: &str,
+    exclude_language: &str,
+) -> Vec<(String, String)> {
+    let mut refs = Vec::new();
+    for language in &config.available_languages {
+        if language == exclude_language {
+            continue;
+        }
+        let value = translations_by_language
+            .get(language)
+            .and_then(|translations| translations.get(message_id))
+            .cloned()
+            .unwrap_or_default();
+        if value.is_empty() || value == config.default_untranslated_value {
+            continue;
+        }
+        refs.push((language.clone(), value));
+    }
+    refs
 }
