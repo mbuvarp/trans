@@ -268,7 +268,8 @@ fn run() -> Result<()> {
                     println!("Found {} errors in translation files:\n", issues.len());
                     for (index, issue) in issues.iter().enumerate() {
                         let relative = issue.path.strip_prefix(&root).unwrap_or(&issue.path);
-                        println!("{}", style(relative.display()).bold());
+                        let display_path = format!("{}:{}", relative.display(), issue.line);
+                        println!("{}", style(display_path).bold());
                         println!("{}", issue.message);
                         if index + 1 < issues.len() {
                             println!();

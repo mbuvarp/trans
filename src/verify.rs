@@ -21,6 +21,7 @@ pub struct KeyMismatch {
 #[derive(Debug, Clone)]
 pub struct VerificationIssue {
     pub path: PathBuf,
+    pub line: usize,
     pub message: String,
 }
 
@@ -63,12 +64,14 @@ pub fn collect_verification_issues(
             Err(TransError::MissingLanguageFile(_)) => {
                 issues.push(VerificationIssue {
                     path,
+                    line: 1,
                     message: "missing language file".to_string(),
                 });
             }
             Err(TransError::Json(err)) => {
                 issues.push(VerificationIssue {
                     path,
+                    line: 1,
                     message: format!("invalid JSON: {err}"),
                 });
             }
@@ -76,27 +79,52 @@ pub fn collect_verification_issues(
         }
     }
 
-    if translations_by_language.contains_key(&config.primary_language) {
-        let mismatches = key_mismatches(&translations_by_language, &config.primary_language);
-        for mismatch in mismatches {
-            let missing = format_key_list(&mismatch.missing);
-            let extra = format_key_list(&mismatch.extra);
+    let Some(primary_translations) = translations_by_language.get(&config.primary_language) else {
+        return Ok(issues);
+    };
+
+    let primary_keys: BTreeSet<String> = primary_translations
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    for (language, translations) in &translations_by_language {
+        if language == &config.primary_language {
+            continue;
+        }
+        let keys: BTreeSet<String> = translations.keys().cloned().collect();
+        for key in primary_keys.difference(&keys) {
+            let base_path = language_file_path(root, config, &config.primary_language);
+            let line = find_key_line_number(&base_path, key).unwrap_or(1);
             issues.push(VerificationIssue {
-                path: language_file_path(root, config, &mismatch.language),
+                path: base_path,
+                line,
                 message: format!(
-                    "key mismatch vs '{}' (missing: {missing}, extra: {extra})",
+                    "missing key '{key}' in '{language}' (present in '{}')",
                     config.primary_language
                 ),
             });
         }
-
-        let format_issues = collect_format_validation_issues(config, &translations_by_language)?;
-        for issue in format_issues {
+        for key in keys.difference(&primary_keys) {
+            let path = language_file_path(root, config, language);
+            let line = find_key_line_number(&path, key).unwrap_or(1);
             issues.push(VerificationIssue {
-                path: language_file_path(root, config, &issue.language),
-                message: format!("{}: {}", issue.id, issue.message),
+                path,
+                line,
+                message: format!("extra key '{key}' not in '{}'", config.primary_language),
             });
         }
+    }
+
+    let format_issues = collect_format_validation_issues(config, &translations_by_language)?;
+    for issue in format_issues {
+        let path = language_file_path(root, config, &issue.language);
+        let line = find_key_line_number(&path, &issue.id).unwrap_or(1);
+        issues.push(VerificationIssue {
+            path,
+            line,
+            message: format!("{}: {}", issue.id, issue.message),
+        });
     }
 
     Ok(issues)
@@ -167,6 +195,26 @@ fn format_key_list(keys: &BTreeSet<String>) -> String {
     } else {
         preview.join(", ")
     }
+}
+
+fn find_key_line_number(path: &Path, key: &str) -> Option<usize> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    for (index, line) in contents.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix('"') else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(key) else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix('"') else {
+            continue;
+        };
+        if rest.trim_start().starts_with(':') {
+            return Some(index + 1);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
