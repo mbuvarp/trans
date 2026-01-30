@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::Parser;
+use console::style;
 
 use trans::cli::{
     Cli, Command, ConfigFormat, ConfigKey, ConfigSection, parse_lang_list, parse_values,
@@ -13,7 +14,6 @@ use trans::config::{
 };
 use trans::error::{Result, TransError};
 use trans::export::{export_csv, export_csv_with_options, export_excel, export_excel_with_options};
-use trans::format_validation::validate_message_formats;
 use trans::interactive::{
     configure_ai_interactive, configure_edit_interactive, configure_root_interactive,
     init_config_interactive, run_interactive,
@@ -22,7 +22,7 @@ use trans::operations::{
     add_translation, change_message_id, delete_translation, update_translation,
 };
 use trans::query::{get_translation, get_translations_all, list_required_languages};
-use trans::verify::verify_language_files;
+use trans::verify::{collect_verification_issues, verify_language_files};
 use trans::verify_ai::verify_with_ai;
 
 fn main() {
@@ -260,11 +260,22 @@ fn run() -> Result<()> {
             if ai {
                 verify_with_ai(&root, &config)
             } else {
-                verify_language_files(&root, &config)?;
-                let translations = trans::export::load_all_languages(&root, &config)?;
-                validate_message_formats(&config, &translations)?;
-                println!("OK");
-                Ok(())
+                let issues = collect_verification_issues(&root, &config)?;
+                if issues.is_empty() {
+                    println!("OK");
+                    Ok(())
+                } else {
+                    println!("Found {} errors in translation files:\n", issues.len());
+                    for (index, issue) in issues.iter().enumerate() {
+                        let relative = issue.path.strip_prefix(&root).unwrap_or(&issue.path);
+                        println!("{}", style(relative.display()).bold());
+                        println!("{}", issue.message);
+                        if index + 1 < issues.len() {
+                            println!();
+                        }
+                    }
+                    process::exit(1);
+                }
             }
         }
     }

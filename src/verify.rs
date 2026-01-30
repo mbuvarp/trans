@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::TransConfig;
 use crate::error::{Result, TransError};
-use crate::translations::{Translations, load_language_translations, save_language_translations};
+use crate::format_validation::collect_format_validation_issues;
+use crate::translations::{
+    Translations, language_file_path, load_language_translations, load_translations,
+    save_language_translations,
+};
 
 pub type TranslationSnapshot = BTreeMap<String, Translations>;
 
@@ -12,6 +16,12 @@ pub struct KeyMismatch {
     pub language: String,
     pub missing: BTreeSet<String>,
     pub extra: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerificationIssue {
+    pub path: PathBuf,
+    pub message: String,
 }
 
 pub fn verify_language_files(root: impl AsRef<Path>, config: &TransConfig) -> Result<()> {
@@ -34,6 +44,62 @@ pub fn verify_language_files(root: impl AsRef<Path>, config: &TransConfig) -> Re
     }
 
     Ok(())
+}
+
+pub fn collect_verification_issues(
+    root: impl AsRef<Path>,
+    config: &TransConfig,
+) -> Result<Vec<VerificationIssue>> {
+    let root = root.as_ref();
+    let mut translations_by_language = BTreeMap::new();
+    let mut issues = Vec::new();
+
+    for language in &config.available_languages {
+        let path = language_file_path(root, config, language);
+        match load_translations(&path) {
+            Ok(translations) => {
+                translations_by_language.insert(language.clone(), translations);
+            }
+            Err(TransError::MissingLanguageFile(_)) => {
+                issues.push(VerificationIssue {
+                    path,
+                    message: "missing language file".to_string(),
+                });
+            }
+            Err(TransError::Json(err)) => {
+                issues.push(VerificationIssue {
+                    path,
+                    message: format!("invalid JSON: {err}"),
+                });
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    if translations_by_language.contains_key(&config.primary_language) {
+        let mismatches = key_mismatches(&translations_by_language, &config.primary_language);
+        for mismatch in mismatches {
+            let missing = format_key_list(&mismatch.missing);
+            let extra = format_key_list(&mismatch.extra);
+            issues.push(VerificationIssue {
+                path: language_file_path(root, config, &mismatch.language),
+                message: format!(
+                    "key mismatch vs '{}' (missing: {missing}, extra: {extra})",
+                    config.primary_language
+                ),
+            });
+        }
+
+        let format_issues = collect_format_validation_issues(config, &translations_by_language)?;
+        for issue in format_issues {
+            issues.push(VerificationIssue {
+                path: language_file_path(root, config, &issue.language),
+                message: format!("{}: {}", issue.id, issue.message),
+            });
+        }
+    }
+
+    Ok(issues)
 }
 
 pub fn key_mismatches(
