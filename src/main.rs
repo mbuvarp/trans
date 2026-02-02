@@ -289,6 +289,11 @@ fn run() -> Result<()> {
         Some(Command::DelLang { lang }) => {
             let root = env::current_dir()?;
             let config = TransConfig::load_from_root(&root)?;
+            if lang == config.primary_language {
+                return Err(TransError::InvalidInput(
+                    "cannot delete the primary language".to_string(),
+                ));
+            }
             let confirmed = Confirm::new()
                 .with_prompt(format!(
                     "Delete language '{lang}'? This will remove the language file and update config."
