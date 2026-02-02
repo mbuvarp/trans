@@ -226,6 +226,64 @@ pub fn add_language(root: impl AsRef<Path>, config: &TransConfig, language: &str
     Ok(())
 }
 
+pub fn delete_language(root: impl AsRef<Path>, config: &TransConfig, language: &str) -> Result<()> {
+    let language = language.trim();
+    if language.is_empty() {
+        return Err(TransError::InvalidInput(
+            "language must not be empty".to_string(),
+        ));
+    }
+    if language == config.primary_language {
+        return Err(TransError::InvalidInput(
+            "cannot delete the primary language".to_string(),
+        ));
+    }
+    if !config
+        .available_languages
+        .iter()
+        .any(|lang| lang == language)
+    {
+        return Err(TransError::InvalidInput(format!(
+            "language '{language}' does not exist"
+        )));
+    }
+
+    verify_language_files(&root, config)?;
+
+    let translations = load_language_translations(&root, config, language)?;
+    let path = language_file_path(&root, config, language);
+
+    if !path.exists() {
+        return Err(TransError::InvalidInput(format!(
+            "language file does not exist at {}",
+            path.display()
+        )));
+    }
+
+    std::fs::remove_file(&path)?;
+
+    let mut updated_config = config.clone();
+    updated_config
+        .available_languages
+        .retain(|lang| lang != language);
+    updated_config
+        .required_languages
+        .retain(|lang| lang != language);
+
+    if let Err(err) = updated_config.save_to_root(&root) {
+        let _ = save_language_translations(&root, config, language, &translations);
+        return Err(err);
+    }
+
+    if let Err(err) = verify_language_files(&root, &updated_config) {
+        let _ = save_language_translations(&root, config, language, &translations);
+        let _ = config.save_to_root(&root);
+        return Err(err);
+    }
+
+    Ok(())
+}
+
 pub fn replace_default_untranslated_value(
     root: impl AsRef<Path>,
     config: &TransConfig,
@@ -479,5 +537,23 @@ mod tests {
 
         let updated = TransConfig::load_from_root(root).expect("load config");
         assert!(updated.available_languages.contains(&"fr".to_string()));
+    }
+
+    #[test]
+    fn delete_language_removes_file_and_updates_config() {
+        let dir = tempdir().expect("tempdir");
+        let mut config = base_config();
+        config.required_languages.push("nb".to_string());
+        let root = dir.path();
+        setup_files(root, &config);
+
+        delete_language(root, &config, "nb").expect("delete language");
+
+        let path = crate::translations::language_file_path(root, &config, "nb");
+        assert!(!path.exists());
+
+        let updated = TransConfig::load_from_root(root).expect("load config");
+        assert!(!updated.available_languages.contains(&"nb".to_string()));
+        assert!(!updated.required_languages.contains(&"nb".to_string()));
     }
 }

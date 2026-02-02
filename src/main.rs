@@ -5,6 +5,7 @@ use std::process;
 
 use clap::Parser;
 use console::style;
+use dialoguer::Confirm;
 
 use trans::cli::{
     Cli, Command, ConfigFormat, ConfigKey, ConfigSection, parse_lang_list, parse_values,
@@ -19,7 +20,8 @@ use trans::interactive::{
     init_config_interactive, run_interactive,
 };
 use trans::operations::{
-    add_language, add_translation, change_message_id, delete_translation, update_translation,
+    add_language, add_translation, change_message_id, delete_language, delete_translation,
+    update_translation,
 };
 use trans::query::{get_translation, get_translations_all, list_required_languages};
 use trans::verify::{collect_verification_issues, verify_language_files};
@@ -283,6 +285,21 @@ fn run() -> Result<()> {
             let root = env::current_dir()?;
             let config = TransConfig::load_from_root(&root)?;
             add_language(&root, &config, &lang)
+        }
+        Some(Command::DelLang { lang }) => {
+            let root = env::current_dir()?;
+            let config = TransConfig::load_from_root(&root)?;
+            let confirmed = Confirm::new()
+                .with_prompt(format!(
+                    "Delete language '{lang}'? This will remove the language file and update config."
+                ))
+                .default(false)
+                .interact()?;
+            if confirmed {
+                delete_language(&root, &config, &lang)
+            } else {
+                Ok(())
+            }
         }
     }
 }
