@@ -281,6 +281,15 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Some(Command::Auto { lang }) => {
+            let root = env::current_dir()?;
+            let config = TransConfig::load_from_root(&root)?;
+            let lang_filter = match lang {
+                Some(lang) => Some(parse_lang_list(&lang)?),
+                None => None,
+            };
+            trans::auto::auto_translate(&root, &config, lang_filter)
+        }
         Some(Command::AddLang { lang }) => {
             let root = env::current_dir()?;
             let config = TransConfig::load_from_root(&root)?;
