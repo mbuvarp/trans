@@ -373,7 +373,7 @@ fn build_prompts(task: &TranslationTask) -> (String, String) {
     let source_name = language_display_name(&task.source_language);
     let target_name = language_display_name(&task.language);
     let system_prompt = format!(
-        "You are a professional translator. Translate from {} to {}. Preserve placeholders like {{name}} and ICU plural/select syntax. Return only the translation text.",
+        "You are a professional translator. Translate from {} to {}. Preserve placeholders like {{name}} and ICU plural/select syntax. Do not add XML/HTML tags unless they appear in the source. Return only the translation text.",
         source_name, target_name
     );
     let mut user_prompt = format!("Message ID: {}\nSource: {}", task.id, task.source_text);
