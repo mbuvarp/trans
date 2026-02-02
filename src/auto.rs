@@ -74,39 +74,56 @@ pub fn auto_translate(
     let missing_by_language =
         collect_missing_translations(&translations_by_language, config, &selected_languages);
 
-    let total_missing: usize = missing_by_language.values().map(|ids| ids.len()).sum();
-    if total_missing == 0 {
-        println!("No missing translations.");
-        return Ok(());
-    }
-
-    println!("Missing translations:");
-    for language in &selected_languages {
-        let count = missing_by_language
-            .get(language)
-            .map(|ids| ids.len())
-            .unwrap_or(0);
-        println!("{language}: {count}");
-    }
-
-    if !confirm_prompt("Proceed with AI translation?")? {
-        return Ok(());
-    }
-
     let tasks = build_translation_tasks(
         config,
         &translations_by_language,
         &missing_by_language,
         &selected_languages,
     );
-    if tasks.is_empty() {
-        println!("No missing translations.");
-        return Ok(());
-    }
 
     let mut counts_by_language: BTreeMap<String, usize> = BTreeMap::new();
     for task in &tasks {
         *counts_by_language.entry(task.language.clone()).or_insert(0) += 1;
+    }
+
+    let total_missing: usize = counts_by_language.values().sum();
+    if total_missing == 0 {
+        let total_raw_missing: usize = missing_by_language.values().map(|ids| ids.len()).sum();
+        if total_raw_missing == 0 {
+            println!("No missing translations.");
+        } else {
+            println!("No missing translations with non-empty primary text.");
+        }
+        return Ok(());
+    }
+
+    println!("Missing translations:");
+    for language in &selected_languages {
+        let count = counts_by_language.get(language).cloned().unwrap_or(0);
+        println!("{language}: {count}");
+    }
+
+    let mut skipped = Vec::new();
+    for language in &selected_languages {
+        let missing = missing_by_language
+            .get(language)
+            .map(|ids| ids.len())
+            .unwrap_or(0);
+        let count = counts_by_language.get(language).cloned().unwrap_or(0);
+        if missing > count {
+            skipped.push(format!("{language}: {}", missing - count));
+        }
+    }
+    if !skipped.is_empty() {
+        println!();
+        println!("Skipped entries with empty primary text:");
+        for line in skipped {
+            println!("{line}");
+        }
+    }
+
+    if !confirm_prompt("Proceed with AI translation?")? {
+        return Ok(());
     }
 
     let progress = MultiProgress::new();
