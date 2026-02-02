@@ -128,22 +128,17 @@ pub fn auto_translate(
 
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|err| TransError::InvalidInput(format!("AI runtime error: {err}")))?;
-    let results = runtime.block_on(run_translation_tasks(&settings, tasks, &bars))?;
-
-    for result in results {
-        if let Some(translations) = translations_by_language.get_mut(&result.language) {
-            translations.insert(result.id, result.value);
-        }
-    }
+    runtime.block_on(run_translation_tasks(
+        &settings,
+        root,
+        config,
+        &mut translations_by_language,
+        tasks,
+        &bars,
+    ))?;
 
     for bar in bars.values() {
         bar.finish_with_message("done");
-    }
-
-    for language in &selected_languages {
-        if let Some(translations) = translations_by_language.get(language) {
-            save_language_translations(root, config, language, translations)?;
-        }
     }
 
     verify_language_files(root, config)?;
@@ -250,9 +245,12 @@ fn build_translation_tasks(
 
 async fn run_translation_tasks(
     settings: &AiSettings,
+    root: &Path,
+    config: &TransConfig,
+    translations_by_language: &mut BTreeMap<String, Translations>,
     tasks: Vec<TranslationTask>,
     bars: &BTreeMap<String, ProgressBar>,
-) -> Result<Vec<TranslationResult>> {
+) -> Result<()> {
     let semaphore = Arc::new(Semaphore::new(settings.concurrency.max(1)));
     let mut join_set = JoinSet::new();
 
@@ -268,10 +266,6 @@ async fn run_translation_tasks(
                 bar.set_message(format!("consulting {}", settings.model));
             }
             let result = suggest_with_retries(&settings, &task).await;
-            if let Some(bar) = &bar {
-                bar.inc(1);
-                bar.set_message("");
-            }
             result.map(|value| TranslationResult {
                 language: task.language,
                 id: task.id,
@@ -280,15 +274,21 @@ async fn run_translation_tasks(
         });
     }
 
-    let mut results = Vec::new();
     while let Some(joined) = join_set.join_next().await {
         let output =
             joined.map_err(|err| TransError::InvalidInput(format!("AI task failed: {err}")))?;
         let value = output?;
-        results.push(value);
+        if let Some(translations) = translations_by_language.get_mut(&value.language) {
+            translations.insert(value.id.clone(), value.value);
+            save_language_translations(root, config, &value.language, translations)?;
+        }
+        if let Some(bar) = bars.get(&value.language) {
+            bar.inc(1);
+            bar.set_message("");
+        }
     }
 
-    Ok(results)
+    Ok(())
 }
 
 async fn suggest_with_retries(settings: &AiSettings, task: &TranslationTask) -> Result<String> {
