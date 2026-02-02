@@ -46,7 +46,7 @@ pub async fn suggest_translation(
     let source_name = language_display_name(source_lang);
     let target_name = language_display_name(target_lang);
     let system_prompt = format!(
-        "You are a professional translator. Translate from {source_name} to {target_name}. Preserve placeholders like {{name}} and ICU plural/select syntax. Return only the translation text."
+        "You are a professional translator. Translate from {source_name} to {target_name}. Preserve placeholders like {{name}} and ICU plural/select syntax. Do not add XML/HTML tags unless they appear in the source. Return only the translation text."
     );
 
     let user_prompt = format!("Message ID: {message_id}\nSource: {source_text}");
