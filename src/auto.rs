@@ -11,6 +11,7 @@ use crate::config::TransConfig;
 use crate::error::{Result, TransError};
 use crate::export::load_all_languages;
 use crate::format_validation::validate_message_formats;
+use crate::language::language_display_name;
 use crate::translations::{Translations, save_language_translations};
 use crate::verify::{collect_verification_issues, verify_language_files};
 use crate::verify_ai::verify_with_ai;
@@ -357,9 +358,11 @@ async fn suggest_with_retries(
 }
 
 fn build_prompts(task: &TranslationTask) -> (String, String) {
+    let source_name = language_display_name(&task.source_language);
+    let target_name = language_display_name(&task.language);
     let system_prompt = format!(
         "You are a professional translator. Translate from {} to {}. Preserve placeholders like {{name}} and ICU plural/select syntax. Return only the translation text.",
-        task.source_language, task.language
+        source_name, target_name
     );
     let mut user_prompt = format!("Message ID: {}\nSource: {}", task.id, task.source_text);
     if !task.references.is_empty() {

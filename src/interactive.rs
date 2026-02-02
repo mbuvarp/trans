@@ -7,6 +7,7 @@ use dialoguer::{Completion, Confirm, FuzzySelect, Input, Select};
 use crate::ai::{AiSettings, resolve_ai_settings, suggest_translation};
 use crate::config::{AiConfig, ConfigField, ExportFormat, TransConfig};
 use crate::error::Result;
+use crate::language::is_valid_language_code;
 use crate::message_id::validate_message_id;
 use crate::operations::{
     TranslationValues, add_translation, delete_translation, replace_default_untranslated_value,
@@ -710,6 +711,7 @@ fn prompt_language_files_path_with_default(root: &Path, default_value: &str) -> 
         print_spacer();
 
         if let Some(value) = &values[selection] {
+            warn_invalid_language_files(root, value)?;
             return Ok(value.clone());
         }
     }
@@ -723,6 +725,7 @@ fn prompt_language_files_path_with_default(root: &Path, default_value: &str) -> 
         let candidate = root.join(&input);
         if candidate.exists() {
             if candidate.is_dir() {
+                warn_invalid_language_files(root, &input)?;
                 return Ok(input);
             }
             eprintln!(
@@ -743,6 +746,7 @@ fn prompt_language_files_path_with_default(root: &Path, default_value: &str) -> 
         print_spacer();
         if create {
             fs::create_dir_all(&candidate)?;
+            warn_invalid_language_files(root, &input)?;
             return Ok(input);
         }
     }
@@ -886,12 +890,52 @@ fn discover_languages(root: &Path, relative_path: &str) -> Result<Vec<String>> {
             Some(stem) if !stem.is_empty() => stem,
             _ => continue,
         };
-        languages.push(stem.to_string());
+        if is_valid_language_code(stem) {
+            languages.push(stem.to_string());
+        }
     }
 
     languages.sort();
     languages.dedup();
     Ok(languages)
+}
+
+fn warn_invalid_language_files(root: &Path, relative_path: &str) -> Result<()> {
+    let dir = root.join(relative_path);
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    let mut invalid = Vec::new();
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(stem) if !stem.is_empty() => stem,
+            _ => continue,
+        };
+        if !is_valid_language_code(stem) {
+            invalid.push(stem.to_string());
+        }
+    }
+    if !invalid.is_empty() {
+        invalid.sort();
+        invalid.dedup();
+        eprintln!(
+            "Warning: found language files with invalid codes: {}",
+            invalid.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn prompt_message_id() -> Result<String> {
