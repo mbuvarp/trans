@@ -188,6 +188,11 @@ pub enum Command {
         #[arg(long = "ai", help = "Use AI to suggest fixes for verification errors")]
         ai: bool,
     },
+    #[command(about = "Add a new language based on the primary language keys")]
+    AddLang {
+        #[arg(value_name = "LANG", help = "Language code to add (e.g. nb)")]
+        lang: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

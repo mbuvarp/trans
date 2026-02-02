@@ -4,7 +4,9 @@ use std::path::Path;
 use crate::config::TransConfig;
 use crate::error::{Result, TransError};
 use crate::message_id::validate_message_id;
-use crate::translations::save_language_translations;
+use crate::translations::{
+    Translations, language_file_path, load_language_translations, save_language_translations,
+};
 use crate::verify::{
     TranslationSnapshot, restore_translations, snapshot_translations, verify_language_files,
 };
@@ -168,6 +170,60 @@ pub fn change_message_id(
     }
 
     persist_with_rollback(&root, config, &snapshot, &updated)
+}
+
+pub fn add_language(root: impl AsRef<Path>, config: &TransConfig, language: &str) -> Result<()> {
+    let language = language.trim();
+    if language.is_empty() {
+        return Err(TransError::InvalidInput(
+            "language must not be empty".to_string(),
+        ));
+    }
+    if config
+        .available_languages
+        .iter()
+        .any(|lang| lang == language)
+    {
+        return Err(TransError::InvalidInput(format!(
+            "language '{language}' already exists"
+        )));
+    }
+
+    verify_language_files(&root, config)?;
+
+    let primary_translations = load_language_translations(&root, config, &config.primary_language)?;
+
+    let path = language_file_path(&root, config, language);
+    if path.exists() {
+        return Err(TransError::InvalidInput(format!(
+            "language file already exists at {}",
+            path.display()
+        )));
+    }
+
+    let mut new_translations = Translations::new();
+    for key in primary_translations.keys() {
+        new_translations.insert(key.clone(), config.default_untranslated_value.clone());
+    }
+
+    save_language_translations(&root, config, language, &new_translations)?;
+
+    let mut updated_config = config.clone();
+    updated_config
+        .available_languages
+        .push(language.to_string());
+    if let Err(err) = updated_config.save_to_root(&root) {
+        let _ = std::fs::remove_file(&path);
+        return Err(err);
+    }
+
+    if let Err(err) = verify_language_files(&root, &updated_config) {
+        let _ = std::fs::remove_file(&path);
+        let _ = config.save_to_root(&root);
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 pub fn replace_default_untranslated_value(
@@ -407,5 +463,21 @@ mod tests {
 
         let nb = load_language_translations(root, &config, "nb").expect("load nb");
         assert_eq!(nb.get("app.title").map(String::as_str), Some("TODO"));
+    }
+
+    #[test]
+    fn add_language_creates_new_language_file_and_updates_config() {
+        let dir = tempdir().expect("tempdir");
+        let config = base_config();
+        let root = dir.path();
+        setup_files(root, &config);
+
+        add_language(root, &config, "fr").expect("add language");
+
+        let fr = load_language_translations(root, &config, "fr").expect("load fr");
+        assert_eq!(fr.get("app.title").map(String::as_str), Some(""));
+
+        let updated = TransConfig::load_from_root(root).expect("load config");
+        assert!(updated.available_languages.contains(&"fr".to_string()));
     }
 }

@@ -19,7 +19,7 @@ use trans::interactive::{
     init_config_interactive, run_interactive,
 };
 use trans::operations::{
-    add_translation, change_message_id, delete_translation, update_translation,
+    add_language, add_translation, change_message_id, delete_translation, update_translation,
 };
 use trans::query::{get_translation, get_translations_all, list_required_languages};
 use trans::verify::{collect_verification_issues, verify_language_files};
@@ -278,6 +278,11 @@ fn run() -> Result<()> {
                     process::exit(1);
                 }
             }
+        }
+        Some(Command::AddLang { lang }) => {
+            let root = env::current_dir()?;
+            let config = TransConfig::load_from_root(&root)?;
+            add_language(&root, &config, &lang)
         }
     }
 }
