@@ -17,7 +17,6 @@ use crate::translations::{Translations, save_language_translations};
 use crate::verify::{collect_verification_issues, verify_language_files};
 use crate::verify_ai::verify_with_ai;
 
-const DEFAULT_CONCURRENCY: usize = 2;
 const MAX_RETRIES: usize = 4;
 const RETRY_BASE_DELAY_MS: u64 = 500;
 
@@ -254,7 +253,7 @@ async fn run_translation_tasks(
     tasks: Vec<TranslationTask>,
     bars: &BTreeMap<String, ProgressBar>,
 ) -> Result<Vec<TranslationResult>> {
-    let semaphore = Arc::new(Semaphore::new(DEFAULT_CONCURRENCY));
+    let semaphore = Arc::new(Semaphore::new(settings.concurrency.max(1)));
     let mut join_set = JoinSet::new();
 
     for task in tasks {
@@ -293,13 +292,7 @@ async fn run_translation_tasks(
 }
 
 async fn suggest_with_retries(settings: &AiSettings, task: &TranslationTask) -> Result<String> {
-    let (system_prompt, user_prompt) = build_prompts(
-        &task.source_language,
-        &task.language,
-        &task.id,
-        &task.source_text,
-        &task.references,
-    );
+    let (system_prompt, user_prompt) = build_prompts(task);
     let mut attempt = 0usize;
     loop {
         match suggest_custom(settings, &system_prompt, &user_prompt).await {
@@ -318,20 +311,15 @@ async fn suggest_with_retries(settings: &AiSettings, task: &TranslationTask) -> 
     }
 }
 
-fn build_prompts(
-    source_lang: &str,
-    target_lang: &str,
-    message_id: &str,
-    source_text: &str,
-    references: &[(String, String)],
-) -> (String, String) {
+fn build_prompts(task: &TranslationTask) -> (String, String) {
     let system_prompt = format!(
-        "You are a professional translator. Translate from {source_lang} to {target_lang}. Preserve placeholders like {{name}} and ICU plural/select syntax. Return only the translation text."
+        "You are a professional translator. Translate from {} to {}. Preserve placeholders like {{name}} and ICU plural/select syntax. Return only the translation text.",
+        task.source_language, task.language
     );
-    let mut user_prompt = format!("Message ID: {message_id}\nSource: {source_text}");
-    if !references.is_empty() {
+    let mut user_prompt = format!("Message ID: {}\nSource: {}", task.id, task.source_text);
+    if !task.references.is_empty() {
         user_prompt.push_str("\nOther translations:\n");
-        for (language, value) in references.iter().take(5) {
+        for (language, value) in task.references.iter().take(5) {
             user_prompt.push_str(&format!("- {language}: {value}\n"));
         }
     }

@@ -29,6 +29,10 @@ fn default_ai_max_output_tokens() -> u32 {
     128
 }
 
+fn default_ai_concurrency() -> usize {
+    2
+}
+
 fn default_export_format() -> ExportFormat {
     ExportFormat::Excel
 }
@@ -117,6 +121,8 @@ pub struct AiConfig {
     pub api_key_env: String,
     #[serde(default = "default_ai_max_output_tokens")]
     pub max_output_tokens: u32,
+    #[serde(default = "default_ai_concurrency")]
+    pub concurrency: usize,
 }
 
 impl Default for AiConfig {
@@ -126,6 +132,7 @@ impl Default for AiConfig {
             model: default_ai_model(),
             api_key_env: default_ai_api_key_env(),
             max_output_tokens: default_ai_max_output_tokens(),
+            concurrency: default_ai_concurrency(),
         }
     }
 }
@@ -271,6 +278,20 @@ impl TransConfig {
             }
         }
 
+        if let Some(ai) = &self.ai {
+            if ai.model.trim().is_empty() {
+                return Err(TransError::InvalidConfig(
+                    "ai.model must not be empty".to_string(),
+                ));
+            }
+            if ai.api_key_env.trim().is_empty() {
+                return Err(TransError::InvalidConfig(
+                    "ai.apiKeyEnv must not be empty".to_string(),
+                ));
+            }
+            validate_ai_concurrency(ai.concurrency)?;
+        }
+
         Ok(())
     }
 }
@@ -320,6 +341,10 @@ pub fn format_config_list(config: &TransConfig, config_path: Option<&Path>) -> V
         "ai.maxOutputTokens",
         &ai.max_output_tokens.to_string(),
     ));
+    lines.push(format_label_value(
+        "ai.concurrency",
+        &ai.concurrency.to_string(),
+    ));
     lines
 }
 
@@ -336,6 +361,7 @@ pub enum ConfigField {
     AiModel,
     AiApiKeyEnv,
     AiMaxOutputTokens,
+    AiConcurrency,
 }
 
 fn format_value(value: &str) -> String {
@@ -372,6 +398,15 @@ fn validate_language_list(name: &str, values: &[String]) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn validate_ai_concurrency(value: usize) -> Result<()> {
+    if value == 0 {
+        return Err(TransError::InvalidConfig(
+            "ai.concurrency must be at least 1".to_string(),
+        ));
+    }
     Ok(())
 }
 

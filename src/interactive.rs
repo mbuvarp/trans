@@ -311,11 +311,19 @@ fn prompt_ai_config(defaults: &AiConfig) -> Result<AiConfig> {
         .interact_text()?;
     print_spacer();
 
+    print_label("AI concurrency");
+    let concurrency = Input::<usize>::new()
+        .with_prompt(">")
+        .default(defaults.concurrency)
+        .interact_text()?;
+    print_spacer();
+
     Ok(AiConfig {
         enabled,
         model,
         api_key_env,
         max_output_tokens,
+        concurrency,
     })
 }
 
@@ -649,6 +657,19 @@ pub fn configure_edit_interactive(
             print_spacer();
             config.ai = Some(AiConfig {
                 max_output_tokens,
+                ..defaults
+            });
+        }
+        Some(ConfigField::AiConcurrency) => {
+            let defaults = config.ai.clone().unwrap_or_default();
+            print_label("AI concurrency");
+            let concurrency = Input::<usize>::new()
+                .with_prompt(">")
+                .default(defaults.concurrency)
+                .interact_text()?;
+            print_spacer();
+            config.ai = Some(AiConfig {
+                concurrency,
                 ..defaults
             });
         }

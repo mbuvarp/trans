@@ -12,6 +12,7 @@ pub struct AiSettings {
     pub model: String,
     pub api_key: String,
     pub max_output_tokens: u32,
+    pub concurrency: usize,
 }
 
 pub fn resolve_ai_settings(root: &Path, config: &TransConfig) -> Result<Option<AiSettings>> {
@@ -30,6 +31,7 @@ pub fn resolve_ai_settings(root: &Path, config: &TransConfig) -> Result<Option<A
         model: ai.model.clone(),
         api_key,
         max_output_tokens: ai.max_output_tokens,
+        concurrency: ai.concurrency.max(1),
     }))
 }
 
@@ -254,6 +256,7 @@ mod tests {
                 model: "gpt-5-mini".to_string(),
                 api_key_env: "OPENAI_API_KEY".to_string(),
                 max_output_tokens: 128,
+                concurrency: 2,
             }),
         }
     }

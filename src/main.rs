@@ -281,9 +281,18 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Some(Command::Auto { lang }) => {
+        Some(Command::Auto { lang, concurrency }) => {
             let root = env::current_dir()?;
-            let config = TransConfig::load_from_root(&root)?;
+            let mut config = TransConfig::load_from_root(&root)?;
+            if let Some(concurrency) = concurrency {
+                if concurrency == 0 {
+                    return Err(TransError::InvalidInput(
+                        "concurrency must be at least 1".to_string(),
+                    ));
+                }
+                let ai = config.ai.clone().unwrap_or_default();
+                config.ai = Some(trans::config::AiConfig { concurrency, ..ai });
+            }
             let lang_filter = match lang {
                 Some(lang) => Some(parse_lang_list(&lang)?),
                 None => None,
@@ -331,6 +340,7 @@ fn map_config_key(key: ConfigKey) -> ConfigField {
         ConfigKey::AiModel => ConfigField::AiModel,
         ConfigKey::AiApiKeyEnv => ConfigField::AiApiKeyEnv,
         ConfigKey::AiMaxOutputTokens => ConfigField::AiMaxOutputTokens,
+        ConfigKey::AiConcurrency => ConfigField::AiConcurrency,
     }
 }
 
