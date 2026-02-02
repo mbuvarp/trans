@@ -193,6 +193,11 @@ pub enum Command {
         #[arg(value_name = "LANG", help = "Language code to add (e.g. nb)")]
         lang: String,
     },
+    #[command(about = "Remove a language file and update config")]
+    DelLang {
+        #[arg(value_name = "LANG", help = "Language code to remove (e.g. nb)")]
+        lang: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
