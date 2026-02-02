@@ -57,6 +57,7 @@ fn setup_project_with_ai(root: &std::path::Path) -> TransConfig {
         model: "gpt-5-mini".to_string(),
         api_key_env: "OPENAI_API_KEY".to_string(),
         max_output_tokens: 64,
+        concurrency: 2,
     });
     config.save_to_root(root).expect("save config");
 

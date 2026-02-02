@@ -101,7 +101,7 @@ pub enum Command {
     },
     #[command(
         about = "Update config values interactively",
-        long_about = "Update config values interactively.\n\nRoot config options:\n- languageFilesPath: location of language files\n- availableLanguages: all known languages\n- requiredLanguages: languages required for input\n- primaryLanguage: first language in interactive mode\n- defaultUntranslatedValue: default for non-required languages\n- defaultExportFormat: csv or excel\n- excelPassword: password for Excel sheet protection\n\nUse `trans config ai` to edit AI settings:\n- enabled\n- model\n- apiKeyEnv\n- maxOutputTokens\n\nUse `trans config show` to print current configuration values.\nUse `trans config edit [key]` to edit all values or a single key.\nUse `trans config --format json|yaml` to convert the config file format."
+        long_about = "Update config values interactively.\n\nRoot config options:\n- languageFilesPath: location of language files\n- availableLanguages: all known languages\n- requiredLanguages: languages required for input\n- primaryLanguage: first language in interactive mode\n- defaultUntranslatedValue: default for non-required languages\n- defaultExportFormat: csv or excel\n- excelPassword: password for Excel sheet protection\n\nUse `trans config ai` to edit AI settings:\n- enabled\n- model\n- apiKeyEnv\n- maxOutputTokens\n- concurrency\n\nUse `trans config show` to print current configuration values.\nUse `trans config edit [key]` to edit all values or a single key.\nUse `trans config --format json|yaml` to convert the config file format."
     )]
     Config {
         #[arg(
@@ -197,6 +197,13 @@ pub enum Command {
             help = "Comma-separated locales to translate (primary language is the source)"
         )]
         lang: Option<String>,
+        #[arg(
+            short = 'c',
+            long = "concurrency",
+            value_name = "N",
+            help = "Number of AI requests to run in parallel"
+        )]
+        concurrency: Option<usize>,
     },
     #[command(about = "Add a new language based on the primary language keys")]
     AddLang {
@@ -253,6 +260,8 @@ pub enum ConfigKey {
     AiApiKeyEnv,
     #[value(name = "ai.maxOutputTokens")]
     AiMaxOutputTokens,
+    #[value(name = "ai.concurrency")]
+    AiConcurrency,
 }
 
 pub fn parse_values(input: &str) -> Result<TranslationValues> {
