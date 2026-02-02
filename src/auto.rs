@@ -1,5 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
+use std::time::{Duration as StdDuration, Instant};
 
 use dialoguer::Confirm;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -141,6 +147,12 @@ pub fn auto_translate(
         bar.set_prefix(language.clone());
         bars.insert(language.clone(), bar);
     }
+    let status_bar = progress.add(ProgressBar::new_spinner());
+    status_bar.set_style(
+        ProgressStyle::with_template("{msg}")
+            .map_err(|err| TransError::InvalidInput(format!("progress style error: {err}")))?,
+    );
+    let _status_guard = start_status_bar(status_bar);
 
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|err| TransError::InvalidInput(format!("AI runtime error: {err}")))?;
@@ -417,6 +429,57 @@ fn confirm_prompt(prompt: &str) -> Result<bool> {
         .with_prompt(prompt)
         .default(true)
         .interact()?)
+}
+
+fn start_status_bar(bar: ProgressBar) -> StatusGuard {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let bar_thread = bar.clone();
+    let start = Instant::now();
+    let handle = thread::spawn(move || {
+        while !stop_thread.load(Ordering::SeqCst) {
+            let elapsed = format_elapsed(start.elapsed());
+            bar_thread.set_message(format!(
+                "[{elapsed}] Translations are saved as they complete."
+            ));
+            bar_thread.tick();
+            thread::sleep(StdDuration::from_secs(1));
+        }
+    });
+
+    StatusGuard {
+        stop,
+        handle: Some(handle),
+        bar,
+        start,
+    }
+}
+
+struct StatusGuard {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+    bar: ProgressBar,
+    start: Instant,
+}
+
+impl Drop for StatusGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        let elapsed = format_elapsed(self.start.elapsed());
+        self.bar.finish_with_message(format!(
+            "[{elapsed}] Translations are saved as they complete."
+        ));
+    }
+}
+
+fn format_elapsed(duration: StdDuration) -> String {
+    let total_seconds = duration.as_secs();
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    format!("{minutes:02}:{seconds:02}")
 }
 
 #[cfg(test)]
