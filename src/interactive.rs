@@ -311,7 +311,7 @@ fn prompt_ai_config(defaults: &AiConfig) -> Result<AiConfig> {
         .interact_text()?;
     print_spacer();
 
-    print_label("AI concurrency");
+    print_label("AI concurrency (max simultaneous AI requests)");
     let concurrency = Input::<usize>::new()
         .with_prompt(">")
         .default(defaults.concurrency)
@@ -662,7 +662,7 @@ pub fn configure_edit_interactive(
         }
         Some(ConfigField::AiConcurrency) => {
             let defaults = config.ai.clone().unwrap_or_default();
-            print_label("AI concurrency");
+            print_label("AI concurrency (max simultaneous AI requests)");
             let concurrency = Input::<usize>::new()
                 .with_prompt(">")
                 .default(defaults.concurrency)
