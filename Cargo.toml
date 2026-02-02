@@ -11,7 +11,10 @@ csv = "1.4.0"
 dialoguer = { version = "0.12.0", features = ["completion", "fuzzy-select"] }
 dotenvy = "0.15.7"
 formatjs_icu_messageformat_parser = "0.2.2"
+iso3166 = "1.2.1"
+isolang = { version = "2.4.0", features = ["english_names"] }
 calamine = "0.26.1"
+codes-iso-15924 = "0.1.3"
 indicatif = "0.17.8"
 reqwest = { version = "0.12.14", features = ["json", "rustls-tls"] }
 tokio = { version = "1.43.0", features = ["rt-multi-thread"] }

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::TransConfig;
 use crate::error::{Result, TransError};
+use crate::language::language_display_name;
 
 #[derive(Debug, Clone)]
 pub struct AiSettings {
@@ -42,8 +43,10 @@ pub async fn suggest_translation(
     message_id: &str,
     source_text: &str,
 ) -> Result<String> {
+    let source_name = language_display_name(source_lang);
+    let target_name = language_display_name(target_lang);
     let system_prompt = format!(
-        "You are a professional translator. Translate from {source_lang} to {target_lang}. Preserve placeholders like {{name}} and ICU plural/select syntax. Return only the translation text."
+        "You are a professional translator. Translate from {source_name} to {target_name}. Preserve placeholders like {{name}} and ICU plural/select syntax. Return only the translation text."
     );
 
     let user_prompt = format!("Message ID: {message_id}\nSource: {source_text}");
