@@ -252,7 +252,7 @@ async fn run_translation_tasks(
     bars: &BTreeMap<String, ProgressBar>,
 ) -> Result<()> {
     let semaphore = Arc::new(Semaphore::new(settings.concurrency.max(1)));
-    let mut join_set = JoinSet::new();
+    let mut join_set: JoinSet<Result<TranslationResult>> = JoinSet::new();
 
     for task in tasks {
         let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
@@ -265,8 +265,15 @@ async fn run_translation_tasks(
             if let Some(bar) = &bar {
                 bar.set_message(format!("consulting {}", settings.model));
             }
-            let result = suggest_with_retries(&settings, &task).await;
-            result.map(|value| TranslationResult {
+            let value = suggest_with_retries(&settings, &task, bar.clone())
+                .await
+                .map_err(|err| {
+                    TransError::InvalidInput(format!(
+                        "AI failed for {}:{}: {err}",
+                        task.language, task.id
+                    ))
+                })?;
+            Ok(TranslationResult {
                 language: task.language,
                 id: task.id,
                 value,
@@ -275,7 +282,7 @@ async fn run_translation_tasks(
     }
 
     while let Some(joined) = join_set.join_next().await {
-        let output =
+        let output: Result<TranslationResult> =
             joined.map_err(|err| TransError::InvalidInput(format!("AI task failed: {err}")))?;
         let value = output?;
         if let Some(translations) = translations_by_language.get_mut(&value.language) {
@@ -291,7 +298,11 @@ async fn run_translation_tasks(
     Ok(())
 }
 
-async fn suggest_with_retries(settings: &AiSettings, task: &TranslationTask) -> Result<String> {
+async fn suggest_with_retries(
+    settings: &AiSettings,
+    task: &TranslationTask,
+    bar: Option<ProgressBar>,
+) -> Result<String> {
     let (system_prompt, user_prompt) = build_prompts(task);
     let mut attempt = 0usize;
     loop {
@@ -302,7 +313,16 @@ async fn suggest_with_retries(settings: &AiSettings, task: &TranslationTask) -> 
             {
                 let delay_ms =
                     RETRY_BASE_DELAY_MS.saturating_mul(2u64.saturating_pow(attempt as u32));
+                if let Some(bar) = &bar {
+                    bar.set_message(format!(
+                        "rate limited, retrying in {}s",
+                        (delay_ms as f64 / 1000.0).max(0.5)
+                    ));
+                }
                 sleep(Duration::from_millis(delay_ms)).await;
+                if let Some(bar) = &bar {
+                    bar.set_message(format!("consulting {}", settings.model));
+                }
                 attempt += 1;
                 continue;
             }
