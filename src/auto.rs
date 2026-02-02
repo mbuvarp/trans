@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use dialoguer::Confirm;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::ai::{AiSettings, resolve_ai_settings, suggest_custom};
 use crate::config::TransConfig;
 use crate::error::{Result, TransError};
 use crate::export::load_all_languages;
 use crate::format_validation::validate_message_formats;
-use crate::spinner::start_spinner;
 use crate::translations::{Translations, save_language_translations};
 use crate::verify::{collect_verification_issues, verify_language_files};
 use crate::verify_ai::verify_with_ai;
@@ -72,9 +72,31 @@ pub fn auto_translate(
         return Ok(());
     }
 
+    let progress = MultiProgress::new();
+    let style = ProgressStyle::with_template("{prefix} {bar:40.cyan/blue} {pos}/{len} {msg}")
+        .map_err(|err| TransError::InvalidInput(format!("progress style error: {err}")))?;
+    let mut bars: BTreeMap<String, ProgressBar> = BTreeMap::new();
+    for language in &selected_languages {
+        let count = missing_by_language
+            .get(language)
+            .map(|ids| ids.len())
+            .unwrap_or(0);
+        if count == 0 {
+            continue;
+        }
+        let bar = progress.add(ProgressBar::new(count as u64));
+        bar.set_style(style.clone());
+        bar.set_prefix(language.clone());
+        bars.insert(language.clone(), bar);
+    }
+
     for language in &selected_languages {
         let Some(ids) = missing_by_language.get(language) else {
             continue;
+        };
+        let bar = match bars.get(language) {
+            Some(bar) => bar,
+            None => continue,
         };
         for id in ids {
             let primary_value = translations_by_language
@@ -87,6 +109,7 @@ pub fn auto_translate(
             }
             let references =
                 reference_translations(config, &translations_by_language, id, language);
+            bar.set_message(format!("consulting {}", settings.model));
             let suggestion = run_translation_suggestion(
                 &settings,
                 &config.primary_language,
@@ -95,10 +118,13 @@ pub fn auto_translate(
                 &primary_value,
                 &references,
             )?;
+            bar.set_message("");
             if let Some(translations) = translations_by_language.get_mut(language) {
                 translations.insert(id.clone(), suggestion);
             }
+            bar.inc(1);
         }
+        bar.finish_with_message("done");
     }
 
     for language in &selected_languages {
@@ -195,10 +221,7 @@ fn run_translation_suggestion(
 
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|err| TransError::InvalidInput(format!("AI runtime error: {err}")))?;
-    let spinner = start_spinner(format!("Consulting {}", settings.model));
-    let result = runtime.block_on(suggest_custom(settings, &system_prompt, &user_prompt));
-    drop(spinner);
-    result
+    runtime.block_on(suggest_custom(settings, &system_prompt, &user_prompt))
 }
 
 fn reference_translations(
