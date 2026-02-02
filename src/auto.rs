@@ -1,10 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::Arc;
 
 use dialoguer::Confirm;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
 
@@ -251,34 +249,14 @@ async fn run_translation_tasks(
     tasks: Vec<TranslationTask>,
     bars: &BTreeMap<String, ProgressBar>,
 ) -> Result<()> {
-    let semaphore = Arc::new(Semaphore::new(settings.concurrency.max(1)));
+    let concurrency = settings.concurrency.max(1);
     let mut join_set: JoinSet<Result<TranslationResult>> = JoinSet::new();
+    let mut tasks_iter = tasks.into_iter();
 
-    for task in tasks {
-        let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
-            TransError::InvalidInput("failed to acquire AI concurrency permit".to_string())
-        })?;
-        let settings = settings.clone();
-        let bar = bars.get(&task.language).cloned();
-        join_set.spawn(async move {
-            let _permit = permit;
-            if let Some(bar) = &bar {
-                bar.set_message(format!("consulting {}", settings.model));
-            }
-            let value = suggest_with_retries(&settings, &task, bar.clone())
-                .await
-                .map_err(|err| {
-                    TransError::InvalidInput(format!(
-                        "AI failed for {}:{}: {err}",
-                        task.language, task.id
-                    ))
-                })?;
-            Ok(TranslationResult {
-                language: task.language,
-                id: task.id,
-                value,
-            })
-        });
+    for _ in 0..concurrency {
+        if let Some(task) = tasks_iter.next() {
+            spawn_translation_task(&mut join_set, settings.clone(), bars, task);
+        }
     }
 
     while let Some(joined) = join_set.join_next().await {
@@ -293,9 +271,39 @@ async fn run_translation_tasks(
             bar.inc(1);
             bar.set_message("");
         }
+        if let Some(task) = tasks_iter.next() {
+            spawn_translation_task(&mut join_set, settings.clone(), bars, task);
+        }
     }
 
     Ok(())
+}
+
+fn spawn_translation_task(
+    join_set: &mut JoinSet<Result<TranslationResult>>,
+    settings: AiSettings,
+    bars: &BTreeMap<String, ProgressBar>,
+    task: TranslationTask,
+) {
+    let bar = bars.get(&task.language).cloned();
+    join_set.spawn(async move {
+        if let Some(bar) = &bar {
+            bar.set_message(format!("consulting {}", settings.model));
+        }
+        let value = suggest_with_retries(&settings, &task, bar.clone())
+            .await
+            .map_err(|err| {
+                TransError::InvalidInput(format!(
+                    "AI failed for {}:{}: {err}",
+                    task.language, task.id
+                ))
+            })?;
+        Ok(TranslationResult {
+            language: task.language,
+            id: task.id,
+            value,
+        })
+    });
 }
 
 async fn suggest_with_retries(
