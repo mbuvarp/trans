@@ -128,7 +128,7 @@ pub fn maybe_prompt_sync(root: &Path, config: &TransConfig, err: &TransError) ->
         return Ok(false);
     }
     let confirmed = dialoguer::Confirm::new()
-        .with_prompt("Do you want to sync IDs?")
+        .with_prompt("ID inconsistencies found. Do you want to sync IDs?")
         .default(true)
         .interact()?;
     if !confirmed {
