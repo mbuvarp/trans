@@ -328,7 +328,11 @@ fn prompt_ai_config(defaults: &AiConfig) -> Result<AiConfig> {
     })
 }
 
-pub fn run_interactive(root: impl AsRef<Path>, message_id: Option<String>) -> Result<()> {
+pub fn run_interactive(
+    root: impl AsRef<Path>,
+    message_id: Option<String>,
+    prompt_all: bool,
+) -> Result<()> {
     let root = root.as_ref();
     let config = TransConfig::load_from_root(root)?;
     verify_language_files(root, &config)?;
@@ -358,15 +362,50 @@ pub fn run_interactive(root: impl AsRef<Path>, message_id: Option<String>) -> Re
         print_spacer();
         match selection {
             0 => {
-                let values =
-                    prompt_required_translations(root, &config, &message_id, &ai_settings, true)?;
+                let values = if prompt_all {
+                    prompt_translations_for_languages(
+                        root,
+                        &config,
+                        &message_id,
+                        &ai_settings,
+                        &languages_for_all(&config),
+                        true,
+                    )?
+                } else {
+                    prompt_translations_for_languages(
+                        root,
+                        &config,
+                        &message_id,
+                        &ai_settings,
+                        &config.required_languages,
+                        true,
+                    )?
+                };
                 update_translation(root, &config, &message_id, &values)
             }
             1 => delete_translation(root, &config, &message_id),
             _ => Ok(()),
         }
     } else {
-        let values = prompt_required_translations(root, &config, &message_id, &ai_settings, false)?;
+        let values = if prompt_all {
+            prompt_translations_for_languages(
+                root,
+                &config,
+                &message_id,
+                &ai_settings,
+                &languages_for_all(&config),
+                false,
+            )?
+        } else {
+            prompt_translations_for_languages(
+                root,
+                &config,
+                &message_id,
+                &ai_settings,
+                &config.required_languages,
+                false,
+            )?
+        };
         add_translation(root, &config, &message_id, &values)
     }
 }
@@ -951,16 +990,17 @@ fn prompt_message_id() -> Result<String> {
     }
 }
 
-fn prompt_required_translations(
+pub fn prompt_translations_for_languages(
     root: &Path,
     config: &TransConfig,
     message_id: &str,
     ai_settings: &Option<AiSettings>,
+    languages: &[String],
     use_existing_defaults: bool,
 ) -> Result<TranslationValues> {
     let mut values = TranslationValues::new();
 
-    for language in &config.required_languages {
+    for language in languages {
         let default_value = if use_existing_defaults {
             let translations = load_language_translations(root, config, language)?;
             translations.get(message_id).cloned()
@@ -1038,6 +1078,17 @@ fn prompt_required_translations(
     }
 
     Ok(values)
+}
+
+pub fn languages_for_all(config: &TransConfig) -> Vec<String> {
+    let mut languages = Vec::with_capacity(config.available_languages.len());
+    languages.push(config.primary_language.clone());
+    for language in &config.available_languages {
+        if language != &config.primary_language {
+            languages.push(language.clone());
+        }
+    }
+    languages
 }
 
 fn suggest_translation_blocking(
