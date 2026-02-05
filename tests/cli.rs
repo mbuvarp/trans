@@ -76,6 +76,7 @@ fn setup_project_with_ai(root: &std::path::Path) -> TransConfig {
 fn trans_cmd() -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("trans"));
     cmd.env("TRANS_AI_DISABLE", "1");
+    cmd.env("TRANS_NO_UPDATE_CHECK", "1");
     cmd
 }
 
