@@ -43,7 +43,7 @@ fn run() -> Result<()> {
     match cli.command {
         None => {
             let root = env::current_dir()?;
-            run_interactive(&root, cli.message_id)
+            run_interactive(&root, cli.message_id, cli.all)
         }
         Some(Command::Init { format }) => {
             let root = env::current_dir()?;
@@ -184,15 +184,53 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Add { id, values }) => {
+        Some(Command::Add { id, values, all }) => {
             let root = env::current_dir()?;
             let config = TransConfig::load_from_root(&root)?;
+            if all && values.is_some() {
+                return Err(TransError::InvalidInput(
+                    "cannot use --all together with --values".to_string(),
+                ));
+            }
+            if all {
+                let ai_settings = trans::ai::resolve_ai_settings(&root, &config)?;
+                let values = trans::interactive::prompt_translations_for_languages(
+                    &root,
+                    &config,
+                    &id,
+                    &ai_settings,
+                    &trans::interactive::languages_for_all(&config),
+                    false,
+                )?;
+                return add_translation(&root, &config, &id, &values);
+            }
+            let values = values
+                .ok_or_else(|| TransError::InvalidInput("missing --values or --all".to_string()))?;
             let values = parse_values(&values)?;
             add_translation(&root, &config, &id, &values)
         }
-        Some(Command::Update { id, values }) => {
+        Some(Command::Update { id, values, all }) => {
             let root = env::current_dir()?;
             let config = TransConfig::load_from_root(&root)?;
+            if all && values.is_some() {
+                return Err(TransError::InvalidInput(
+                    "cannot use --all together with --values".to_string(),
+                ));
+            }
+            if all {
+                let ai_settings = trans::ai::resolve_ai_settings(&root, &config)?;
+                let values = trans::interactive::prompt_translations_for_languages(
+                    &root,
+                    &config,
+                    &id,
+                    &ai_settings,
+                    &trans::interactive::languages_for_all(&config),
+                    true,
+                )?;
+                return update_translation(&root, &config, &id, &values);
+            }
+            let values = values
+                .ok_or_else(|| TransError::InvalidInput("missing --values or --all".to_string()))?;
             let values = parse_values(&values)?;
             update_translation(&root, &config, &id, &values)
         }

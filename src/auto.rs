@@ -439,9 +439,7 @@ fn start_status_bar(bar: ProgressBar) -> StatusGuard {
     let handle = thread::spawn(move || {
         while !stop_thread.load(Ordering::SeqCst) {
             let elapsed = format_elapsed(start.elapsed());
-            bar_thread.set_message(format!(
-                "[{elapsed}] Translations are saved continuously."
-            ));
+            bar_thread.set_message(format!("[{elapsed}] Translations are saved continuously."));
             bar_thread.tick();
             thread::sleep(StdDuration::from_secs(1));
         }
@@ -469,9 +467,8 @@ impl Drop for StatusGuard {
             let _ = handle.join();
         }
         let elapsed = format_elapsed(self.start.elapsed());
-        self.bar.finish_with_message(format!(
-            "[{elapsed}] Translations are saved continuously."
-        ));
+        self.bar
+            .finish_with_message(format!("[{elapsed}] Translations are saved continuously."));
     }
 }
 

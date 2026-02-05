@@ -21,6 +21,8 @@ pub struct Cli {
         help = "Print version information"
     )]
     pub version: bool,
+    #[arg(long = "all", help = "Prompt for all languages in interactive mode")]
+    pub all: bool,
     #[arg(
         value_name = "MESSAGE_ID",
         help = "Optional message id (e.g. app.header.title) to use in interactive mode"
@@ -58,7 +60,9 @@ pub enum Command {
             value_name = "LANG:VALUE,...",
             help = "Comma-separated translations, e.g. en:Hello,nb:Hei"
         )]
-        values: String,
+        values: Option<String>,
+        #[arg(long = "all", help = "Prompt for all languages interactively")]
+        all: bool,
     },
     #[command(about = "Update an existing translation id")]
     Update {
@@ -73,7 +77,9 @@ pub enum Command {
             value_name = "LANG:VALUE,...",
             help = "Comma-separated translations, e.g. en:Hello,nb:Hei"
         )]
-        values: String,
+        values: Option<String>,
+        #[arg(long = "all", help = "Prompt for all languages interactively")]
+        all: bool,
     },
     #[command(about = "Delete a translation id from all languages")]
     Delete {

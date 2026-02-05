@@ -269,9 +269,20 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
         fs::write(root.join(".env"), "OPENAI_API_KEY=test-key\n").expect("write");
+        let previous = env::var("OPENAI_API_KEY").ok();
+        unsafe {
+            env::set_var("OPENAI_API_KEY", "test-key");
+        }
         let config = base_config();
         let settings = resolve_ai_settings(root, &config).expect("settings");
         assert!(settings.is_some());
         assert_eq!(settings.unwrap().api_key, "test-key");
+        unsafe {
+            if let Some(value) = previous {
+                env::set_var("OPENAI_API_KEY", value);
+            } else {
+                env::remove_var("OPENAI_API_KEY");
+            }
+        }
     }
 }
