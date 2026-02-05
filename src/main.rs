@@ -25,6 +25,7 @@ use trans::operations::{
 };
 use trans::query::{get_translation, get_translations_all, list_required_languages};
 use trans::sync::{apply_sync_plan, collect_missing_ids, maybe_prompt_sync};
+use trans::update_check::{UpdateInfo, spawn_update_check};
 use trans::verify::{collect_verification_issues, verify_language_files};
 use trans::verify_ai::verify_with_ai;
 
@@ -41,7 +42,8 @@ fn run() -> Result<()> {
         println!("trans {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    match cli.command {
+    let update_check = spawn_update_check(env!("CARGO_PKG_VERSION"));
+    let result = match cli.command {
         None => {
             let root = env::current_dir()?;
             run_interactive(&root, cli.message_id, cli.all)
@@ -67,26 +69,31 @@ fn run() -> Result<()> {
             let config = TransConfig::load_from_root(&root)?;
             let format = format.unwrap_or(config.default_export_format);
             let use_custom = lang.is_some() || output.is_some() || missing || no_lock;
-            let selected = if let Some(lang) = lang {
-                let langs = parse_lang_list(&lang)?;
+            let selected = if let Some(lang) = lang.as_ref() {
+                let langs = parse_lang_list(lang)?;
                 let selected = resolve_export_languages(&config, &langs)?;
-                if langs.iter().all(|value| value == &config.primary_language) {
+                let only_primary = langs.iter().all(|value| value == &config.primary_language);
+                if only_primary {
                     eprintln!(
                         "Warning: only the primary language '{}' was provided; nothing to export.",
                         config.primary_language
                     );
-                    return Ok(());
+                    None
+                } else {
+                    Some(selected)
                 }
-                Some(selected)
             } else {
                 None
             };
-            if use_custom {
+            if use_custom && selected.is_some() {
                 verify_language_files(&root, &config)?;
             }
             let output_path = build_export_path(&root, output.as_deref(), format);
-            match format {
-                ExportFormat::Csv => {
+            if lang.is_some() && selected.is_none() {
+                Ok(())
+            } else {
+                match format {
+                    ExportFormat::Csv => {
                     if let Some(langs) = selected.as_ref() {
                         let translations =
                             trans::export::load_selected_languages(&root, &config, langs)?;
@@ -118,7 +125,7 @@ fn run() -> Result<()> {
                         }
                     }
                 }
-                ExportFormat::Excel => {
+                    ExportFormat::Excel => {
                     if let Some(langs) = selected.as_ref() {
                         let translations =
                             trans::export::load_selected_languages(&root, &config, langs)?;
@@ -150,6 +157,7 @@ fn run() -> Result<()> {
                             println!("Exported Excel to {}", path.display());
                             Ok(())
                         }
+                    }
                     }
                 }
             }
@@ -203,19 +211,22 @@ fn run() -> Result<()> {
                     &trans::interactive::languages_for_all(&config),
                     false,
                 )?;
-                return add_translation(&root, &config, &id, &values);
-            }
-            let values = values
-                .ok_or_else(|| TransError::InvalidInput("missing --values or --all".to_string()))?;
-            let values = parse_values(&values)?;
-            match add_translation(&root, &config, &id, &values) {
-                Err(err) => {
-                    if maybe_prompt_sync(&root, &config, &err)? {
-                        return Ok(());
+                add_translation(&root, &config, &id, &values)
+            } else {
+                let values = values.ok_or_else(|| {
+                    TransError::InvalidInput("missing --values or --all".to_string())
+                })?;
+                let values = parse_values(&values)?;
+                match add_translation(&root, &config, &id, &values) {
+                    Err(err) => {
+                        if maybe_prompt_sync(&root, &config, &err)? {
+                            Ok(())
+                        } else {
+                            Err(err)
+                        }
                     }
-                    Err(err)
+                    Ok(()) => Ok(()),
                 }
-                Ok(()) => Ok(()),
             }
         }
         Some(Command::Update { id, values, all }) => {
@@ -236,19 +247,22 @@ fn run() -> Result<()> {
                     &trans::interactive::languages_for_all(&config),
                     true,
                 )?;
-                return update_translation(&root, &config, &id, &values);
-            }
-            let values = values
-                .ok_or_else(|| TransError::InvalidInput("missing --values or --all".to_string()))?;
-            let values = parse_values(&values)?;
-            match update_translation(&root, &config, &id, &values) {
-                Err(err) => {
-                    if maybe_prompt_sync(&root, &config, &err)? {
-                        return Ok(());
+                update_translation(&root, &config, &id, &values)
+            } else {
+                let values = values.ok_or_else(|| {
+                    TransError::InvalidInput("missing --values or --all".to_string())
+                })?;
+                let values = parse_values(&values)?;
+                match update_translation(&root, &config, &id, &values) {
+                    Err(err) => {
+                        if maybe_prompt_sync(&root, &config, &err)? {
+                            Ok(())
+                        } else {
+                            Err(err)
+                        }
                     }
-                    Err(err)
+                    Ok(()) => Ok(()),
                 }
-                Ok(()) => Ok(()),
             }
         }
         Some(Command::Delete { id }) => {
@@ -257,9 +271,10 @@ fn run() -> Result<()> {
             match delete_translation(&root, &config, &id) {
                 Err(err) => {
                     if maybe_prompt_sync(&root, &config, &err)? {
-                        return Ok(());
+                        Ok(())
+                    } else {
+                        Err(err)
                     }
-                    Err(err)
                 }
                 Ok(()) => Ok(()),
             }
@@ -296,22 +311,23 @@ fn run() -> Result<()> {
                     true,
                 )?;
                 println!("Wrote config to {}", target.display());
-                return Ok(());
-            }
-            match section {
-                Some(ConfigSection::Ai) => configure_ai_interactive(&root),
-                Some(ConfigSection::Show) => {
-                    let (config, path) = TransConfig::load_from_root_with_path(&root)?;
-                    for line in format_config_list(&config, Some(&path)) {
-                        println!("{line}");
+                Ok(())
+            } else {
+                match section {
+                    Some(ConfigSection::Ai) => configure_ai_interactive(&root),
+                    Some(ConfigSection::Show) => {
+                        let (config, path) = TransConfig::load_from_root_with_path(&root)?;
+                        for line in format_config_list(&config, Some(&path)) {
+                            println!("{line}");
+                        }
+                        Ok(())
                     }
-                    Ok(())
+                    Some(ConfigSection::Edit { key }) => {
+                        let field = key.map(map_config_key);
+                        configure_edit_interactive(&root, field)
+                    }
+                    None => configure_root_interactive(&root),
                 }
-                Some(ConfigSection::Edit { key }) => {
-                    let field = key.map(map_config_key);
-                    configure_edit_interactive(&root, field)
-                }
-                None => configure_root_interactive(&root),
             }
         }
         Some(Command::ChangeId { old_id, new_id }) => {
@@ -320,9 +336,10 @@ fn run() -> Result<()> {
             match change_message_id(&root, &config, &old_id, &new_id) {
                 Err(err) => {
                     if maybe_prompt_sync(&root, &config, &err)? {
-                        return Ok(());
+                        Ok(())
+                    } else {
+                        Err(err)
                     }
-                    Err(err)
                 }
                 Ok(()) => Ok(()),
             }
@@ -400,7 +417,11 @@ fn run() -> Result<()> {
                 Ok(())
             }
         }
+    };
+    if result.is_ok() {
+        maybe_prompt_update(update_check)?;
     }
+    result
 }
 
 fn handle_sync(root: &Path, config: &TransConfig) -> Result<()> {
@@ -439,6 +460,38 @@ fn handle_sync(root: &Path, config: &TransConfig) -> Result<()> {
         println!("Added {applied} missing IDs.");
     }
     Ok(())
+}
+
+fn maybe_prompt_update(receiver: Option<std::sync::mpsc::Receiver<UpdateInfo>>) -> Result<()> {
+    let receiver = match receiver {
+        Some(receiver) => receiver,
+        None => return Ok(()),
+    };
+    let info = match receiver.recv_timeout(std::time::Duration::from_millis(200)) {
+        Ok(info) => info,
+        Err(_) => return Ok(()),
+    };
+    println!(
+        "You are using trans {}, but {} is available. Update now?",
+        style(format!("v{}", info.current)).bold(),
+        style(format!("v{}", info.latest)).bold()
+    );
+    let confirmed = Confirm::new().default(true).interact()?;
+    if !confirmed {
+        return Ok(());
+    }
+    let status = std::process::Command::new("brew")
+        .args(["upgrade", "trans"])
+        .status();
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(TransError::InvalidInput(
+            "brew upgrade trans failed".to_string(),
+        )),
+        Err(err) => Err(TransError::InvalidInput(format!(
+            "failed to run brew upgrade trans: {err}"
+        ))),
+    }
 }
 
 fn map_config_key(key: ConfigKey) -> ConfigField {
