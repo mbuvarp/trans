@@ -335,7 +335,13 @@ pub fn run_interactive(
 ) -> Result<()> {
     let root = root.as_ref();
     let config = TransConfig::load_from_root(root)?;
-    verify_language_files(root, &config)?;
+    if let Err(err) = verify_language_files(root, &config) {
+        if crate::sync::maybe_prompt_sync(root, &config, &err)? {
+            verify_language_files(root, &config)?;
+        } else {
+            return Err(err);
+        }
+    }
     let ai_settings = resolve_ai_settings(root, &config)?;
 
     let message_id = match message_id {
