@@ -12,6 +12,7 @@ pub mod message_id;
 pub mod operations;
 pub mod query;
 pub mod spinner;
+pub mod sync;
 pub mod translations;
 pub mod verify;
 pub mod verify_ai;

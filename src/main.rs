@@ -24,6 +24,7 @@ use trans::operations::{
     update_translation,
 };
 use trans::query::{get_translation, get_translations_all, list_required_languages};
+use trans::sync::{apply_sync_plan, collect_missing_ids, maybe_prompt_sync};
 use trans::verify::{collect_verification_issues, verify_language_files};
 use trans::verify_ai::verify_with_ai;
 
@@ -207,7 +208,15 @@ fn run() -> Result<()> {
             let values = values
                 .ok_or_else(|| TransError::InvalidInput("missing --values or --all".to_string()))?;
             let values = parse_values(&values)?;
-            add_translation(&root, &config, &id, &values)
+            match add_translation(&root, &config, &id, &values) {
+                Err(err) => {
+                    if maybe_prompt_sync(&root, &config, &err)? {
+                        return Ok(());
+                    }
+                    Err(err)
+                }
+                Ok(()) => Ok(()),
+            }
         }
         Some(Command::Update { id, values, all }) => {
             let root = env::current_dir()?;
@@ -232,12 +241,28 @@ fn run() -> Result<()> {
             let values = values
                 .ok_or_else(|| TransError::InvalidInput("missing --values or --all".to_string()))?;
             let values = parse_values(&values)?;
-            update_translation(&root, &config, &id, &values)
+            match update_translation(&root, &config, &id, &values) {
+                Err(err) => {
+                    if maybe_prompt_sync(&root, &config, &err)? {
+                        return Ok(());
+                    }
+                    Err(err)
+                }
+                Ok(()) => Ok(()),
+            }
         }
         Some(Command::Delete { id }) => {
             let root = env::current_dir()?;
             let config = TransConfig::load_from_root(&root)?;
-            delete_translation(&root, &config, &id)
+            match delete_translation(&root, &config, &id) {
+                Err(err) => {
+                    if maybe_prompt_sync(&root, &config, &err)? {
+                        return Ok(());
+                    }
+                    Err(err)
+                }
+                Ok(()) => Ok(()),
+            }
         }
         Some(Command::Show { id, lang }) => {
             let root = env::current_dir()?;
@@ -292,7 +317,15 @@ fn run() -> Result<()> {
         Some(Command::ChangeId { old_id, new_id }) => {
             let root = env::current_dir()?;
             let config = TransConfig::load_from_root(&root)?;
-            change_message_id(&root, &config, &old_id, &new_id)
+            match change_message_id(&root, &config, &old_id, &new_id) {
+                Err(err) => {
+                    if maybe_prompt_sync(&root, &config, &err)? {
+                        return Ok(());
+                    }
+                    Err(err)
+                }
+                Ok(()) => Ok(()),
+            }
         }
         Some(Command::Verify { ai }) => {
             let root = env::current_dir()?;
@@ -318,6 +351,11 @@ fn run() -> Result<()> {
                     process::exit(1);
                 }
             }
+        }
+        Some(Command::Sync) => {
+            let root = env::current_dir()?;
+            let config = TransConfig::load_from_root(&root)?;
+            handle_sync(&root, &config)
         }
         Some(Command::Auto { lang, concurrency }) => {
             let root = env::current_dir()?;
@@ -363,6 +401,44 @@ fn run() -> Result<()> {
             }
         }
     }
+}
+
+fn handle_sync(root: &Path, config: &TransConfig) -> Result<()> {
+    let plan = collect_missing_ids(root, config)?;
+    let report = plan.report();
+    if report.total_missing == 0 {
+        println!("No missing IDs.");
+        return Ok(());
+    }
+
+    println!("Found missing IDs:");
+    for (language, count) in report.missing_by_language {
+        println!("{language}: {count}");
+    }
+    println!();
+    let default_message = if config.default_untranslated_value.is_empty() {
+        "<empty>".to_string()
+    } else {
+        config.default_untranslated_value.clone()
+    };
+    let prompt = format!(
+        "Do you want to add the missing IDs with message \"{default_message}\"?"
+    );
+    let confirmed = dialoguer::Confirm::new()
+        .with_prompt(prompt)
+        .default(true)
+        .interact()?;
+    if !confirmed {
+        return Ok(());
+    }
+
+    let applied = apply_sync_plan(root, config, &plan)?.total_missing;
+    if applied == 0 {
+        println!("No missing IDs to add.");
+    } else {
+        println!("Added {applied} missing IDs.");
+    }
+    Ok(())
 }
 
 fn map_config_key(key: ConfigKey) -> ConfigField {

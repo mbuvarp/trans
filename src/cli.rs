@@ -194,6 +194,8 @@ pub enum Command {
         #[arg(long = "ai", help = "Use AI to suggest fixes for verification errors")]
         ai: bool,
     },
+    #[command(about = "Sync missing ids from the primary language into all languages")]
+    Sync,
     #[command(about = "Translate all missing values with AI")]
     Auto {
         #[arg(
