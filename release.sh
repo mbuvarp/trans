@@ -3,10 +3,13 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: ./release.sh <version> [--notes <text>] [--notes-file <path>] [--dry-run]
+Usage: ./release.sh <version|patch|minor|major> [--notes <text>] [--notes-file <path>] [--dry-run]
 
 Examples:
   ./release.sh v0.1.1
+  ./release.sh patch
+  ./release.sh minor
+  ./release.sh major
   ./release.sh v0.1.1 --notes "Bug fixes"
   ./release.sh v0.1.1 --notes-file /path/to/notes.md
   ./release.sh v0.1.1 --dry-run
@@ -24,7 +27,8 @@ if [[ ${1:-} == "" || ${1:-} == "-h" || ${1:-} == "--help" ]]; then
   exit 0
 fi
 
-version="$1"
+requested_version="$1"
+version="$requested_version"
 shift || true
 
 notes=""
@@ -68,6 +72,56 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+current_cargo_version() {
+  python3 - <<'PY'
+from pathlib import Path
+
+lines = Path("Cargo.toml").read_text(encoding="utf-8").splitlines()
+in_pkg = False
+for line in lines:
+  stripped = line.strip()
+  if stripped == "[package]":
+    in_pkg = True
+    continue
+  if in_pkg and stripped.startswith("[") and stripped.endswith("]"):
+    break
+  if in_pkg and stripped.startswith("version"):
+    value = stripped.split("=", 1)[1].strip().strip('"')
+    print(value)
+    break
+else:
+  raise SystemExit("version not found in Cargo.toml")
+PY
+}
+
+bump_cargo_version() {
+  local current="$1"
+  local mode="$2"
+  python3 - "$current" "$mode" <<'PY'
+import re
+import sys
+
+version = sys.argv[1]
+mode = sys.argv[2]
+match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
+if not match:
+    raise SystemExit(f"unsupported Cargo.toml version '{version}', expected x.y.z")
+major, minor, patch = map(int, match.groups())
+if mode == "patch":
+    patch += 1
+elif mode == "minor":
+    minor += 1
+    patch = 0
+elif mode == "major":
+    major += 1
+    minor = 0
+    patch = 0
+else:
+    raise SystemExit(f"unsupported bump mode '{mode}'")
+print(f"{major}.{minor}.{patch}")
+PY
+}
+
 if [[ -n "$notes" && -n "$notes_file" ]]; then
   echo "Use either --notes or --notes-file, not both." >&2
   exit 1
@@ -76,6 +130,22 @@ fi
 if [[ "$dry_run" == "true" && (-n "$notes" || -n "$notes_file") ]]; then
   echo "--dry-run cannot be used with --notes or --notes-file." >&2
   exit 1
+fi
+
+current_version="$(current_cargo_version)"
+
+if [[ "$requested_version" == "patch" || "$requested_version" == "minor" || "$requested_version" == "major" ]]; then
+  next_cargo_version="$(bump_cargo_version "$current_version" "$requested_version")"
+  version="v${next_cargo_version}"
+  echo "Bump mode: $requested_version"
+  echo "Current version: v${current_version}"
+  echo "Version to release: ${version}"
+  read -r -p "Proceed with ${version}? [Y/n] " reply
+  reply="${reply:-Y}"
+  if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+    echo "Aborted."
+    exit 1
+  fi
 fi
 
 if [[ -n "$(git status --porcelain)" ]]; then
@@ -250,27 +320,6 @@ if [[ "$dry_run" == "true" ]]; then
 fi
 
 cargo_version="${version#v}"
-
-current_version="$(python3 - <<'PY'
-from pathlib import Path
-
-lines = Path("Cargo.toml").read_text(encoding="utf-8").splitlines()
-in_pkg = False
-for line in lines:
-  stripped = line.strip()
-  if stripped == "[package]":
-    in_pkg = True
-    continue
-  if in_pkg and stripped.startswith("[") and stripped.endswith("]"):
-    break
-  if in_pkg and stripped.startswith("version"):
-    value = stripped.split("=", 1)[1].strip().strip('"')
-    print(value)
-    break
-else:
-  raise SystemExit("version not found in Cargo.toml")
-PY
-)"
 
 if [[ "$current_version" != "$cargo_version" ]]; then
   echo "Updating Cargo.toml version $current_version -> $cargo_version"
