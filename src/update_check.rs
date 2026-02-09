@@ -42,10 +42,7 @@ pub fn spawn_update_check(current: &str) -> Option<Receiver<UpdateInfo>> {
         if let Ok(Some(latest)) = check_brew_latest() {
             let _ = write_cache(&latest);
             if is_newer(&latest, &current) {
-                let _ = tx.send(UpdateInfo {
-                    current,
-                    latest,
-                });
+                let _ = tx.send(UpdateInfo { current, latest });
             }
         }
     });
@@ -128,11 +125,7 @@ fn parse_version(value: &str) -> Option<Vec<u64>> {
         }
         break;
     }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts)
-    }
+    if parts.is_empty() { None } else { Some(parts) }
 }
 
 fn is_newer(latest: &str, current: &str) -> bool {
