@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use console::style;
 use dialoguer::{Completion, Confirm, FuzzySelect, Input, Select};
 
-use crate::ai::{AiSettings, resolve_ai_settings, suggest_translation};
+use crate::ai::{
+    AiSettings, SuggestTranslationContext, resolve_ai_settings, suggest_translation_with_context,
+};
 use crate::config::{AiConfig, ConfigField, ExportFormat, TransConfig};
 use crate::error::Result;
 use crate::language::is_valid_language_code;
@@ -1020,7 +1022,7 @@ pub fn prompt_translations_for_languages(
             input = input.default(default);
         }
         let mut translation = input.allow_empty(true).interact_text()?;
-        if translation.trim() == "/ai" {
+        if let Some(initial_feedback) = parse_ai_command(&translation) {
             if language == &config.primary_language {
                 eprintln!("AI mode requires a manual entry for the primary language first.");
                 translation = Input::<String>::new()
@@ -1039,37 +1041,17 @@ pub fn prompt_translations_for_languages(
                         .allow_empty(true)
                         .interact_text()?;
                 } else if let Some(settings) = ai_settings {
-                    translation = loop {
-                        match suggest_translation_blocking(
-                            settings,
-                            &config.primary_language,
-                            language,
-                            message_id,
-                            &source_text,
-                        ) {
-                            Ok(suggestion) => {
-                                print_label("AI suggestion");
-                                println!("{suggestion}");
-                                let reviewed = Input::<String>::new()
-                                    .with_prompt(">")
-                                    .allow_empty(true)
-                                    .default(suggestion.clone())
-                                    .interact_text()?;
-                                if reviewed.trim() == "/ai" {
-                                    continue;
-                                }
-                                break reviewed;
-                            }
-                            Err(err) => {
-                                eprintln!("AI error: {err}");
-                                let manual = Input::<String>::new()
-                                    .with_prompt(">")
-                                    .allow_empty(true)
-                                    .interact_text()?;
-                                break manual;
-                            }
-                        }
-                    };
+                    let reference_translations =
+                        gather_reference_translations(root, config, message_id, language, &values)?;
+                    translation = prompt_translation_with_ai(
+                        settings,
+                        &config.primary_language,
+                        language,
+                        message_id,
+                        &source_text,
+                        &reference_translations,
+                        initial_feedback,
+                    )?;
                 } else {
                     eprintln!("AI is not configured. Enter translation manually.");
                     translation = Input::<String>::new()
@@ -1103,20 +1085,151 @@ fn suggest_translation_blocking(
     target_lang: &str,
     message_id: &str,
     source_text: &str,
+    context: &SuggestTranslationContext,
 ) -> Result<String> {
     let runtime = tokio::runtime::Runtime::new().map_err(|err| {
         crate::error::TransError::InvalidInput(format!("AI runtime error: {err}"))
     })?;
     let spinner = start_spinner(format!("Consulting {}", settings.model));
-    let result = runtime.block_on(suggest_translation(
+    let result = runtime.block_on(suggest_translation_with_context(
         settings,
         source_lang,
         target_lang,
         message_id,
         source_text,
+        context,
     ));
     drop(spinner);
     result
+}
+
+fn gather_reference_translations(
+    root: &Path,
+    config: &TransConfig,
+    message_id: &str,
+    target_language: &str,
+    values: &TranslationValues,
+) -> Result<Vec<(String, String)>> {
+    let mut references = Vec::new();
+    for language in &config.available_languages {
+        if language == target_language || language == &config.primary_language {
+            continue;
+        }
+        let value = if let Some(value) = values.get(language) {
+            Some(value.clone())
+        } else {
+            let translations = load_language_translations(root, config, language)?;
+            translations.get(message_id).cloned()
+        };
+        if let Some(value) = value {
+            if !value.trim().is_empty() && value != config.default_untranslated_value {
+                references.push((language.clone(), value));
+            }
+        }
+    }
+    Ok(references)
+}
+
+fn prompt_translation_with_ai(
+    settings: &AiSettings,
+    source_language: &str,
+    target_language: &str,
+    message_id: &str,
+    source_text: &str,
+    reference_translations: &[(String, String)],
+    initial_feedback: Option<String>,
+) -> Result<String> {
+    let mut suggestions: Vec<String> = Vec::new();
+    let mut feedback_history: Vec<String> = Vec::new();
+    let mut latest_feedback = initial_feedback;
+
+    loop {
+        let context = SuggestTranslationContext {
+            reference_translations: reference_translations.to_vec(),
+            previous_suggestions: suggestions.clone(),
+            feedback_history: feedback_history.clone(),
+            latest_feedback: latest_feedback.clone(),
+            request_alternative: latest_feedback.is_none() && !suggestions.is_empty(),
+        };
+        match suggest_translation_blocking(
+            settings,
+            source_language,
+            target_language,
+            message_id,
+            source_text,
+            &context,
+        ) {
+            Ok(suggestion) => {
+                if !suggestions.iter().any(|value| value == &suggestion) {
+                    suggestions.push(suggestion.clone());
+                }
+                if let Some(feedback) = latest_feedback.take() {
+                    feedback_history.push(feedback);
+                }
+                let selection = select_or_type_translation(&suggestions)?;
+                if let Some(feedback) = parse_ai_command(&selection) {
+                    latest_feedback = feedback;
+                    continue;
+                }
+                return Ok(selection);
+            }
+            Err(err) => {
+                eprintln!("AI error: {err}");
+                let selection = select_or_type_translation(&suggestions)?;
+                if let Some(feedback) = parse_ai_command(&selection) {
+                    latest_feedback = feedback;
+                    continue;
+                }
+                return Ok(selection);
+            }
+        }
+    }
+}
+
+fn select_or_type_translation(suggestions: &[String]) -> Result<String> {
+    if !suggestions.is_empty() {
+        print_label("AI suggestions");
+        let mut items: Vec<String> = suggestions.iter().map(|s| format!("- {s}")).collect();
+        items.push("- <write new translation/command>".to_string());
+        let selection = Select::new()
+            .with_prompt(">")
+            .items(&items)
+            .default(suggestions.len().saturating_sub(1))
+            .interact()?;
+        if selection < suggestions.len() {
+            return Ok(suggestions[selection].clone());
+        }
+    }
+
+    let mut prompt = Input::<String>::new().with_prompt(">").allow_empty(true);
+    if let Some(last) = suggestions.last() {
+        prompt = prompt.default(last.clone());
+    }
+    Ok(prompt.interact_text()?)
+}
+
+fn parse_ai_command(input: &str) -> Option<Option<String>> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with("/ai") {
+        return None;
+    }
+    if trimmed == "/ai" {
+        return Some(None);
+    }
+    let rest = trimmed.trim_start_matches("/ai");
+    if rest.is_empty() {
+        return Some(None);
+    }
+    let first = rest.chars().next()?;
+    if !first.is_whitespace() {
+        return None;
+    }
+    let feedback = rest.trim();
+    if feedback.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(feedback.to_string()))
+    }
 }
 
 fn print_label(text: &str) {
@@ -1129,4 +1242,29 @@ fn print_description(text: &str) {
 
 fn print_spacer() {
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ai_command;
+
+    #[test]
+    fn parse_ai_command_without_feedback() {
+        assert_eq!(parse_ai_command("/ai"), Some(None));
+        assert_eq!(parse_ai_command(" /ai  "), Some(None));
+    }
+
+    #[test]
+    fn parse_ai_command_with_feedback() {
+        assert_eq!(
+            parse_ai_command("/ai bruk ordet las"),
+            Some(Some("bruk ordet las".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_ai_command_rejects_non_ai_input() {
+        assert_eq!(parse_ai_command("hello"), None);
+        assert_eq!(parse_ai_command("/air"), None);
+    }
 }
