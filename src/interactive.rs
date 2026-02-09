@@ -1216,6 +1216,7 @@ fn select_translation_action(suggestions: &[String]) -> Result<AiSelection> {
             return Ok(AiSelection::UseSuggestion(suggestions[selection].clone()));
         }
         if selection == suggestions.len() {
+            show_previous_suggestion(suggestions);
             let feedback = Input::<String>::new()
                 .with_prompt(">")
                 .allow_empty(true)
@@ -1227,7 +1228,11 @@ fn select_translation_action(suggestions: &[String]) -> Result<AiSelection> {
             };
             return Ok(AiSelection::Instruct(feedback));
         }
-        let prompt = Input::<String>::new().with_prompt(">").allow_empty(true);
+        show_previous_suggestion(suggestions);
+        let mut prompt = Input::<String>::new().with_prompt(">").allow_empty(true);
+        if let Some(last) = suggestions.last() {
+            prompt = prompt.default(last.clone());
+        }
         return Ok(AiSelection::WriteCustom(prompt.interact_text()?));
     }
 
@@ -1253,6 +1258,14 @@ fn select_translation_action(suggestions: &[String]) -> Result<AiSelection> {
     }
     let prompt = Input::<String>::new().with_prompt(">").allow_empty(true);
     Ok(AiSelection::WriteCustom(prompt.interact_text()?))
+}
+
+fn show_previous_suggestion(suggestions: &[String]) {
+    if let Some(last) = suggestions.last() {
+        print_label("Previous suggestion");
+        println!("{last}");
+        print_spacer();
+    }
 }
 
 fn parse_ai_command(input: &str) -> Option<Option<String>> {
