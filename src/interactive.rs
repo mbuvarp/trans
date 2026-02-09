@@ -1189,8 +1189,8 @@ fn prompt_translation_with_ai(
 fn select_or_type_translation(suggestions: &[String]) -> Result<String> {
     if !suggestions.is_empty() {
         print_label("AI suggestions");
-        let mut items: Vec<String> = suggestions.iter().map(|s| format!("- {s}")).collect();
-        items.push("- <write new translation/command>".to_string());
+        let mut items: Vec<String> = suggestions.to_vec();
+        items.push("Write custom translation or command".to_string());
         let selection = Select::new()
             .with_prompt(">")
             .items(&items)
