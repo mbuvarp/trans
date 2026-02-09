@@ -99,16 +99,25 @@ fn check_brew_latest() -> Result<Option<String>> {
         _ => return Ok(None),
     };
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    let latest = payload
+    let latest = extract_livecheck_latest(&payload);
+    Ok(latest)
+}
+
+fn extract_livecheck_latest(payload: &serde_json::Value) -> Option<String> {
+    payload
         .as_array()
         .and_then(|items| items.first())
         .and_then(|item| {
             item.get("latest")
-                .or_else(|| item.get("version"))
                 .and_then(|value| value.as_str())
+                .or_else(|| {
+                    item.get("version")
+                        .and_then(|version| version.get("latest"))
+                        .and_then(|value| value.as_str())
+                })
+                .or_else(|| item.get("version").and_then(|value| value.as_str()))
         })
-        .map(|value| value.trim_start_matches('v').to_string());
-    Ok(latest)
+        .map(|value| value.trim_start_matches('v').to_string())
 }
 
 fn parse_version(value: &str) -> Option<Vec<u64>> {
@@ -149,4 +158,41 @@ fn is_newer(latest: &str, current: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_livecheck_latest;
+
+    #[test]
+    fn extract_livecheck_latest_from_nested_version_object() {
+        let payload = serde_json::json!([
+            {
+                "formula": "trans",
+                "version": {
+                    "current": "0.1.6",
+                    "latest": "0.1.7",
+                    "outdated": true
+                }
+            }
+        ]);
+        assert_eq!(
+            extract_livecheck_latest(&payload),
+            Some("0.1.7".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_livecheck_latest_from_flat_latest() {
+        let payload = serde_json::json!([
+            {
+                "formula": "trans",
+                "latest": "v0.2.0"
+            }
+        ]);
+        assert_eq!(
+            extract_livecheck_latest(&payload),
+            Some("0.2.0".to_string())
+        );
+    }
 }
