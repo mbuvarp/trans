@@ -1166,46 +1166,93 @@ fn prompt_translation_with_ai(
                 if let Some(feedback) = latest_feedback.take() {
                     feedback_history.push(feedback);
                 }
-                let selection = select_or_type_translation(&suggestions)?;
-                if let Some(feedback) = parse_ai_command(&selection) {
-                    latest_feedback = feedback;
-                    continue;
+                match select_translation_action(&suggestions)? {
+                    AiSelection::UseSuggestion(selection) => return Ok(selection),
+                    AiSelection::Instruct(feedback) => {
+                        latest_feedback = feedback;
+                        continue;
+                    }
+                    AiSelection::WriteCustom(custom) => return Ok(custom),
                 }
-                return Ok(selection);
             }
             Err(err) => {
                 eprintln!("AI error: {err}");
-                let selection = select_or_type_translation(&suggestions)?;
-                if let Some(feedback) = parse_ai_command(&selection) {
-                    latest_feedback = feedback;
-                    continue;
+                match select_translation_action(&suggestions)? {
+                    AiSelection::UseSuggestion(selection) => return Ok(selection),
+                    AiSelection::Instruct(feedback) => {
+                        latest_feedback = feedback;
+                        continue;
+                    }
+                    AiSelection::WriteCustom(custom) => return Ok(custom),
                 }
-                return Ok(selection);
             }
         }
     }
 }
 
-fn select_or_type_translation(suggestions: &[String]) -> Result<String> {
+enum AiSelection {
+    UseSuggestion(String),
+    Instruct(Option<String>),
+    WriteCustom(String),
+}
+
+fn select_translation_action(suggestions: &[String]) -> Result<AiSelection> {
     if !suggestions.is_empty() {
         print_label("AI suggestions");
         let mut items: Vec<String> = suggestions.to_vec();
-        items.push("Write custom translation or command".to_string());
+        let instruct_label = style("Instruct the AI").bright().cyan().to_string();
+        let custom_label = style("Write custom translation")
+            .bright()
+            .cyan()
+            .to_string();
+        items.push(instruct_label);
+        items.push(custom_label);
         let selection = Select::new()
             .with_prompt(">")
             .items(&items)
             .default(suggestions.len().saturating_sub(1))
             .interact()?;
         if selection < suggestions.len() {
-            return Ok(suggestions[selection].clone());
+            return Ok(AiSelection::UseSuggestion(suggestions[selection].clone()));
         }
+        if selection == suggestions.len() {
+            let feedback = Input::<String>::new()
+                .with_prompt(">")
+                .allow_empty(true)
+                .interact_text()?;
+            let feedback = if feedback.trim().is_empty() {
+                None
+            } else {
+                Some(feedback)
+            };
+            return Ok(AiSelection::Instruct(feedback));
+        }
+        let prompt = Input::<String>::new().with_prompt(">").allow_empty(true);
+        return Ok(AiSelection::WriteCustom(prompt.interact_text()?));
     }
 
-    let mut prompt = Input::<String>::new().with_prompt(">").allow_empty(true);
-    if let Some(last) = suggestions.last() {
-        prompt = prompt.default(last.clone());
+    let command_label = style("Instruct the AI").bright().cyan();
+    let manual_label = style("Write custom translation").bright().cyan();
+    print_label(&format!("{} or {}", command_label, manual_label));
+    let selection = Select::new()
+        .with_prompt(">")
+        .items(&[command_label.to_string(), manual_label.to_string()])
+        .default(0)
+        .interact()?;
+    if selection == 0 {
+        let feedback = Input::<String>::new()
+            .with_prompt(">")
+            .allow_empty(true)
+            .interact_text()?;
+        let feedback = if feedback.trim().is_empty() {
+            None
+        } else {
+            Some(feedback)
+        };
+        return Ok(AiSelection::Instruct(feedback));
     }
-    Ok(prompt.interact_text()?)
+    let prompt = Input::<String>::new().with_prompt(">").allow_empty(true);
+    Ok(AiSelection::WriteCustom(prompt.interact_text()?))
 }
 
 fn parse_ai_command(input: &str) -> Option<Option<String>> {
