@@ -94,58 +94,46 @@ fn run() -> Result<()> {
             } else {
                 match format {
                     ExportFormat::Csv => {
-                    if let Some(langs) = selected.as_ref() {
-                        let translations =
-                            trans::export::load_selected_languages(&root, &config, langs)?;
-                        export_csv_with_options(
-                            &config,
-                            &translations,
-                            langs,
-                            &output_path,
-                            missing,
-                        )?;
-                        println!("Exported CSV to {}", output_path.display());
-                        Ok(())
-                    } else {
-                        if use_custom {
-                            let translations = trans::export::load_all_languages(&root, &config)?;
+                        if let Some(langs) = selected.as_ref() {
+                            let translations =
+                                trans::export::load_selected_languages(&root, &config, langs)?;
                             export_csv_with_options(
                                 &config,
                                 &translations,
-                                &config.available_languages,
+                                langs,
                                 &output_path,
                                 missing,
                             )?;
                             println!("Exported CSV to {}", output_path.display());
                             Ok(())
                         } else {
-                            let path = export_csv(&root, &config)?;
-                            println!("Exported CSV to {}", path.display());
-                            Ok(())
+                            if use_custom {
+                                let translations =
+                                    trans::export::load_all_languages(&root, &config)?;
+                                export_csv_with_options(
+                                    &config,
+                                    &translations,
+                                    &config.available_languages,
+                                    &output_path,
+                                    missing,
+                                )?;
+                                println!("Exported CSV to {}", output_path.display());
+                                Ok(())
+                            } else {
+                                let path = export_csv(&root, &config)?;
+                                println!("Exported CSV to {}", path.display());
+                                Ok(())
+                            }
                         }
                     }
-                }
                     ExportFormat::Excel => {
-                    if let Some(langs) = selected.as_ref() {
-                        let translations =
-                            trans::export::load_selected_languages(&root, &config, langs)?;
-                        export_excel_with_options(
-                            &config,
-                            &translations,
-                            langs,
-                            &output_path,
-                            missing,
-                            !no_lock,
-                        )?;
-                        println!("Exported Excel to {}", output_path.display());
-                        Ok(())
-                    } else {
-                        if use_custom {
-                            let translations = trans::export::load_all_languages(&root, &config)?;
+                        if let Some(langs) = selected.as_ref() {
+                            let translations =
+                                trans::export::load_selected_languages(&root, &config, langs)?;
                             export_excel_with_options(
                                 &config,
                                 &translations,
-                                &config.available_languages,
+                                langs,
                                 &output_path,
                                 missing,
                                 !no_lock,
@@ -153,11 +141,25 @@ fn run() -> Result<()> {
                             println!("Exported Excel to {}", output_path.display());
                             Ok(())
                         } else {
-                            let path = export_excel(&root, &config)?;
-                            println!("Exported Excel to {}", path.display());
-                            Ok(())
+                            if use_custom {
+                                let translations =
+                                    trans::export::load_all_languages(&root, &config)?;
+                                export_excel_with_options(
+                                    &config,
+                                    &translations,
+                                    &config.available_languages,
+                                    &output_path,
+                                    missing,
+                                    !no_lock,
+                                )?;
+                                println!("Exported Excel to {}", output_path.display());
+                                Ok(())
+                            } else {
+                                let path = export_excel(&root, &config)?;
+                                println!("Exported Excel to {}", path.display());
+                                Ok(())
+                            }
                         }
-                    }
                     }
                 }
             }
@@ -442,9 +444,7 @@ fn handle_sync(root: &Path, config: &TransConfig) -> Result<()> {
     } else {
         config.default_untranslated_value.clone()
     };
-    let prompt = format!(
-        "Do you want to add the missing IDs with message \"{default_message}\"?"
-    );
+    let prompt = format!("Do you want to add the missing IDs with message \"{default_message}\"?");
     let confirmed = dialoguer::Confirm::new()
         .with_prompt(prompt)
         .default(true)

@@ -143,7 +143,9 @@ pub fn maybe_prompt_sync(root: &Path, config: &TransConfig, err: &TransError) ->
 mod tests {
     use super::*;
     use crate::config::{ExportFormat, TransConfig};
-    use crate::translations::{Translations, load_language_translations, save_language_translations};
+    use crate::translations::{
+        Translations, load_language_translations, save_language_translations,
+    };
     use tempfile::tempdir;
 
     fn config() -> TransConfig {
@@ -173,7 +175,10 @@ mod tests {
 
         let plan = collect_missing_ids(dir.path(), &config).expect("plan");
         assert_eq!(plan.total_missing(), 1);
-        assert_eq!(plan.missing_by_language["nb"], vec!["app.subtitle".to_string()]);
+        assert_eq!(
+            plan.missing_by_language["nb"],
+            vec!["app.subtitle".to_string()]
+        );
     }
 
     #[test]

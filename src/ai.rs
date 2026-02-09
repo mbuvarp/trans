@@ -16,6 +16,15 @@ pub struct AiSettings {
     pub concurrency: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SuggestTranslationContext {
+    pub reference_translations: Vec<(String, String)>,
+    pub previous_suggestions: Vec<String>,
+    pub feedback_history: Vec<String>,
+    pub latest_feedback: Option<String>,
+    pub request_alternative: bool,
+}
+
 pub fn resolve_ai_settings(root: &Path, config: &TransConfig) -> Result<Option<AiSettings>> {
     let ai = match &config.ai {
         Some(ai) if ai.enabled => ai,
@@ -43,14 +52,75 @@ pub async fn suggest_translation(
     message_id: &str,
     source_text: &str,
 ) -> Result<String> {
+    suggest_translation_with_context(
+        settings,
+        source_lang,
+        target_lang,
+        message_id,
+        source_text,
+        &SuggestTranslationContext::default(),
+    )
+    .await
+}
+
+pub async fn suggest_translation_with_context(
+    settings: &AiSettings,
+    source_lang: &str,
+    target_lang: &str,
+    message_id: &str,
+    source_text: &str,
+    context: &SuggestTranslationContext,
+) -> Result<String> {
     let source_name = language_display_name(source_lang);
     let target_name = language_display_name(target_lang);
     let system_prompt = format!(
         "You are a professional translator. Translate from {source_name} to {target_name}. Preserve placeholders like {{name}} and ICU plural/select syntax. Do not add XML/HTML tags unless they appear in the source. Return only the translation text."
     );
-
-    let user_prompt = format!("Message ID: {message_id}\nSource: {source_text}");
+    let user_prompt = build_translation_user_prompt(message_id, source_text, context);
     suggest_custom(settings, &system_prompt, &user_prompt).await
+}
+
+fn build_translation_user_prompt(
+    message_id: &str,
+    source_text: &str,
+    context: &SuggestTranslationContext,
+) -> String {
+    let mut lines = vec![
+        format!("Message ID: {message_id}"),
+        format!("Source: {source_text}"),
+    ];
+
+    if !context.reference_translations.is_empty() {
+        lines.push("Reference translations in other languages:".to_string());
+        for (language, value) in &context.reference_translations {
+            lines.push(format!("- {language}: {value}"));
+        }
+    }
+
+    if !context.previous_suggestions.is_empty() {
+        lines.push("Previous AI suggestions for this language:".to_string());
+        for suggestion in &context.previous_suggestions {
+            lines.push(format!("- {suggestion}"));
+        }
+    }
+
+    if !context.feedback_history.is_empty() {
+        lines.push("Previously provided user feedback:".to_string());
+        for feedback in &context.feedback_history {
+            lines.push(format!("- {feedback}"));
+        }
+    }
+
+    if let Some(feedback) = &context.latest_feedback {
+        lines.push(format!("New user feedback to apply: {feedback}"));
+    } else if context.request_alternative && !context.previous_suggestions.is_empty() {
+        lines.push(
+            "Generate a new alternative translation that is different in wording from previous suggestions."
+                .to_string(),
+        );
+    }
+
+    lines.join("\n")
 }
 
 pub async fn suggest_custom(
@@ -284,5 +354,38 @@ mod tests {
                 env::remove_var("OPENAI_API_KEY");
             }
         }
+    }
+
+    #[test]
+    fn build_prompt_includes_previous_suggestions_and_feedback() {
+        let prompt = build_translation_user_prompt(
+            "app.title",
+            "Title",
+            &SuggestTranslationContext {
+                reference_translations: vec![("nb".to_string(), "Tittel".to_string())],
+                previous_suggestions: vec!["Forslag A".to_string(), "Forslag B".to_string()],
+                feedback_history: vec!["Bruk enkel tone".to_string()],
+                latest_feedback: Some("Bruk ordet las".to_string()),
+                request_alternative: false,
+            },
+        );
+        assert!(prompt.contains("Reference translations in other languages:"));
+        assert!(prompt.contains("Previous AI suggestions for this language:"));
+        assert!(prompt.contains("Previously provided user feedback:"));
+        assert!(prompt.contains("New user feedback to apply: Bruk ordet las"));
+    }
+
+    #[test]
+    fn build_prompt_requests_alternative_when_needed() {
+        let prompt = build_translation_user_prompt(
+            "app.title",
+            "Title",
+            &SuggestTranslationContext {
+                previous_suggestions: vec!["Forslag A".to_string()],
+                request_alternative: true,
+                ..SuggestTranslationContext::default()
+            },
+        );
+        assert!(prompt.contains("Generate a new alternative translation"));
     }
 }
