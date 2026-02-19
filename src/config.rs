@@ -476,7 +476,11 @@ mod tests {
         let path = dir.path().join(".trans.config.json");
         config.save_to_path(&path).expect("save");
         let payload = fs::read_to_string(path).expect("read");
-        assert!(payload.trim_start().starts_with("{\n  \"mode\": \"react-intl\""));
+        assert!(
+            payload
+                .trim_start()
+                .starts_with("{\n  \"mode\": \"react-intl\"")
+        );
     }
 
     #[test]
