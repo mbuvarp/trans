@@ -150,6 +150,7 @@ mod tests {
 
     fn config() -> TransConfig {
         TransConfig {
+            mode: crate::config::ConfigMode::ReactIntl,
             language_files_path: "messages".into(),
             available_languages: vec!["en".to_string(), "nb".to_string()],
             required_languages: vec!["en".to_string()],

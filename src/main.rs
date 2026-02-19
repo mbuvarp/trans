@@ -496,6 +496,7 @@ fn maybe_prompt_update(receiver: Option<std::sync::mpsc::Receiver<UpdateInfo>>) 
 
 fn map_config_key(key: ConfigKey) -> ConfigField {
     match key {
+        ConfigKey::Mode => ConfigField::Mode,
         ConfigKey::LanguageFilesPath => ConfigField::LanguageFilesPath,
         ConfigKey::AvailableLanguages => ConfigField::AvailableLanguages,
         ConfigKey::RequiredLanguages => ConfigField::RequiredLanguages,

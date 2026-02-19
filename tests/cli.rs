@@ -10,6 +10,7 @@ use trans::translations::{Translations, load_language_translations, save_languag
 
 fn base_config() -> TransConfig {
     TransConfig {
+        mode: trans::config::ConfigMode::ReactIntl,
         language_files_path: PathBuf::from("messages"),
         available_languages: vec!["en".to_string(), "nb".to_string()],
         required_languages: vec!["en".to_string()],
