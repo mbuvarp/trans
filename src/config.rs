@@ -37,6 +37,10 @@ fn default_export_format() -> ExportFormat {
     ExportFormat::Excel
 }
 
+fn default_mode() -> ConfigMode {
+    ConfigMode::ReactIntl
+}
+
 fn default_excel_password() -> String {
     "unlock".to_string()
 }
@@ -55,6 +59,20 @@ pub enum ConfigFormat {
 pub enum ExportFormat {
     Csv,
     Excel,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigMode {
+    ReactIntl,
+}
+
+impl ConfigMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConfigMode::ReactIntl => "react-intl",
+        }
+    }
 }
 
 impl ExportFormat {
@@ -96,6 +114,8 @@ impl ConfigFormat {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransConfig {
+    #[serde(default = "default_mode")]
+    pub mode: ConfigMode,
     pub language_files_path: PathBuf,
     pub available_languages: Vec<String>,
     pub required_languages: Vec<String>,
@@ -304,6 +324,7 @@ pub fn format_config_list(config: &TransConfig, config_path: Option<&Path>) -> V
             &path.display().to_string(),
         ));
     }
+    lines.push(format_label_value("mode", config.mode.as_str()));
     lines.push(format_label_value(
         "languageFilesPath",
         &config.language_files_path.display().to_string(),
@@ -350,6 +371,7 @@ pub fn format_config_list(config: &TransConfig, config_path: Option<&Path>) -> V
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigField {
+    Mode,
     LanguageFilesPath,
     AvailableLanguages,
     RequiredLanguages,
@@ -417,6 +439,7 @@ mod tests {
 
     fn base_config() -> TransConfig {
         TransConfig {
+            mode: ConfigMode::ReactIntl,
             language_files_path: PathBuf::from("translations"),
             available_languages: vec!["en".to_string(), "nb".to_string()],
             required_languages: vec!["en".to_string()],
@@ -439,10 +462,21 @@ mod tests {
         }
         "#;
         let config: TransConfig = serde_json::from_str(json).expect("valid json");
+        assert_eq!(config.mode, ConfigMode::ReactIntl);
         assert_eq!(config.default_untranslated_value, "");
         assert_eq!(config.default_export_format, ExportFormat::Excel);
         assert_eq!(config.excel_password, "unlock");
         assert!(config.ai.is_none());
+    }
+
+    #[test]
+    fn save_to_path_places_mode_first_in_json() {
+        let dir = tempdir().expect("tempdir");
+        let config = base_config();
+        let path = dir.path().join(".trans.config.json");
+        config.save_to_path(&path).expect("save");
+        let payload = fs::read_to_string(path).expect("read");
+        assert!(payload.trim_start().starts_with("{\n  \"mode\": \"react-intl\""));
     }
 
     #[test]

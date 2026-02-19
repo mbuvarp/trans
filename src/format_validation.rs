@@ -232,6 +232,7 @@ mod tests {
 
     fn base_config() -> TransConfig {
         TransConfig {
+            mode: crate::config::ConfigMode::ReactIntl,
             language_files_path: std::path::PathBuf::from("lang"),
             available_languages: vec!["en".to_string(), "nb".to_string()],
             required_languages: vec!["en".to_string()],

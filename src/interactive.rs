@@ -7,7 +7,7 @@ use dialoguer::{Completion, Confirm, FuzzySelect, Input, Select};
 use crate::ai::{
     AiSettings, SuggestTranslationContext, resolve_ai_settings, suggest_translation_with_context,
 };
-use crate::config::{AiConfig, ConfigField, ExportFormat, TransConfig};
+use crate::config::{AiConfig, ConfigField, ConfigMode, ExportFormat, TransConfig};
 use crate::error::Result;
 use crate::language::is_valid_language_code;
 use crate::message_id::validate_message_id;
@@ -105,6 +105,7 @@ pub fn init_config_interactive(
             return Ok(());
         }
     }
+    let mode = prompt_mode(ConfigMode::ReactIntl)?;
     let language_files_path = prompt_language_files_path(root)?;
 
     let default_languages = discover_languages(root, &language_files_path)?;
@@ -174,6 +175,7 @@ pub fn init_config_interactive(
     };
 
     let config = TransConfig {
+        mode,
         language_files_path: language_files_path.into(),
         available_languages,
         required_languages,
@@ -194,6 +196,7 @@ pub fn configure_root_interactive(root: impl AsRef<Path>) -> Result<()> {
     let root = root.as_ref();
     let mut config = TransConfig::load_from_root(root)?;
 
+    let mode = prompt_mode(config.mode)?;
     let language_files_path = prompt_language_files_path_with_default(
         root,
         &config.language_files_path.to_string_lossy(),
@@ -263,6 +266,7 @@ pub fn configure_root_interactive(root: impl AsRef<Path>) -> Result<()> {
 
     let default_export_format = prompt_default_export_format(config.default_export_format)?;
 
+    config.mode = mode;
     config.language_files_path = language_files_path.into();
     config.available_languages = available_languages;
     config.required_languages = required_languages;
@@ -427,6 +431,7 @@ pub fn configure_edit_interactive(
 
     match field {
         None => {
+            let mode = prompt_mode(config.mode)?;
             let language_files_path = prompt_language_files_path_with_default(
                 root,
                 &config.language_files_path.to_string_lossy(),
@@ -519,6 +524,7 @@ pub fn configure_edit_interactive(
                 None
             };
 
+            config.mode = mode;
             config.language_files_path = language_files_path.into();
             config.available_languages = available_languages;
             config.required_languages = required_languages;
@@ -539,6 +545,9 @@ pub fn configure_edit_interactive(
             }
             config.save_to_root(root)?;
             return Ok(());
+        }
+        Some(ConfigField::Mode) => {
+            config.mode = prompt_mode(config.mode)?;
         }
         Some(ConfigField::LanguageFilesPath) => {
             let language_files_path = prompt_language_files_path_with_default(
@@ -910,6 +919,24 @@ fn prompt_default_export_format(current: ExportFormat) -> Result<ExportFormat> {
     Ok(match selection {
         0 => ExportFormat::Excel,
         _ => ExportFormat::Csv,
+    })
+}
+
+fn prompt_mode(current: ConfigMode) -> Result<ConfigMode> {
+    print_label("Mode");
+    let choices = [ConfigMode::ReactIntl.as_str()];
+    let default_index = match current {
+        ConfigMode::ReactIntl => 0,
+    };
+    let selection = Select::new()
+        .with_prompt(">")
+        .items(&choices)
+        .default(default_index)
+        .interact()?;
+    print_spacer();
+    Ok(match selection {
+        0 => ConfigMode::ReactIntl,
+        _ => ConfigMode::ReactIntl,
     })
 }
 
