@@ -128,8 +128,8 @@ pub enum Command {
         new_id: String,
     },
     #[command(
-        about = "Migrate language files between react-intl and next-intl modes",
-        long_about = "Migrate language files between react-intl and next-intl modes.\n\nBy default files are converted in place under languageFilesPath.\nUse -o/--out-dir to write converted files to another directory.\nWhen -o is used, languageFilesPath is updated unless --no-update-language-files-path is provided.\nUse -b/--backup to copy languageFilesPath to a sibling directory named <languageFilesPath>__backup before migration.\nUse -c/--check to only validate migration compatibility (no writes to files or config)."
+        about = "Convert translation files between react-intl and next-intl and update config mode",
+        long_about = "Convert translation files between react-intl and next-intl formats and update config mode when migration succeeds.\n\nBy default files are converted in place under languageFilesPath.\nUse -o/--out-dir to write converted files to another directory.\nWhen -o is used, languageFilesPath is updated unless --no-update-language-files-path is provided.\nUse -b/--backup to copy languageFilesPath to a sibling directory named <languageFilesPath>__backup before migration; migration fails if that backup directory already exists.\nUse -c/--check to only validate migration compatibility (no writes to files or config). In check mode, --backup is ignored and --out-dir is not created or validated."
     )]
     Migrate {
         #[arg(
