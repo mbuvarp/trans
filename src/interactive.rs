@@ -167,6 +167,10 @@ pub fn init_config_interactive(
 
     let default_export_format = prompt_default_export_format(ExportFormat::Excel)?;
 
+    print_label("Run update check after successful commands");
+    let run_update_check = Confirm::new().with_prompt(">").default(false).interact()?;
+    print_spacer();
+
     print_label("Do you want to set up AI?");
     let setup_ai = Confirm::new().with_prompt(">").default(true).interact()?;
     print_spacer();
@@ -186,6 +190,7 @@ pub fn init_config_interactive(
         default_untranslated_value,
         default_export_format,
         excel_password: "unlock".to_string(),
+        run_update_check,
         ai,
     };
 
@@ -270,6 +275,13 @@ pub fn configure_root_interactive(root: impl AsRef<Path>) -> Result<()> {
 
     let default_export_format = prompt_default_export_format(config.default_export_format)?;
 
+    print_label("Run update check after successful commands");
+    let run_update_check = Confirm::new()
+        .with_prompt(">")
+        .default(config.run_update_check)
+        .interact()?;
+    print_spacer();
+
     config.mode = mode;
     config.language_files_path = language_files_path.into();
     config.available_languages = available_languages;
@@ -277,6 +289,7 @@ pub fn configure_root_interactive(root: impl AsRef<Path>) -> Result<()> {
     config.primary_language = primary_language;
     config.default_untranslated_value = default_untranslated_value;
     config.default_export_format = default_export_format;
+    config.run_update_check = run_update_check;
 
     config.validate()?;
     maybe_migrate_mode(root, &original_config, config.mode)?;
@@ -518,6 +531,13 @@ pub fn configure_edit_interactive(
 
             let default_export_format = prompt_default_export_format(config.default_export_format)?;
 
+            print_label("Run update check after successful commands");
+            let run_update_check = Confirm::new()
+                .with_prompt(">")
+                .default(config.run_update_check)
+                .interact()?;
+            print_spacer();
+
             print_label("Do you want to set up AI?");
             let setup_ai = Confirm::new()
                 .with_prompt(">")
@@ -538,6 +558,7 @@ pub fn configure_edit_interactive(
             config.primary_language = primary_language;
             config.default_untranslated_value = default_untranslated_value;
             config.default_export_format = default_export_format;
+            config.run_update_check = run_update_check;
             config.ai = ai;
 
             config.validate()?;
@@ -675,6 +696,15 @@ pub fn configure_edit_interactive(
                 .interact_text()?;
             print_spacer();
             config.excel_password = excel_password;
+        }
+        Some(ConfigField::RunUpdateCheck) => {
+            print_label("Run update check after successful commands");
+            let run_update_check = Confirm::new()
+                .with_prompt(">")
+                .default(config.run_update_check)
+                .interact()?;
+            print_spacer();
+            config.run_update_check = run_update_check;
         }
         Some(ConfigField::AiEnabled) => {
             let defaults = config.ai.clone().unwrap_or_default();

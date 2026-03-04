@@ -45,6 +45,10 @@ fn default_excel_password() -> String {
     "unlock".to_string()
 }
 
+fn default_run_update_check() -> bool {
+    false
+}
+
 const CONFIG_JSON_FILE_NAME: &str = ".trans.config.json";
 const CONFIG_YAML_FILE_NAME: &str = ".trans.config.yaml";
 
@@ -128,6 +132,8 @@ pub struct TransConfig {
     pub default_export_format: ExportFormat,
     #[serde(default = "default_excel_password")]
     pub excel_password: String,
+    #[serde(default = "default_run_update_check")]
+    pub run_update_check: bool,
     #[serde(default)]
     pub ai: Option<AiConfig>,
 }
@@ -355,6 +361,10 @@ pub fn format_config_list(config: &TransConfig, config_path: Option<&Path>) -> V
         "excelPassword",
         &format_value(&config.excel_password),
     ));
+    lines.push(format_label_value(
+        "runUpdateCheck",
+        &config.run_update_check.to_string(),
+    ));
 
     let ai = config.ai.clone().unwrap_or_default();
     lines.push(format_label_value("ai.enabled", &ai.enabled.to_string()));
@@ -381,6 +391,7 @@ pub enum ConfigField {
     DefaultUntranslatedValue,
     DefaultExportFormat,
     ExcelPassword,
+    RunUpdateCheck,
     AiEnabled,
     AiModel,
     AiApiKeyEnv,
@@ -449,6 +460,7 @@ mod tests {
             default_untranslated_value: "".to_string(),
             default_export_format: ExportFormat::Excel,
             excel_password: "unlock".to_string(),
+            run_update_check: false,
             ai: None,
         }
     }
@@ -468,6 +480,7 @@ mod tests {
         assert_eq!(config.default_untranslated_value, "");
         assert_eq!(config.default_export_format, ExportFormat::Excel);
         assert_eq!(config.excel_password, "unlock");
+        assert!(!config.run_update_check);
         assert!(config.ai.is_none());
     }
 

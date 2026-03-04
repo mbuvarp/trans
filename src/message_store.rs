@@ -655,6 +655,7 @@ mod tests {
             default_untranslated_value: String::new(),
             default_export_format: crate::config::ExportFormat::Excel,
             excel_password: "unlock".to_string(),
+            run_update_check: false,
             ai: None,
         };
 
@@ -725,6 +726,7 @@ mod tests {
             default_untranslated_value: String::new(),
             default_export_format: crate::config::ExportFormat::Excel,
             excel_password: "unlock".to_string(),
+            run_update_check: false,
             ai: None,
         };
 
@@ -754,6 +756,7 @@ mod tests {
             default_untranslated_value: String::new(),
             default_export_format: crate::config::ExportFormat::Excel,
             excel_password: "unlock".to_string(),
+            run_update_check: false,
             ai: None,
         };
 

@@ -44,7 +44,7 @@ fn run() -> Result<()> {
         println!("trans {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    let update_check = spawn_update_check(env!("CARGO_PKG_VERSION"));
+    let update_check = maybe_start_update_check(&cli)?;
     let result = match cli.command {
         None => {
             let root = env::current_dir()?;
@@ -577,12 +577,28 @@ fn map_config_key(key: ConfigKey) -> ConfigField {
         ConfigKey::DefaultUntranslatedValue => ConfigField::DefaultUntranslatedValue,
         ConfigKey::DefaultExportFormat => ConfigField::DefaultExportFormat,
         ConfigKey::ExcelPassword => ConfigField::ExcelPassword,
+        ConfigKey::RunUpdateCheck => ConfigField::RunUpdateCheck,
         ConfigKey::AiEnabled => ConfigField::AiEnabled,
         ConfigKey::AiModel => ConfigField::AiModel,
         ConfigKey::AiApiKeyEnv => ConfigField::AiApiKeyEnv,
         ConfigKey::AiMaxOutputTokens => ConfigField::AiMaxOutputTokens,
         ConfigKey::AiConcurrency => ConfigField::AiConcurrency,
     }
+}
+
+fn maybe_start_update_check(cli: &Cli) -> Result<Option<std::sync::mpsc::Receiver<UpdateInfo>>> {
+    if matches!(cli.command, Some(Command::Init { .. })) {
+        return Ok(None);
+    }
+    let root = env::current_dir()?;
+    let config = match TransConfig::load_from_root(&root) {
+        Ok(config) => config,
+        Err(_) => return Ok(None),
+    };
+    if !config.run_update_check {
+        return Ok(None);
+    }
+    Ok(spawn_update_check(env!("CARGO_PKG_VERSION")))
 }
 
 fn resolve_export_languages(config: &TransConfig, requested: &[String]) -> Result<Vec<String>> {

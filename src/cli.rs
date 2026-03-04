@@ -107,7 +107,7 @@ pub enum Command {
     },
     #[command(
         about = "Update config values interactively",
-        long_about = "Update config values interactively.\n\nRoot config options:\n- mode: translation library mode (react-intl or next-intl)\n- languageFilesPath: location of language files\n- availableLanguages: all known languages\n- requiredLanguages: languages required for input\n- primaryLanguage: first language in interactive mode\n- defaultUntranslatedValue: default for non-required languages\n- defaultExportFormat: csv or excel\n- excelPassword: password for Excel sheet protection\n\nUse `trans config ai` to edit AI settings:\n- enabled\n- model\n- apiKeyEnv\n- maxOutputTokens\n- concurrency\n\nUse `trans config show` to print current configuration values.\nUse `trans config edit [key]` to edit all values or a single key.\nUse `trans config --format json|yaml` to convert the config file format."
+        long_about = "Update config values interactively.\n\nRoot config options:\n- mode: translation library mode (react-intl or next-intl)\n- languageFilesPath: location of language files\n- availableLanguages: all known languages\n- requiredLanguages: languages required for input\n- primaryLanguage: first language in interactive mode\n- defaultUntranslatedValue: default for non-required languages\n- defaultExportFormat: csv or excel\n- excelPassword: password for Excel sheet protection\n- runUpdateCheck: enable brew update check prompt after successful commands\n\nUse `trans config ai` to edit AI settings:\n- enabled\n- model\n- apiKeyEnv\n- maxOutputTokens\n- concurrency\n\nUse `trans config show` to print current configuration values.\nUse `trans config edit [key]` to edit all values or a single key.\nUse `trans config --format json|yaml` to convert the config file format."
     )]
     Config {
         #[arg(
@@ -286,6 +286,8 @@ pub enum ConfigKey {
     DefaultExportFormat,
     #[value(name = "excelPassword")]
     ExcelPassword,
+    #[value(name = "runUpdateCheck")]
+    RunUpdateCheck,
     #[value(name = "ai.enabled")]
     AiEnabled,
     #[value(name = "ai.model")]

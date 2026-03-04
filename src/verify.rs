@@ -224,6 +224,7 @@ mod tests {
             default_untranslated_value: "".to_string(),
             default_export_format: crate::config::ExportFormat::Excel,
             excel_password: "unlock".to_string(),
+            run_update_check: false,
             ai: None,
         }
     }
