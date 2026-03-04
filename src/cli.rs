@@ -129,7 +129,7 @@ pub enum Command {
     },
     #[command(
         about = "Migrate language files between react-intl and next-intl modes",
-        long_about = "Migrate language files between react-intl and next-intl modes.\n\nBy default files are converted in place under languageFilesPath.\nUse -o/--out-dir to write converted files to another directory.\nWhen -o is used, languageFilesPath is updated unless --no-update-language-files-path is provided."
+        long_about = "Migrate language files between react-intl and next-intl modes.\n\nBy default files are converted in place under languageFilesPath.\nUse -o/--out-dir to write converted files to another directory.\nWhen -o is used, languageFilesPath is updated unless --no-update-language-files-path is provided.\nUse -b/--backup to copy languageFilesPath to a sibling directory named <languageFilesPath>__backup before migration.\nUse -c/--check to only validate migration compatibility (no writes to files or config)."
     )]
     Migrate {
         #[arg(
@@ -150,6 +150,18 @@ pub enum Command {
             help = "With --out-dir, keep existing languageFilesPath in config"
         )]
         no_update_language_files_path: bool,
+        #[arg(
+            short = 'b',
+            long = "backup",
+            help = "Create a backup directory at <languageFilesPath>__backup before migration"
+        )]
+        backup: bool,
+        #[arg(
+            short = 'c',
+            long = "check",
+            help = "Only validate migration compatibility; do not modify files or config"
+        )]
+        check: bool,
     },
     #[command(about = "Export translations to CSV or Excel")]
     Export {

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -26,7 +27,7 @@ use trans::operations::{
 };
 use trans::query::{get_translation, get_translations_all, list_required_languages};
 use trans::sync::{apply_sync_plan, collect_missing_ids, maybe_prompt_sync};
-use trans::translations::migrate_language_files_to_dir;
+use trans::translations::{migrate_language_files_to_dir, validate_language_file_migration};
 use trans::update_check::{UpdateInfo, spawn_update_check};
 use trans::verify::{collect_verification_issues, verify_language_files};
 use trans::verify_ai::verify_with_ai;
@@ -354,9 +355,18 @@ fn run() -> Result<()> {
             mode,
             out_dir,
             no_update_language_files_path,
+            backup,
+            check,
         }) => {
             let root = env::current_dir()?;
-            handle_migrate(&root, mode, out_dir, no_update_language_files_path)
+            handle_migrate(
+                &root,
+                mode,
+                out_dir,
+                no_update_language_files_path,
+                backup,
+                check,
+            )
         }
         Some(Command::Verify { ai }) => {
             let root = env::current_dir()?;
@@ -479,6 +489,8 @@ fn handle_migrate(
     target_mode: ConfigMode,
     out_dir: Option<String>,
     no_update_language_files_path: bool,
+    backup: bool,
+    check: bool,
 ) -> Result<()> {
     if no_update_language_files_path && out_dir.is_none() {
         return Err(TransError::InvalidInput(
@@ -488,11 +500,31 @@ fn handle_migrate(
 
     let mut config = TransConfig::load_from_root(root)?;
     if config.mode == target_mode {
+        if check {
+            println!(
+                "Check OK: config is already in '{}' mode.",
+                target_mode.as_str()
+            );
+        } else {
+            println!(
+                "Config is already in '{}' mode. Nothing to migrate.",
+                target_mode.as_str()
+            );
+        }
+        return Ok(());
+    }
+
+    if check {
+        validate_language_file_migration(root, &config, target_mode)?;
         println!(
-            "Config is already in '{}' mode. Nothing to migrate.",
+            "Check OK: translations are valid for migration to '{}'.",
             target_mode.as_str()
         );
         return Ok(());
+    }
+
+    if backup {
+        create_language_files_backup(root, &config)?;
     }
 
     let out_dir_abs = out_dir
@@ -669,4 +701,68 @@ fn normalize_config_path(root: &Path, out_dir: &Path) -> PathBuf {
         Ok(_) => PathBuf::from("."),
         Err(_) => out_abs,
     }
+}
+
+fn create_language_files_backup(root: &Path, config: &TransConfig) -> Result<()> {
+    let source_dir = root.join(&config.language_files_path);
+    let metadata = fs::metadata(&source_dir).map_err(|err| {
+        TransError::InvalidInput(format!(
+            "failed to read languageFilesPath '{}': {err}",
+            source_dir.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(TransError::InvalidInput(format!(
+            "languageFilesPath '{}' is not a directory",
+            source_dir.display()
+        )));
+    }
+
+    let backup_dir = backup_dir_path(&source_dir)?;
+    if backup_dir.exists() {
+        return Err(TransError::InvalidInput(format!(
+            "backup directory already exists: {}",
+            backup_dir.display()
+        )));
+    }
+
+    copy_dir_recursive(&source_dir, &backup_dir)?;
+    println!("Created backup at {}", backup_dir.display());
+    Ok(())
+}
+
+fn backup_dir_path(source_dir: &Path) -> Result<PathBuf> {
+    let parent = source_dir.parent().ok_or_else(|| {
+        TransError::InvalidInput(format!(
+            "failed to resolve backup path for '{}'",
+            source_dir.display()
+        ))
+    })?;
+    let name = source_dir
+        .file_name()
+        .ok_or_else(|| {
+            TransError::InvalidInput(format!(
+                "failed to resolve backup path for '{}'",
+                source_dir.display()
+            ))
+        })?
+        .to_string_lossy();
+    Ok(parent.join(format!("{name}__backup")))
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    let mut entries = fs::read_dir(source)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if file_type.is_file() {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }

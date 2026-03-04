@@ -115,6 +115,19 @@ pub fn migrate_mode(root: &Path, config: &TransConfig, target_mode: ConfigMode) 
     migrate_mode_to_dir(root, config, target_mode, None)
 }
 
+pub fn validate_migration(
+    root: &Path,
+    config: &TransConfig,
+    target_mode: ConfigMode,
+) -> Result<()> {
+    if config.mode == target_mode {
+        return Ok(());
+    }
+    let source_dir = root.join(&config.language_files_path);
+    let by_language = load_migration_translations(&source_dir, config)?;
+    validate_migration_compatibility(&by_language, target_mode)
+}
+
 pub fn migrate_mode_to_dir(
     root: &Path,
     config: &TransConfig,
@@ -126,9 +139,9 @@ pub fn migrate_mode_to_dir(
     }
 
     let mut snapshots: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    let mut by_language: BTreeMap<String, FlatTranslations> = BTreeMap::new();
 
     let source_dir = root.join(&config.language_files_path);
+    let by_language = load_migration_translations(&source_dir, config)?;
     let destination_dir = out_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| source_dir.clone());
@@ -145,20 +158,9 @@ pub fn migrate_mode_to_dir(
             }
         })?;
         snapshots.insert(language.clone(), bytes);
-
-        let translations = load_translations_for_mode(&path, config.mode)?;
-        by_language.insert(language.clone(), translations);
     }
 
-    if target_mode == ConfigMode::NextIntl {
-        let conflicts = detect_migration_conflicts(&by_language);
-        if !conflicts.is_empty() {
-            return Err(TransError::InvalidInput(format!(
-                "mode migration aborted due to key conflicts:\n{}",
-                conflicts.join("\n")
-            )));
-        }
-    }
+    validate_migration_compatibility(&by_language, target_mode)?;
 
     let mut created_outputs = Vec::new();
     for language in &config.available_languages {
@@ -177,6 +179,36 @@ pub fn migrate_mode_to_dir(
         created_outputs.push(path);
     }
 
+    Ok(())
+}
+
+fn load_migration_translations(
+    source_dir: &Path,
+    config: &TransConfig,
+) -> Result<BTreeMap<String, FlatTranslations>> {
+    let mut by_language: BTreeMap<String, FlatTranslations> = BTreeMap::new();
+    for language in &config.available_languages {
+        let path = source_dir.join(format!("{language}.json"));
+        let translations = load_translations_for_mode(&path, config.mode)?;
+        by_language.insert(language.clone(), translations);
+    }
+    Ok(by_language)
+}
+
+fn validate_migration_compatibility(
+    by_language: &BTreeMap<String, FlatTranslations>,
+    target_mode: ConfigMode,
+) -> Result<()> {
+    if target_mode != ConfigMode::NextIntl {
+        return Ok(());
+    }
+    let conflicts = detect_migration_conflicts(by_language);
+    if !conflicts.is_empty() {
+        return Err(TransError::InvalidInput(format!(
+            "mode migration aborted due to key conflicts:\n{}",
+            conflicts.join("\n")
+        )));
+    }
     Ok(())
 }
 
@@ -769,5 +801,66 @@ mod tests {
         let converted = fs::read_to_string(out_dir.join("en.json")).expect("read converted");
         assert!(converted.contains("\"app\""));
         assert!(converted.contains("\"header\""));
+    }
+
+    #[test]
+    fn validate_migration_succeeds_without_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("messages")).expect("mkdir");
+        fs::write(
+            root.join("messages/en.json"),
+            "{\n  \"app.header.title\": \"Title\"\n}\n",
+        )
+        .expect("write");
+
+        let config = TransConfig {
+            mode: ConfigMode::ReactIntl,
+            language_files_path: "messages".into(),
+            available_languages: vec!["en".to_string()],
+            required_languages: vec!["en".to_string()],
+            primary_language: "en".to_string(),
+            default_untranslated_value: String::new(),
+            default_export_format: crate::config::ExportFormat::Excel,
+            excel_password: "unlock".to_string(),
+            run_update_check: false,
+            ai: None,
+        };
+
+        let before = fs::read_to_string(root.join("messages/en.json")).expect("read before");
+        validate_migration(root, &config, ConfigMode::NextIntl).expect("validate");
+        let after = fs::read_to_string(root.join("messages/en.json")).expect("read after");
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn validate_migration_fails_on_conflicts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("messages")).expect("mkdir");
+        fs::write(
+            root.join("messages/en.json"),
+            "{\n  \"app\": \"A\",\n  \"app.header\": \"B\"\n}\n",
+        )
+        .expect("write");
+
+        let config = TransConfig {
+            mode: ConfigMode::ReactIntl,
+            language_files_path: "messages".into(),
+            available_languages: vec!["en".to_string()],
+            required_languages: vec!["en".to_string()],
+            primary_language: "en".to_string(),
+            default_untranslated_value: String::new(),
+            default_export_format: crate::config::ExportFormat::Excel,
+            excel_password: "unlock".to_string(),
+            run_update_check: false,
+            ai: None,
+        };
+
+        let err = validate_migration(root, &config, ConfigMode::NextIntl).expect_err("should fail");
+        assert!(
+            err.to_string()
+                .contains("mode migration aborted due to key conflicts")
+        );
     }
 }

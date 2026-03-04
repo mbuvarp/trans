@@ -524,3 +524,155 @@ fn migrate_out_dir_overwrites_existing_files() {
     assert!(converted.contains("\"app\""));
     assert!(!converted.contains("\"old\""));
 }
+
+#[test]
+fn migrate_check_valid_does_not_modify_files_or_config() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    let before = std::fs::read_to_string(dir.path().join("messages/en.json")).expect("read before");
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["migrate", "next-intl", "--check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Check OK"));
+
+    let after = std::fs::read_to_string(dir.path().join("messages/en.json")).expect("read after");
+    assert_eq!(before, after);
+    let config = TransConfig::load_from_root(dir.path()).expect("load config");
+    assert_eq!(config.mode, trans::config::ConfigMode::ReactIntl);
+}
+
+#[test]
+fn migrate_check_conflict_fails_without_modifying_config() {
+    let dir = tempdir().expect("tempdir");
+    let config = base_config();
+    config.save_to_root(dir.path()).expect("save config");
+    std::fs::create_dir_all(dir.path().join("messages")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("messages/en.json"),
+        "{\n  \"app\": \"A\",\n  \"app.header\": \"B\"\n}\n",
+    )
+    .expect("write en");
+    std::fs::write(
+        dir.path().join("messages/nb.json"),
+        "{\n  \"app\": \"A\",\n  \"app.header\": \"B\"\n}\n",
+    )
+    .expect("write nb");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["migrate", "next-intl", "--check"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "mode migration aborted due to key conflicts",
+        ));
+
+    let config_after = TransConfig::load_from_root(dir.path()).expect("load config");
+    assert_eq!(config_after.mode, trans::config::ConfigMode::ReactIntl);
+}
+
+#[test]
+fn migrate_check_with_out_dir_does_not_create_output_dir() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args([
+            "migrate",
+            "next-intl",
+            "--check",
+            "-o",
+            "converted/messages",
+        ])
+        .assert()
+        .success();
+
+    assert!(!dir.path().join("converted/messages").exists());
+}
+
+#[test]
+fn migrate_check_ignores_backup_flag() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["migrate", "next-intl", "--check", "--backup"])
+        .assert()
+        .success();
+
+    assert!(!dir.path().join("messages__backup").exists());
+}
+
+#[test]
+fn migrate_backup_in_place_creates_backup_then_migrates() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["migrate", "next-intl", "--backup"])
+        .assert()
+        .success();
+
+    let config = TransConfig::load_from_root(dir.path()).expect("load config");
+    assert_eq!(config.mode, trans::config::ConfigMode::NextIntl);
+
+    let backup = dir.path().join("messages__backup/en.json");
+    let backup_raw = std::fs::read_to_string(backup).expect("read backup");
+    assert!(backup_raw.contains("\"app.title\""));
+
+    let migrated_raw =
+        std::fs::read_to_string(dir.path().join("messages/en.json")).expect("read migrated");
+    assert!(migrated_raw.contains("\"app\""));
+    assert!(!migrated_raw.contains("\"app.title\""));
+}
+
+#[test]
+fn migrate_backup_fails_when_backup_exists() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+    std::fs::create_dir_all(dir.path().join("messages__backup")).expect("mkdir backup");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["migrate", "next-intl", "--backup"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("backup directory already exists"));
+
+    let config = TransConfig::load_from_root(dir.path()).expect("load config");
+    assert_eq!(config.mode, trans::config::ConfigMode::ReactIntl);
+}
+
+#[test]
+fn migrate_backup_with_out_dir_creates_backup_and_migrates_to_out_dir() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args([
+            "migrate",
+            "next-intl",
+            "--backup",
+            "-o",
+            "converted/messages",
+        ])
+        .assert()
+        .success();
+
+    assert!(dir.path().join("messages__backup/en.json").exists());
+    assert!(dir.path().join("converted/messages/en.json").exists());
+
+    let config = TransConfig::load_from_root(dir.path()).expect("load config");
+    assert_eq!(config.mode, trans::config::ConfigMode::NextIntl);
+    assert_eq!(
+        config.language_files_path,
+        PathBuf::from("converted/messages")
+    );
+}
