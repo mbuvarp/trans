@@ -16,7 +16,10 @@ use crate::operations::{
     update_translation,
 };
 use crate::spinner::start_spinner;
-use crate::translations::load_language_translations;
+use crate::translations::{
+    coerce_non_string_leaf_values, collect_non_string_leaf_values, load_language_translations,
+    migrate_language_files,
+};
 use crate::verify::verify_language_files;
 
 struct PathCompletion {
@@ -195,6 +198,7 @@ pub fn init_config_interactive(
 pub fn configure_root_interactive(root: impl AsRef<Path>) -> Result<()> {
     let root = root.as_ref();
     let mut config = TransConfig::load_from_root(root)?;
+    let original_config = config.clone();
 
     let mode = prompt_mode(config.mode)?;
     let language_files_path = prompt_language_files_path_with_default(
@@ -275,6 +279,7 @@ pub fn configure_root_interactive(root: impl AsRef<Path>) -> Result<()> {
     config.default_export_format = default_export_format;
 
     config.validate()?;
+    maybe_migrate_mode(root, &original_config, config.mode)?;
     config.save_to_root(root)?;
     Ok(())
 }
@@ -341,6 +346,7 @@ pub fn run_interactive(
 ) -> Result<()> {
     let root = root.as_ref();
     let config = TransConfig::load_from_root(root)?;
+    ensure_next_intl_strings(root, &config)?;
     if let Err(err) = verify_language_files(root, &config) {
         if crate::sync::maybe_prompt_sync(root, &config, &err)? {
             verify_language_files(root, &config)?;
@@ -428,6 +434,7 @@ pub fn configure_edit_interactive(
 ) -> Result<()> {
     let root = root.as_ref();
     let mut config = TransConfig::load_from_root(root)?;
+    let original_config = config.clone();
 
     match field {
         None => {
@@ -534,6 +541,7 @@ pub fn configure_edit_interactive(
             config.ai = ai;
 
             config.validate()?;
+            maybe_migrate_mode(root, &original_config, config.mode)?;
             if replace_default {
                 let replaced = replace_default_untranslated_value(
                     root,
@@ -733,6 +741,7 @@ pub fn configure_edit_interactive(
     }
 
     config.validate()?;
+    maybe_migrate_mode(root, &original_config, config.mode)?;
     config.save_to_root(root)?;
     Ok(())
 }
@@ -924,9 +933,13 @@ fn prompt_default_export_format(current: ExportFormat) -> Result<ExportFormat> {
 
 fn prompt_mode(current: ConfigMode) -> Result<ConfigMode> {
     print_label("Mode");
-    let choices = [ConfigMode::ReactIntl.as_str()];
+    let choices = [
+        ConfigMode::ReactIntl.as_str(),
+        ConfigMode::NextIntl.as_str(),
+    ];
     let default_index = match current {
         ConfigMode::ReactIntl => 0,
+        ConfigMode::NextIntl => 1,
     };
     let selection = Select::new()
         .with_prompt(">")
@@ -936,7 +949,7 @@ fn prompt_mode(current: ConfigMode) -> Result<ConfigMode> {
     print_spacer();
     Ok(match selection {
         0 => ConfigMode::ReactIntl,
-        _ => ConfigMode::ReactIntl,
+        _ => ConfigMode::NextIntl,
     })
 }
 
@@ -1317,6 +1330,63 @@ fn parse_ai_command(input: &str) -> Option<Option<String>> {
     } else {
         Some(Some(feedback.to_string()))
     }
+}
+
+pub fn ensure_next_intl_strings(root: &Path, config: &TransConfig) -> Result<()> {
+    if config.mode != ConfigMode::NextIntl {
+        return Ok(());
+    }
+
+    let non_string = collect_non_string_leaf_values(root, config)?;
+    if non_string.is_empty() {
+        return Ok(());
+    }
+
+    print_label("Non-string values found in next-intl files");
+    println!("{}", non_string.format_for_display());
+    let coerce = Confirm::new()
+        .with_prompt("Coerce these values to strings now?")
+        .default(true)
+        .interact()?;
+    print_spacer();
+    if !coerce {
+        return Err(crate::error::TransError::NextIntlNonStringValues(
+            non_string.format_for_display(),
+        ));
+    }
+    let changed = coerce_non_string_leaf_values(root, config)?;
+    println!("Coerced non-string values in {changed} file(s).");
+    print_spacer();
+    Ok(())
+}
+
+fn maybe_migrate_mode(root: &Path, original: &TransConfig, target_mode: ConfigMode) -> Result<()> {
+    if original.mode == target_mode {
+        return Ok(());
+    }
+
+    print_label(&format!(
+        "Mode changed from {} to {}.",
+        original.mode.as_str(),
+        target_mode.as_str()
+    ));
+    let migrate = Confirm::new()
+        .with_prompt("Migrate language files now?")
+        .default(true)
+        .interact()?;
+    print_spacer();
+    if !migrate {
+        return Ok(());
+    }
+
+    if original.mode == ConfigMode::NextIntl {
+        ensure_next_intl_strings(root, original)?;
+    }
+
+    migrate_language_files(root, original, target_mode)?;
+    println!("Migrated language files to {} mode.", target_mode.as_str());
+    print_spacer();
+    Ok(())
 }
 
 fn print_label(text: &str) {

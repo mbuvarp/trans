@@ -9,6 +9,7 @@ pub mod import;
 pub mod interactive;
 pub mod language;
 pub mod message_id;
+pub mod message_store;
 pub mod operations;
 pub mod query;
 pub mod spinner;

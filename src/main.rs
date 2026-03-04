@@ -17,7 +17,7 @@ use trans::error::{Result, TransError};
 use trans::export::{export_csv, export_csv_with_options, export_excel, export_excel_with_options};
 use trans::interactive::{
     configure_ai_interactive, configure_edit_interactive, configure_root_interactive,
-    init_config_interactive, run_interactive,
+    ensure_next_intl_strings, init_config_interactive, run_interactive,
 };
 use trans::operations::{
     add_language, add_translation, change_message_id, delete_language, delete_translation,
@@ -204,6 +204,7 @@ fn run() -> Result<()> {
                 ));
             }
             if all {
+                ensure_next_intl_strings(&root, &config)?;
                 let ai_settings = trans::ai::resolve_ai_settings(&root, &config)?;
                 let values = trans::interactive::prompt_translations_for_languages(
                     &root,
@@ -240,6 +241,7 @@ fn run() -> Result<()> {
                 ));
             }
             if all {
+                ensure_next_intl_strings(&root, &config)?;
                 let ai_settings = trans::ai::resolve_ai_settings(&root, &config)?;
                 let values = trans::interactive::prompt_translations_for_languages(
                     &root,

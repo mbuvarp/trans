@@ -65,12 +65,14 @@ pub enum ExportFormat {
 #[serde(rename_all = "kebab-case")]
 pub enum ConfigMode {
     ReactIntl,
+    NextIntl,
 }
 
 impl ConfigMode {
     pub fn as_str(self) -> &'static str {
         match self {
             ConfigMode::ReactIntl => "react-intl",
+            ConfigMode::NextIntl => "next-intl",
         }
     }
 }

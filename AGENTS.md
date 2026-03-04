@@ -56,6 +56,7 @@ For commit messages, use the convetional commits format detailed here: https://g
 Use `sam` for all new work in this repo.
 
 - Check current project context via `.sam.config.json`, then run `sam list task` before starting new work.
+- Use `sam --help` to explore available commands and options.
 - Create a task for each new unit of work: `sam create task --title "<title>" --prio <LO|MD|HI|UR> [--description "..."] [--depends "..."] [--epic <epic_id>]`.
 - Move a task to `PROG` before doing code changes: `sam update task <task_id> --status PROG`.
 - If reserving files, only do so in `PROG` and clear them on status change: `sam update task <task_id> --reserve-files "path1,path2"`.

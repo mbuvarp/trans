@@ -9,9 +9,9 @@ use crate::operations::TranslationValues;
 
 #[derive(Parser, Debug)]
 #[command(name = "trans", version, disable_version_flag = true)]
-#[command(about = "Translation utility for react-intl JSON files")]
+#[command(about = "Translation utility for translation JSON files")]
 #[command(
-    long_about = "Translation utility for react-intl JSON files.\n\nRun without a subcommand to enter interactive mode, or pass a MESSAGE_ID to use the interactive add/edit flow for that id."
+    long_about = "Translation utility for translation JSON files (react-intl or next-intl).\n\nRun without a subcommand to enter interactive mode, or pass a MESSAGE_ID to use the interactive add/edit flow for that id."
 )]
 pub struct Cli {
     #[arg(
@@ -107,7 +107,7 @@ pub enum Command {
     },
     #[command(
         about = "Update config values interactively",
-        long_about = "Update config values interactively.\n\nRoot config options:\n- mode: translation library mode (currently react-intl)\n- languageFilesPath: location of language files\n- availableLanguages: all known languages\n- requiredLanguages: languages required for input\n- primaryLanguage: first language in interactive mode\n- defaultUntranslatedValue: default for non-required languages\n- defaultExportFormat: csv or excel\n- excelPassword: password for Excel sheet protection\n\nUse `trans config ai` to edit AI settings:\n- enabled\n- model\n- apiKeyEnv\n- maxOutputTokens\n- concurrency\n\nUse `trans config show` to print current configuration values.\nUse `trans config edit [key]` to edit all values or a single key.\nUse `trans config --format json|yaml` to convert the config file format."
+        long_about = "Update config values interactively.\n\nRoot config options:\n- mode: translation library mode (react-intl or next-intl)\n- languageFilesPath: location of language files\n- availableLanguages: all known languages\n- requiredLanguages: languages required for input\n- primaryLanguage: first language in interactive mode\n- defaultUntranslatedValue: default for non-required languages\n- defaultExportFormat: csv or excel\n- excelPassword: password for Excel sheet protection\n\nUse `trans config ai` to edit AI settings:\n- enabled\n- model\n- apiKeyEnv\n- maxOutputTokens\n- concurrency\n\nUse `trans config show` to print current configuration values.\nUse `trans config edit [key]` to edit all values or a single key.\nUse `trans config --format json|yaml` to convert the config file format."
     )]
     Config {
         #[arg(

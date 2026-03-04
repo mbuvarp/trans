@@ -16,6 +16,8 @@ pub enum TransError {
     MissingLanguageFile(PathBuf),
     #[error("verification failed: {0}")]
     VerificationFailed(String),
+    #[error("next-intl non-string values: {0}")]
+    NextIntlNonStringValues(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

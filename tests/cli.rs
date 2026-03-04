@@ -51,6 +51,26 @@ fn setup_project(root: &std::path::Path) -> TransConfig {
     config
 }
 
+fn setup_next_intl_project(root: &std::path::Path) -> TransConfig {
+    let mut config = base_config();
+    config.mode = trans::config::ConfigMode::NextIntl;
+    config.save_to_root(root).expect("save config");
+
+    std::fs::create_dir_all(root.join("messages")).expect("mkdir");
+    std::fs::write(
+        root.join("messages/en.json"),
+        "{\n  \"app\": {\n    \"title\": \"Title\"\n  }\n}\n",
+    )
+    .expect("write en");
+    std::fs::write(
+        root.join("messages/nb.json"),
+        "{\n  \"app\": {\n    \"title\": \"Tittel\"\n  }\n}\n",
+    )
+    .expect("write nb");
+
+    config
+}
+
 fn setup_project_with_ai(root: &std::path::Path) -> TransConfig {
     let mut config = base_config();
     config.ai = Some(AiConfig {
@@ -263,4 +283,109 @@ fn export_missing_only_filters_rows() {
     assert_eq!(rows[0], "id,en,nb");
     assert_eq!(rows.len(), 2);
     assert!(rows[1].starts_with("app.missing,"));
+}
+
+#[test]
+fn next_intl_add_update_show_delete_flow() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_next_intl_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["add", "--id", "app.new", "--values", "en:Hello"])
+        .assert()
+        .success();
+
+    let en = load_language_translations(dir.path(), &config, "en").expect("load en");
+    let nb = load_language_translations(dir.path(), &config, "nb").expect("load nb");
+    assert_eq!(en.get("app.new").map(String::as_str), Some("Hello"));
+    assert_eq!(nb.get("app.new").map(String::as_str), Some(""));
+    let en_file = std::fs::read_to_string(dir.path().join("messages/en.json")).expect("read en");
+    assert!(en_file.contains("\"app\""));
+    assert!(en_file.contains("\"new\""));
+    assert!(!en_file.contains("\"app.new\""));
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["update", "--id", "app.new", "--values", "en:Updated"])
+        .assert()
+        .success();
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["show", "--id", "app.new", "--lang", "en"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Updated"));
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["delete", "--id", "app.new"])
+        .assert()
+        .success();
+
+    let en_after = load_language_translations(dir.path(), &config, "en").expect("load en");
+    assert!(!en_after.contains_key("app.new"));
+}
+
+#[test]
+fn next_intl_verify_reports_nested_line_numbers() {
+    let dir = tempdir().expect("tempdir");
+    let mut config = setup_next_intl_project(dir.path());
+    config.available_languages = vec!["en".to_string(), "nb".to_string()];
+    config.save_to_root(dir.path()).expect("save config");
+
+    std::fs::write(
+        dir.path().join("messages/nb.json"),
+        "{\n  \"app\": {\n    \"other\": \"Annet\"\n  }\n}\n",
+    )
+    .expect("write nb");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("verify")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("messages/en.json:3"));
+}
+
+#[test]
+fn next_intl_import_updates_nested_files() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_next_intl_project(dir.path());
+
+    let csv = "id,en,nb\napp.title,Title,Oppdatert\n";
+    std::fs::write(dir.path().join("import.csv"), csv).expect("write csv");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["import", "import.csv"])
+        .assert()
+        .success();
+
+    let nb = load_language_translations(dir.path(), &config, "nb").expect("load nb");
+    assert_eq!(nb.get("app.title").map(String::as_str), Some("Oppdatert"));
+    let raw = std::fs::read_to_string(dir.path().join("messages/nb.json")).expect("read nb");
+    assert!(raw.contains("\"app\""));
+    assert!(raw.contains("\"title\""));
+}
+
+#[test]
+fn next_intl_non_string_values_fail_in_non_interactive_commands() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_next_intl_project(dir.path());
+    std::fs::write(
+        dir.path().join("messages/nb.json"),
+        "{\n  \"app\": {\n    \"title\": 1\n  }\n}\n",
+    )
+    .expect("write nb");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["show", "--id", "app.title", "--lang", "nb"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("next-intl non-string values"));
+
+    let _ = config;
 }

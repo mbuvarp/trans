@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use crate::config::TransConfig;
 use crate::error::{Result, TransError};
 use crate::format_validation::collect_format_validation_issues;
+use crate::message_store;
 use crate::translations::{
-    Translations, language_file_path, load_language_translations, load_translations,
-    save_language_translations,
+    Translations, language_file_path, load_language_translations, save_language_translations,
 };
 
 pub type TranslationSnapshot = BTreeMap<String, Translations>;
@@ -57,7 +57,7 @@ pub fn collect_verification_issues(
 
     for language in &config.available_languages {
         let path = language_file_path(root, config, language);
-        match load_translations(&path) {
+        match load_language_translations(root, config, language) {
             Ok(translations) => {
                 translations_by_language.insert(language.clone(), translations);
             }
@@ -73,6 +73,13 @@ pub fn collect_verification_issues(
                     path,
                     line: 1,
                     message: format!("invalid JSON: {err}"),
+                });
+            }
+            Err(TransError::NextIntlNonStringValues(err)) => {
+                issues.push(VerificationIssue {
+                    path,
+                    line: 1,
+                    message: err,
                 });
             }
             Err(err) => return Err(err),
@@ -95,7 +102,8 @@ pub fn collect_verification_issues(
         let keys: BTreeSet<String> = translations.keys().cloned().collect();
         for key in primary_keys.difference(&keys) {
             let base_path = language_file_path(root, config, &config.primary_language);
-            let line = find_key_line_number(&base_path, key).unwrap_or(1);
+            let line =
+                message_store::find_key_line_number(&base_path, key, config.mode).unwrap_or(1);
             issues.push(VerificationIssue {
                 path: base_path,
                 line,
@@ -107,7 +115,7 @@ pub fn collect_verification_issues(
         }
         for key in keys.difference(&primary_keys) {
             let path = language_file_path(root, config, language);
-            let line = find_key_line_number(&path, key).unwrap_or(1);
+            let line = message_store::find_key_line_number(&path, key, config.mode).unwrap_or(1);
             issues.push(VerificationIssue {
                 path,
                 line,
@@ -119,7 +127,7 @@ pub fn collect_verification_issues(
     let format_issues = collect_format_validation_issues(config, &translations_by_language)?;
     for issue in format_issues {
         let path = language_file_path(root, config, &issue.language);
-        let line = find_key_line_number(&path, &issue.id).unwrap_or(1);
+        let line = message_store::find_key_line_number(&path, &issue.id, config.mode).unwrap_or(1);
         issues.push(VerificationIssue {
             path,
             line,
@@ -195,26 +203,6 @@ fn format_key_list(keys: &BTreeSet<String>) -> String {
     } else {
         preview.join(", ")
     }
-}
-
-fn find_key_line_number(path: &Path, key: &str) -> Option<usize> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    for (index, line) in contents.lines().enumerate() {
-        let trimmed = line.trim_start();
-        let Some(rest) = trimmed.strip_prefix('"') else {
-            continue;
-        };
-        let Some(rest) = rest.strip_prefix(key) else {
-            continue;
-        };
-        let Some(rest) = rest.strip_prefix('"') else {
-            continue;
-        };
-        if rest.trim_start().starts_with(':') {
-            return Some(index + 1);
-        }
-    }
-    None
 }
 
 #[cfg(test)]

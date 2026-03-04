@@ -1,12 +1,13 @@
-use std::collections::BTreeMap;
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::config::TransConfig;
-use crate::error::{Result, TransError};
+use crate::error::Result;
+use crate::message_store::{
+    FlatTranslations, NonStringValues, coerce_non_string_values, collect_non_string_values,
+    load_translations_for_mode, migrate_mode, save_translations_for_mode,
+};
 
-pub type Translations = BTreeMap<String, String>;
+pub type Translations = FlatTranslations;
 
 pub fn language_file_path(root: impl AsRef<Path>, config: &TransConfig, language: &str) -> PathBuf {
     root.as_ref()
@@ -14,28 +15,16 @@ pub fn language_file_path(root: impl AsRef<Path>, config: &TransConfig, language
         .join(format!("{language}.json"))
 }
 
-pub fn load_translations(path: impl AsRef<Path>) -> Result<Translations> {
-    let path = path.as_ref();
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Err(TransError::MissingLanguageFile(path.to_path_buf()));
-        }
-        Err(err) => return Err(err.into()),
-    };
-
-    let translations: Translations = serde_json::from_str(&contents)?;
-    Ok(translations)
+pub fn load_translations(path: impl AsRef<Path>, config: &TransConfig) -> Result<Translations> {
+    load_translations_for_mode(path, config.mode)
 }
 
-pub fn save_translations(path: impl AsRef<Path>, translations: &Translations) -> Result<()> {
-    let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let payload = serde_json::to_string_pretty(translations)?;
-    fs::write(path, payload)?;
-    Ok(())
+pub fn save_translations(
+    path: impl AsRef<Path>,
+    config: &TransConfig,
+    translations: &Translations,
+) -> Result<()> {
+    save_translations_for_mode(path, config.mode, translations)
 }
 
 pub fn load_language_translations(
@@ -43,7 +32,7 @@ pub fn load_language_translations(
     config: &TransConfig,
     language: &str,
 ) -> Result<Translations> {
-    load_translations(language_file_path(root, config, language))
+    load_translations(language_file_path(root, config, language), config)
 }
 
 pub fn save_language_translations(
@@ -52,5 +41,31 @@ pub fn save_language_translations(
     language: &str,
     translations: &Translations,
 ) -> Result<()> {
-    save_translations(language_file_path(root, config, language), translations)
+    save_translations(
+        language_file_path(root, config, language),
+        config,
+        translations,
+    )
+}
+
+pub fn migrate_language_files(
+    root: impl AsRef<Path>,
+    config: &TransConfig,
+    target_mode: crate::config::ConfigMode,
+) -> Result<()> {
+    migrate_mode(root.as_ref(), config, target_mode)
+}
+
+pub fn collect_non_string_leaf_values(
+    root: impl AsRef<Path>,
+    config: &TransConfig,
+) -> Result<NonStringValues> {
+    collect_non_string_values(root.as_ref(), config)
+}
+
+pub fn coerce_non_string_leaf_values(
+    root: impl AsRef<Path>,
+    config: &TransConfig,
+) -> Result<usize> {
+    coerce_non_string_values(root.as_ref(), config)
 }
