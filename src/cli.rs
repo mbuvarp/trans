@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::config::ExportFormat;
+use crate::config::{ConfigMode, ExportFormat};
 use crate::error::{Result, TransError};
 use crate::import::ExtraLangsStrategy;
 use crate::operations::TranslationValues;
@@ -126,6 +126,30 @@ pub enum Command {
         old_id: String,
         #[arg(value_name = "NEW_ID", help = "New message id to replace it with")]
         new_id: String,
+    },
+    #[command(
+        about = "Migrate language files between react-intl and next-intl modes",
+        long_about = "Migrate language files between react-intl and next-intl modes.\n\nBy default files are converted in place under languageFilesPath.\nUse -o/--out-dir to write converted files to another directory.\nWhen -o is used, languageFilesPath is updated unless --no-update-language-files-path is provided."
+    )]
+    Migrate {
+        #[arg(
+            value_enum,
+            value_name = "MODE",
+            help = "Target mode: react-intl or next-intl"
+        )]
+        mode: ConfigMode,
+        #[arg(
+            short = 'o',
+            long = "out-dir",
+            value_name = "DIR",
+            help = "Output directory for converted files (created if missing)"
+        )]
+        out_dir: Option<String>,
+        #[arg(
+            long = "no-update-language-files-path",
+            help = "With --out-dir, keep existing languageFilesPath in config"
+        )]
+        no_update_language_files_path: bool,
     },
     #[command(about = "Export translations to CSV or Excel")]
     Export {

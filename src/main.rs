@@ -11,7 +11,8 @@ use trans::cli::{
     Cli, Command, ConfigFormat, ConfigKey, ConfigSection, parse_lang_list, parse_values,
 };
 use trans::config::{
-    ConfigField, ConfigFormat as ConfigFileFormat, ExportFormat, TransConfig, format_config_list,
+    ConfigField, ConfigFormat as ConfigFileFormat, ConfigMode, ExportFormat, TransConfig,
+    format_config_list,
 };
 use trans::error::{Result, TransError};
 use trans::export::{export_csv, export_csv_with_options, export_excel, export_excel_with_options};
@@ -25,6 +26,7 @@ use trans::operations::{
 };
 use trans::query::{get_translation, get_translations_all, list_required_languages};
 use trans::sync::{apply_sync_plan, collect_missing_ids, maybe_prompt_sync};
+use trans::translations::migrate_language_files_to_dir;
 use trans::update_check::{UpdateInfo, spawn_update_check};
 use trans::verify::{collect_verification_issues, verify_language_files};
 use trans::verify_ai::verify_with_ai;
@@ -348,6 +350,14 @@ fn run() -> Result<()> {
                 Ok(()) => Ok(()),
             }
         }
+        Some(Command::Migrate {
+            mode,
+            out_dir,
+            no_update_language_files_path,
+        }) => {
+            let root = env::current_dir()?;
+            handle_migrate(&root, mode, out_dir, no_update_language_files_path)
+        }
         Some(Command::Verify { ai }) => {
             let root = env::current_dir()?;
             let config = TransConfig::load_from_root(&root)?;
@@ -464,6 +474,67 @@ fn handle_sync(root: &Path, config: &TransConfig) -> Result<()> {
     Ok(())
 }
 
+fn handle_migrate(
+    root: &Path,
+    target_mode: ConfigMode,
+    out_dir: Option<String>,
+    no_update_language_files_path: bool,
+) -> Result<()> {
+    if no_update_language_files_path && out_dir.is_none() {
+        return Err(TransError::InvalidInput(
+            "--no-update-language-files-path requires --out-dir".to_string(),
+        ));
+    }
+
+    let mut config = TransConfig::load_from_root(root)?;
+    if config.mode == target_mode {
+        println!(
+            "Config is already in '{}' mode. Nothing to migrate.",
+            target_mode.as_str()
+        );
+        return Ok(());
+    }
+
+    let out_dir_abs = out_dir
+        .as_deref()
+        .map(|value| resolve_out_dir(root, value))
+        .transpose()?;
+    let out_dir_ref = out_dir_abs.as_deref();
+
+    migrate_language_files_to_dir(root, &config, target_mode, out_dir_ref)?;
+
+    config.mode = target_mode;
+    if let Some(path) = out_dir_abs {
+        if !no_update_language_files_path {
+            config.language_files_path = normalize_config_path(root, &path);
+        }
+    }
+    config.save_to_root(root)?;
+
+    if let Some(out_dir) = out_dir {
+        if no_update_language_files_path {
+            println!(
+                "Migrated language files to '{}' mode in {} (languageFilesPath unchanged).",
+                target_mode.as_str(),
+                out_dir
+            );
+        } else {
+            println!(
+                "Migrated language files to '{}' mode in {}.",
+                target_mode.as_str(),
+                config.language_files_path.display()
+            );
+        }
+    } else {
+        println!(
+            "Migrated language files in place to '{}' mode.",
+            target_mode.as_str()
+        );
+    }
+
+    Ok(())
+}
+
 fn maybe_prompt_update(receiver: Option<std::sync::mpsc::Receiver<UpdateInfo>>) -> Result<()> {
     let receiver = match receiver {
         Some(receiver) => receiver,
@@ -559,5 +630,27 @@ fn build_export_path(root: &Path, output: Option<&str>, format: ExportFormat) ->
         path
     } else {
         root.join(path)
+    }
+}
+
+fn resolve_out_dir(root: &Path, out_dir: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(out_dir);
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    std::fs::create_dir_all(&resolved)?;
+    Ok(resolved)
+}
+
+fn normalize_config_path(root: &Path, out_dir: &Path) -> PathBuf {
+    let root_abs = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let out_abs = std::fs::canonicalize(out_dir).unwrap_or_else(|_| out_dir.to_path_buf());
+
+    match out_abs.strip_prefix(&root_abs) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative.to_path_buf(),
+        Ok(_) => PathBuf::from("."),
+        Err(_) => out_abs,
     }
 }

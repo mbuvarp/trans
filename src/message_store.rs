@@ -112,6 +112,15 @@ pub fn coerce_non_string_values(root: &Path, config: &TransConfig) -> Result<usi
 }
 
 pub fn migrate_mode(root: &Path, config: &TransConfig, target_mode: ConfigMode) -> Result<()> {
+    migrate_mode_to_dir(root, config, target_mode, None)
+}
+
+pub fn migrate_mode_to_dir(
+    root: &Path,
+    config: &TransConfig,
+    target_mode: ConfigMode,
+    out_dir: Option<&Path>,
+) -> Result<()> {
     if config.mode == target_mode {
         return Ok(());
     }
@@ -119,10 +128,15 @@ pub fn migrate_mode(root: &Path, config: &TransConfig, target_mode: ConfigMode) 
     let mut snapshots: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut by_language: BTreeMap<String, FlatTranslations> = BTreeMap::new();
 
+    let source_dir = root.join(&config.language_files_path);
+    let destination_dir = out_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| source_dir.clone());
+    fs::create_dir_all(&destination_dir)?;
+    let in_place = are_dirs_equivalent(&source_dir, &destination_dir);
+
     for language in &config.available_languages {
-        let path = root
-            .join(&config.language_files_path)
-            .join(format!("{language}.json"));
+        let path = source_dir.join(format!("{language}.json"));
         let bytes = fs::read(&path).map_err(|err| {
             if err.kind() == io::ErrorKind::NotFound {
                 TransError::MissingLanguageFile(path.clone())
@@ -146,17 +160,21 @@ pub fn migrate_mode(root: &Path, config: &TransConfig, target_mode: ConfigMode) 
         }
     }
 
+    let mut created_outputs = Vec::new();
     for language in &config.available_languages {
-        let path = root
-            .join(&config.language_files_path)
-            .join(format!("{language}.json"));
+        let path = destination_dir.join(format!("{language}.json"));
         let Some(translations) = by_language.get(language) else {
             continue;
         };
         if let Err(err) = save_translations_for_mode(&path, target_mode, translations) {
-            restore_snapshots(root, config, &snapshots);
+            if in_place {
+                restore_snapshots(root, config, &snapshots);
+            } else {
+                cleanup_outputs(&created_outputs);
+            }
             return Err(err);
         }
+        created_outputs.push(path);
     }
 
     Ok(())
@@ -169,6 +187,21 @@ fn restore_snapshots(root: &Path, config: &TransConfig, snapshots: &BTreeMap<Str
             .join(format!("{language}.json"));
         let _ = fs::write(path, bytes);
     }
+}
+
+fn cleanup_outputs(paths: &[std::path::PathBuf]) {
+    for path in paths {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn are_dirs_equivalent(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    let left_canonical = fs::canonicalize(left).ok();
+    let right_canonical = fs::canonicalize(right).ok();
+    matches!((left_canonical, right_canonical), (Some(a), Some(b)) if a == b)
 }
 
 fn detect_migration_conflicts(by_language: &BTreeMap<String, FlatTranslations>) -> Vec<String> {
@@ -699,5 +732,39 @@ mod tests {
         let text = fs::read_to_string(root.join("messages/en.json")).expect("read");
         assert!(text.contains("\"app\""));
         assert!(text.contains("\"header\""));
+    }
+
+    #[test]
+    fn migration_writes_to_output_directory_when_requested() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("messages")).expect("mkdir");
+        fs::write(
+            root.join("messages/en.json"),
+            "{\n  \"app.header.title\": \"Title\"\n}\n",
+        )
+        .expect("write");
+
+        let config = TransConfig {
+            mode: ConfigMode::ReactIntl,
+            language_files_path: "messages".into(),
+            available_languages: vec!["en".to_string()],
+            required_languages: vec!["en".to_string()],
+            primary_language: "en".to_string(),
+            default_untranslated_value: String::new(),
+            default_export_format: crate::config::ExportFormat::Excel,
+            excel_password: "unlock".to_string(),
+            ai: None,
+        };
+
+        let out_dir = root.join("converted/messages");
+        migrate_mode_to_dir(root, &config, ConfigMode::NextIntl, Some(&out_dir)).expect("migrate");
+
+        let original = fs::read_to_string(root.join("messages/en.json")).expect("read original");
+        assert!(original.contains("\"app.header.title\""));
+
+        let converted = fs::read_to_string(out_dir.join("en.json")).expect("read converted");
+        assert!(converted.contains("\"app\""));
+        assert!(converted.contains("\"header\""));
     }
 }

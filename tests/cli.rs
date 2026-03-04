@@ -389,3 +389,137 @@ fn next_intl_non_string_values_fail_in_non_interactive_commands() {
 
     let _ = config;
 }
+
+#[test]
+fn migrate_in_place_updates_mode_and_rewrites_files() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["migrate", "next-intl"])
+        .assert()
+        .success();
+
+    let config = TransConfig::load_from_root(dir.path()).expect("load config");
+    assert_eq!(config.mode, trans::config::ConfigMode::NextIntl);
+
+    let en_raw = std::fs::read_to_string(dir.path().join("messages/en.json")).expect("read en");
+    assert!(en_raw.contains("\"app\""));
+    assert!(!en_raw.contains("\"app.title\""));
+}
+
+#[test]
+fn migrate_out_dir_updates_language_files_path_to_relative() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["migrate", "next-intl", "-o", "converted/messages"])
+        .assert()
+        .success();
+
+    let config = TransConfig::load_from_root(dir.path()).expect("load config");
+    assert_eq!(config.mode, trans::config::ConfigMode::NextIntl);
+    assert_eq!(
+        config.language_files_path,
+        PathBuf::from("converted/messages")
+    );
+    assert!(dir.path().join("converted/messages/en.json").exists());
+}
+
+#[test]
+fn migrate_out_dir_with_no_update_keeps_language_files_path() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args([
+            "migrate",
+            "next-intl",
+            "-o",
+            "converted/messages",
+            "--no-update-language-files-path",
+        ])
+        .assert()
+        .success();
+
+    let config = TransConfig::load_from_root(dir.path()).expect("load config");
+    assert_eq!(config.mode, trans::config::ConfigMode::NextIntl);
+    assert_eq!(config.language_files_path, PathBuf::from("messages"));
+    assert!(dir.path().join("converted/messages/en.json").exists());
+}
+
+#[test]
+fn migrate_rejects_no_update_without_out_dir() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["migrate", "next-intl", "--no-update-language-files-path"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--no-update-language-files-path requires --out-dir",
+        ));
+}
+
+#[test]
+fn migrate_conflict_failure_keeps_config_and_source_files() {
+    let dir = tempdir().expect("tempdir");
+    let config = base_config();
+    config.save_to_root(dir.path()).expect("save config");
+
+    std::fs::create_dir_all(dir.path().join("messages")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("messages/en.json"),
+        "{\n  \"app\": \"A\",\n  \"app.header\": \"B\"\n}\n",
+    )
+    .expect("write en");
+    std::fs::write(
+        dir.path().join("messages/nb.json"),
+        "{\n  \"app\": \"A\",\n  \"app.header\": \"B\"\n}\n",
+    )
+    .expect("write nb");
+
+    let before = std::fs::read_to_string(dir.path().join("messages/en.json")).expect("read before");
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["migrate", "next-intl"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "mode migration aborted due to key conflicts",
+        ));
+
+    let after = std::fs::read_to_string(dir.path().join("messages/en.json")).expect("read after");
+    assert_eq!(before, after);
+    let config_after = TransConfig::load_from_root(dir.path()).expect("load config");
+    assert_eq!(config_after.mode, trans::config::ConfigMode::ReactIntl);
+}
+
+#[test]
+fn migrate_out_dir_overwrites_existing_files() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+    std::fs::create_dir_all(dir.path().join("converted/messages")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("converted/messages/en.json"),
+        "{\n  \"old\": \"value\"\n}\n",
+    )
+    .expect("write old");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["migrate", "next-intl", "-o", "converted/messages"])
+        .assert()
+        .success();
+
+    let converted =
+        std::fs::read_to_string(dir.path().join("converted/messages/en.json")).expect("read");
+    assert!(converted.contains("\"app\""));
+    assert!(!converted.contains("\"old\""));
+}

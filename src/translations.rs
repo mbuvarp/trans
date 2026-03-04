@@ -4,7 +4,7 @@ use crate::config::TransConfig;
 use crate::error::Result;
 use crate::message_store::{
     FlatTranslations, NonStringValues, coerce_non_string_values, collect_non_string_values,
-    load_translations_for_mode, migrate_mode, save_translations_for_mode,
+    load_translations_for_mode, migrate_mode, migrate_mode_to_dir, save_translations_for_mode,
 };
 
 pub type Translations = FlatTranslations;
@@ -54,6 +54,15 @@ pub fn migrate_language_files(
     target_mode: crate::config::ConfigMode,
 ) -> Result<()> {
     migrate_mode(root.as_ref(), config, target_mode)
+}
+
+pub fn migrate_language_files_to_dir(
+    root: impl AsRef<Path>,
+    config: &TransConfig,
+    target_mode: crate::config::ConfigMode,
+    out_dir: Option<&Path>,
+) -> Result<()> {
+    migrate_mode_to_dir(root.as_ref(), config, target_mode, out_dir)
 }
 
 pub fn collect_non_string_leaf_values(
