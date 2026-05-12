@@ -84,12 +84,13 @@ trans verify
 
 ## Configuration
 
-`trans` looks for exactly one config file in the current project root:
+`trans` looks for exactly one config file in the current directory, then walks up parent directories until it finds one:
 
 - `.trans.config.json`
 - `.trans.config.yaml`
 
 If neither file exists, most commands fail and tell you to run `trans init`.
+Paths in the config, such as `languageFilesPath`, are resolved relative to the directory containing the discovered config file.
 
 Example JSON config:
 
@@ -178,6 +179,10 @@ Main commands:
 - `trans config`: inspect or edit config values
 
 Run `trans --help` or `trans <command> --help` for the full option set.
+
+Global options:
+
+- `-C, --cwd <DIR>`: run as if `trans` was started in `DIR`; config discovery starts there, and relative project paths still resolve from the discovered config directory.
 
 ## Interactive Mode
 

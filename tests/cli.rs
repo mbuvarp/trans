@@ -116,6 +116,134 @@ fn list_required_languages_outputs_expected_values() {
 }
 
 #[test]
+fn list_required_languages_works_from_child_directory() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+    let child = dir.path().join("src/components");
+    std::fs::create_dir_all(&child).expect("mkdir child");
+
+    trans_cmd()
+        .current_dir(&child)
+        .arg("list-required-languages")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("en"));
+}
+
+#[test]
+fn mutation_and_verify_from_child_use_config_directory_paths() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_project(dir.path());
+    let child = dir.path().join("src/components");
+    std::fs::create_dir_all(&child).expect("mkdir child");
+
+    trans_cmd()
+        .current_dir(&child)
+        .args(["add", "--id", "app.child", "--values", "en:Child"])
+        .assert()
+        .success();
+
+    trans_cmd()
+        .current_dir(&child)
+        .args(["show", "--id", "app.child", "--lang", "en"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Child"));
+
+    trans_cmd()
+        .current_dir(&child)
+        .arg("verify")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK"));
+
+    let en = load_language_translations(dir.path(), &config, "en").expect("load en");
+    assert_eq!(en.get("app.child").map(String::as_str), Some("Child"));
+    assert!(!child.join("messages").exists());
+}
+
+#[test]
+fn cwd_flag_discovers_config_from_child_directory() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+    let child = dir.path().join("src/components");
+    std::fs::create_dir_all(&child).expect("mkdir child");
+    let outside = tempdir().expect("outside tempdir");
+
+    trans_cmd()
+        .current_dir(outside.path())
+        .args([
+            "-C",
+            child.to_str().expect("utf-8 path"),
+            "show",
+            "--id",
+            "app.title",
+            "--lang",
+            "en",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Title"));
+}
+
+#[test]
+fn cwd_flag_works_after_subcommand_and_resolves_relative_paths() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+    let child = dir.path().join("src/components");
+    std::fs::create_dir_all(&child).expect("mkdir child");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args([
+            "show",
+            "-C",
+            "src/components",
+            "--id",
+            "app.title",
+            "--lang",
+            "en",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Title"));
+}
+
+#[test]
+fn cwd_flag_export_writes_to_config_directory() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+    let child = dir.path().join("src/components");
+    std::fs::create_dir_all(&child).expect("mkdir child");
+    let outside = tempdir().expect("outside tempdir");
+
+    trans_cmd()
+        .current_dir(outside.path())
+        .args([
+            "-C",
+            child.to_str().expect("utf-8 path"),
+            "export",
+            "--format",
+            "csv",
+        ])
+        .assert()
+        .success();
+
+    assert!(dir.path().join("translations.csv").exists());
+    assert!(!child.join("translations.csv").exists());
+    assert!(!outside.path().join("translations.csv").exists());
+}
+
+#[test]
+fn help_documents_cwd_flag() {
+    trans_cmd()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("-C, --cwd <DIR>"));
+}
+
+#[test]
 fn add_update_show_delete_flow() {
     let dir = tempdir().expect("tempdir");
     let config = setup_project(dir.path());

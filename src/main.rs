@@ -39,20 +39,44 @@ fn main() {
     }
 }
 
+fn resolve_effective_cwd(cwd: Option<&Path>) -> Result<PathBuf> {
+    let process_cwd = env::current_dir()?;
+    let path = match cwd {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => process_cwd.join(path),
+        None => process_cwd,
+    };
+
+    let path = std::fs::canonicalize(&path)?;
+    if !path.is_dir() {
+        return Err(TransError::InvalidInput(format!(
+            "cwd is not a directory: {}",
+            path.display()
+        )));
+    }
+
+    Ok(path)
+}
+
+fn config_root(effective_cwd: &Path) -> Result<PathBuf> {
+    TransConfig::find_root(effective_cwd)
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     if cli.version {
         println!("trans {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    let update_check = maybe_start_update_check(&cli)?;
+    let effective_cwd = resolve_effective_cwd(cli.cwd.as_deref())?;
+    let update_check = maybe_start_update_check(&cli, &effective_cwd)?;
     let result = match cli.command {
         None => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             run_interactive(&root, cli.message_id, cli.all)
         }
         Some(Command::Init { format }) => {
-            let root = env::current_dir()?;
+            let root = effective_cwd;
             init_config_interactive(
                 &root,
                 match format {
@@ -68,7 +92,7 @@ fn run() -> Result<()> {
             missing,
             no_lock,
         }) => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             let config = TransConfig::load_from_root(&root)?;
             let format = format.unwrap_or(config.default_export_format);
             let use_custom = lang.is_some() || output.is_some() || missing || no_lock;
@@ -174,7 +198,7 @@ fn run() -> Result<()> {
             trim,
             ai,
         }) => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             let config = TransConfig::load_from_root(&root)?;
             let lang_filter = match lang {
                 Some(lang) => Some(parse_lang_list(&lang)?),
@@ -191,7 +215,7 @@ fn run() -> Result<()> {
             )
         }
         Some(Command::ListRequiredLanguages) => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             let config = TransConfig::load_from_root(&root)?;
             for language in list_required_languages(&config) {
                 println!("{language}");
@@ -199,7 +223,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Add { id, values, all }) => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             let config = TransConfig::load_from_root(&root)?;
             if all && values.is_some() {
                 return Err(TransError::InvalidInput(
@@ -236,7 +260,7 @@ fn run() -> Result<()> {
             }
         }
         Some(Command::Update { id, values, all }) => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             let config = TransConfig::load_from_root(&root)?;
             if all && values.is_some() {
                 return Err(TransError::InvalidInput(
@@ -273,7 +297,7 @@ fn run() -> Result<()> {
             }
         }
         Some(Command::Delete { id }) => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             let config = TransConfig::load_from_root(&root)?;
             match delete_translation(&root, &config, &id) {
                 Err(err) => {
@@ -287,7 +311,7 @@ fn run() -> Result<()> {
             }
         }
         Some(Command::Show { id, lang }) => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             let config = TransConfig::load_from_root(&root)?;
             if let Some(lang) = lang {
                 let value = get_translation(&root, &config, &id, &lang)?;
@@ -301,7 +325,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Config { section, format }) => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             if let Some(format) = format {
                 if section.is_some() {
                     return Err(TransError::InvalidInput(
@@ -338,7 +362,7 @@ fn run() -> Result<()> {
             }
         }
         Some(Command::ChangeId { old_id, new_id }) => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             let config = TransConfig::load_from_root(&root)?;
             match change_message_id(&root, &config, &old_id, &new_id) {
                 Err(err) => {
@@ -358,7 +382,7 @@ fn run() -> Result<()> {
             backup,
             check,
         }) => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             handle_migrate(
                 &root,
                 mode,
@@ -369,7 +393,7 @@ fn run() -> Result<()> {
             )
         }
         Some(Command::Verify { ai }) => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             let config = TransConfig::load_from_root(&root)?;
             if ai {
                 verify_with_ai(&root, &config)
@@ -394,12 +418,12 @@ fn run() -> Result<()> {
             }
         }
         Some(Command::Sync) => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             let config = TransConfig::load_from_root(&root)?;
             handle_sync(&root, &config)
         }
         Some(Command::Auto { lang, concurrency }) => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             let mut config = TransConfig::load_from_root(&root)?;
             if let Some(concurrency) = concurrency {
                 if concurrency == 0 {
@@ -417,12 +441,12 @@ fn run() -> Result<()> {
             trans::auto::auto_translate(&root, &config, lang_filter)
         }
         Some(Command::AddLang { lang }) => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             let config = TransConfig::load_from_root(&root)?;
             add_language(&root, &config, &lang)
         }
         Some(Command::DelLang { lang }) => {
-            let root = env::current_dir()?;
+            let root = config_root(&effective_cwd)?;
             let config = TransConfig::load_from_root(&root)?;
             if lang == config.primary_language {
                 return Err(TransError::InvalidInput(
@@ -618,11 +642,17 @@ fn map_config_key(key: ConfigKey) -> ConfigField {
     }
 }
 
-fn maybe_start_update_check(cli: &Cli) -> Result<Option<std::sync::mpsc::Receiver<UpdateInfo>>> {
+fn maybe_start_update_check(
+    cli: &Cli,
+    effective_cwd: &Path,
+) -> Result<Option<std::sync::mpsc::Receiver<UpdateInfo>>> {
     if matches!(cli.command, Some(Command::Init { .. })) {
         return Ok(None);
     }
-    let root = env::current_dir()?;
+    let root = match TransConfig::find_root(effective_cwd) {
+        Ok(root) => root,
+        Err(_) => return Ok(None),
+    };
     let config = match TransConfig::load_from_root(&root) {
         Ok(config) => config,
         Err(_) => return Ok(None),
