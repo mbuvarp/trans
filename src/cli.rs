@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -21,6 +22,14 @@ pub struct Cli {
         help = "Print version information"
     )]
     pub version: bool,
+    #[arg(
+        short = 'C',
+        long = "cwd",
+        global = true,
+        value_name = "DIR",
+        help = "Run as if trans was started in DIR"
+    )]
+    pub cwd: Option<PathBuf>,
     #[arg(long = "all", help = "Prompt for all languages in interactive mode")]
     pub all: bool,
     #[arg(

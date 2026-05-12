@@ -181,6 +181,27 @@ impl TransConfig {
         )
     }
 
+    pub fn find_root(start: impl AsRef<Path>) -> Result<PathBuf> {
+        let start = start.as_ref();
+        for root in start.ancestors() {
+            let (json_path, yaml_path) = Self::config_paths(root);
+            match (json_path.exists(), yaml_path.exists()) {
+                (true, true) => {
+                    return Err(TransError::InvalidConfig(
+                        "both .trans.config.json and .trans.config.yaml exist; keep only one"
+                            .to_string(),
+                    ));
+                }
+                (true, false) | (false, true) => return Ok(root.to_path_buf()),
+                (false, false) => {}
+            }
+        }
+
+        Err(TransError::MissingConfig(
+            ".trans.config.json or .trans.config.yaml".to_string(),
+        ))
+    }
+
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let format = ConfigFormat::from_path(path)?;
@@ -542,6 +563,58 @@ mod tests {
 
         let loaded = TransConfig::load_from_root(dir.path()).expect("load");
         assert_eq!(loaded.primary_language, "en");
+    }
+
+    #[test]
+    fn find_root_finds_json_in_starting_directory() {
+        let dir = tempdir().expect("tempdir");
+        let config = base_config();
+        config.save_to_root(dir.path()).expect("save config");
+
+        let root = TransConfig::find_root(dir.path()).expect("find root");
+        assert_eq!(root, dir.path());
+    }
+
+    #[test]
+    fn find_root_finds_yaml_in_ancestor_directory() {
+        let dir = tempdir().expect("tempdir");
+        let child = dir.path().join("src/components");
+        fs::create_dir_all(&child).expect("mkdir");
+        let config = base_config();
+        let yaml_path = TransConfig::config_path_for_format(dir.path(), ConfigFormat::Yaml);
+        config.save_to_path(&yaml_path).expect("save yaml");
+
+        let root = TransConfig::find_root(&child).expect("find root");
+        assert_eq!(root, dir.path());
+    }
+
+    #[test]
+    fn find_root_errors_when_no_config_exists() {
+        let dir = tempdir().expect("tempdir");
+        let err = TransConfig::find_root(dir.path()).expect_err("missing config");
+
+        assert!(matches!(err, TransError::MissingConfig(_)));
+    }
+
+    #[test]
+    fn find_root_errors_when_both_config_formats_exist() {
+        let dir = tempdir().expect("tempdir");
+        let config = base_config();
+        config
+            .save_to_path(TransConfig::config_path_for_format(
+                dir.path(),
+                ConfigFormat::Json,
+            ))
+            .expect("save json");
+        config
+            .save_to_path(TransConfig::config_path_for_format(
+                dir.path(),
+                ConfigFormat::Yaml,
+            ))
+            .expect("save yaml");
+
+        let err = TransConfig::find_root(dir.path()).expect_err("duplicate config");
+        assert!(matches!(err, TransError::InvalidConfig(_)));
     }
 
     #[test]
