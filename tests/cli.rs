@@ -968,6 +968,36 @@ fn unused_resolves_finite_conditional_key_variables() {
 }
 
 #[test]
+fn unused_resolves_finite_object_map_lookup_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("notifications.errors.blocked", "Blocked"),
+            ("notifications.errors.denied", "Denied"),
+            (
+                "notifications.errors.registrationFailed",
+                "Registration failed",
+            ),
+            ("notifications.errors.unsupported", "Unsupported"),
+            ("notifications.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations();\nconst messageKeyByReason = {\n  blocked: 'notifications.errors.blocked',\n  denied: 'notifications.errors.denied',\n  registrationFailed: 'notifications.errors.registrationFailed',\n  unsupported: 'notifications.errors.unsupported',\n};\nt(messageKeyByReason[error.reason]);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("notifications.unused\n");
+}
+
+#[test]
 fn unused_resolves_finite_map_callback_keys() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(

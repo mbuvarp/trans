@@ -6,11 +6,12 @@ use std::process::Command;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, ArrowFunctionExpression, BindingPattern, CallExpression,
-    ConditionalExpression, Declaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
-    ExportNamedDeclaration, Expression, ForOfStatement, ForStatementLeft, Function, FunctionBody,
-    ImportDeclaration, ImportDeclarationSpecifier, ModuleExportName, ObjectPropertyKind,
-    ReturnStatement, Statement, TemplateLiteral, VariableDeclaration, VariableDeclarationKind,
-    VariableDeclarator,
+    ComputedMemberExpression, ConditionalExpression, Declaration, ExportDefaultDeclaration,
+    ExportDefaultDeclarationKind, ExportNamedDeclaration, Expression, ForOfStatement,
+    ForStatementLeft, Function, FunctionBody, ImportDeclaration, ImportDeclarationSpecifier,
+    ModuleExportName, ObjectExpression, ObjectPropertyKind, PropertyKind, ReturnStatement,
+    Statement, StaticMemberExpression, TemplateLiteral, VariableDeclaration,
+    VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -32,6 +33,8 @@ const TRANSLATOR_METHODS: &[&str] = &["rich", "markup", "raw", "has"];
 const MAX_FINITE_STRINGS: usize = 128;
 
 type FiniteStrings = BTreeSet<String>;
+type FiniteObjectMap = BTreeMap<String, FiniteStrings>;
+type FiniteObjectMaps = BTreeMap<String, FiniteObjectMap>;
 
 #[derive(Debug, Clone, Default)]
 pub struct UnusedReport {
@@ -729,6 +732,7 @@ struct SourceUsageCollector {
     get_extracted: BTreeSet<String>,
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
+    finite_object_maps: FiniteObjectMaps,
     translators: BTreeMap<String, TranslatorBinding>,
     scan: UsageScan,
 }
@@ -765,6 +769,7 @@ fn helper_summary_from_body(
         param_names,
         finite_constants: BTreeMap::new(),
         finite_iterables: BTreeMap::new(),
+        finite_object_maps: BTreeMap::new(),
         usages: Vec::new(),
     };
     for statement in &body.statements {
@@ -787,7 +792,11 @@ fn finite_return_summary_from_expression(expression: &Expression<'_>) -> Option<
 fn finite_return_summary_from_arrow(arrow: &ArrowFunctionExpression<'_>) -> Option<FiniteStrings> {
     if arrow.expression {
         if let Some(Statement::ExpressionStatement(statement)) = arrow.body.statements.first() {
-            return finite_strings_from_expression(&statement.expression, &BTreeMap::new());
+            return finite_strings_from_expression(
+                &statement.expression,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            );
         }
     }
     finite_return_summary_from_body(&arrow.body)
@@ -802,6 +811,7 @@ fn finite_return_summary_from_body(body: &FunctionBody<'_>) -> Option<FiniteStri
     let mut collector = ReturnValueCollector {
         finite_constants: BTreeMap::new(),
         finite_iterables: BTreeMap::new(),
+        finite_object_maps: BTreeMap::new(),
         return_values: BTreeSet::new(),
         unknown_return: false,
     };
@@ -872,32 +882,41 @@ fn append_finite_strings(
 fn finite_strings_from_argument(
     argument: &Argument<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
+    object_maps: &FiniteObjectMaps,
 ) -> Option<FiniteStrings> {
     match argument {
         Argument::StringLiteral(literal) => Some(finite_string(literal.value.to_string())),
-        Argument::TemplateLiteral(literal) => finite_strings_from_template(literal, constants),
+        Argument::TemplateLiteral(literal) => {
+            finite_strings_from_template(literal, constants, object_maps)
+        }
         Argument::Identifier(identifier) => constants.get(identifier.name.as_str()).cloned(),
-        Argument::CallExpression(call) => finite_strings_from_call(call, constants),
+        Argument::CallExpression(call) => finite_strings_from_call(call, constants, object_maps),
+        Argument::ComputedMemberExpression(member) => {
+            finite_strings_from_computed_member(member, constants, object_maps)
+        }
+        Argument::StaticMemberExpression(member) => {
+            finite_strings_from_static_member(member, object_maps)
+        }
         Argument::ConditionalExpression(conditional) => {
-            finite_strings_from_conditional(conditional, constants)
+            finite_strings_from_conditional(conditional, constants, object_maps)
         }
         Argument::ParenthesizedExpression(parenthesized) => {
-            finite_strings_from_expression(&parenthesized.expression, constants)
+            finite_strings_from_expression(&parenthesized.expression, constants, object_maps)
         }
         Argument::TSAsExpression(expression) => {
-            finite_strings_from_expression(&expression.expression, constants)
+            finite_strings_from_expression(&expression.expression, constants, object_maps)
         }
         Argument::TSSatisfiesExpression(expression) => {
-            finite_strings_from_expression(&expression.expression, constants)
+            finite_strings_from_expression(&expression.expression, constants, object_maps)
         }
         Argument::TSNonNullExpression(expression) => {
-            finite_strings_from_expression(&expression.expression, constants)
+            finite_strings_from_expression(&expression.expression, constants, object_maps)
         }
         Argument::TSInstantiationExpression(expression) => {
-            finite_strings_from_expression(&expression.expression, constants)
+            finite_strings_from_expression(&expression.expression, constants, object_maps)
         }
         Argument::TSTypeAssertion(expression) => {
-            finite_strings_from_expression(&expression.expression, constants)
+            finite_strings_from_expression(&expression.expression, constants, object_maps)
         }
         _ => None,
     }
@@ -906,14 +925,23 @@ fn finite_strings_from_argument(
 fn finite_strings_from_expression(
     expression: &Expression<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
+    object_maps: &FiniteObjectMaps,
 ) -> Option<FiniteStrings> {
     match expression.get_inner_expression() {
         Expression::StringLiteral(literal) => Some(finite_string(literal.value.to_string())),
-        Expression::TemplateLiteral(literal) => finite_strings_from_template(literal, constants),
+        Expression::TemplateLiteral(literal) => {
+            finite_strings_from_template(literal, constants, object_maps)
+        }
         Expression::Identifier(identifier) => constants.get(identifier.name.as_str()).cloned(),
-        Expression::CallExpression(call) => finite_strings_from_call(call, constants),
+        Expression::CallExpression(call) => finite_strings_from_call(call, constants, object_maps),
+        Expression::ComputedMemberExpression(member) => {
+            finite_strings_from_computed_member(member, constants, object_maps)
+        }
+        Expression::StaticMemberExpression(member) => {
+            finite_strings_from_static_member(member, object_maps)
+        }
         Expression::ConditionalExpression(conditional) => {
-            finite_strings_from_conditional(conditional, constants)
+            finite_strings_from_conditional(conditional, constants, object_maps)
         }
         _ => None,
     }
@@ -923,11 +951,15 @@ fn finite_iterable_from_expression(
     expression: &Expression<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
     iterables: &BTreeMap<String, FiniteStrings>,
+    object_maps: &FiniteObjectMaps,
 ) -> Option<FiniteStrings> {
     match expression.get_inner_expression() {
-        Expression::ArrayExpression(array) => {
-            finite_iterable_from_array_elements(array.elements.iter(), constants, iterables)
-        }
+        Expression::ArrayExpression(array) => finite_iterable_from_array_elements(
+            array.elements.iter(),
+            constants,
+            iterables,
+            object_maps,
+        ),
         Expression::Identifier(identifier) => iterables.get(identifier.name.as_str()).cloned(),
         _ => None,
     }
@@ -937,11 +969,111 @@ fn finite_iterable_from_array_elements<'a>(
     elements: impl Iterator<Item = &'a ArrayExpressionElement<'a>>,
     constants: &BTreeMap<String, FiniteStrings>,
     iterables: &BTreeMap<String, FiniteStrings>,
+    object_maps: &FiniteObjectMaps,
 ) -> Option<FiniteStrings> {
     let mut values = BTreeSet::new();
     for element in elements {
-        let element_values = finite_strings_from_array_element(element, constants, iterables)?;
+        let element_values =
+            finite_strings_from_array_element(element, constants, iterables, object_maps)?;
         values.extend(element_values);
+        if values.len() > MAX_FINITE_STRINGS {
+            return None;
+        }
+    }
+    Some(values)
+}
+
+fn finite_object_map_from_expression(
+    expression: &Expression<'_>,
+    constants: &BTreeMap<String, FiniteStrings>,
+    object_maps: &FiniteObjectMaps,
+) -> Option<FiniteObjectMap> {
+    match expression.get_inner_expression() {
+        Expression::ObjectExpression(object) => {
+            finite_object_map_from_object(object, constants, object_maps)
+        }
+        _ => None,
+    }
+}
+
+fn finite_object_map_from_object(
+    object: &ObjectExpression<'_>,
+    constants: &BTreeMap<String, FiniteStrings>,
+    object_maps: &FiniteObjectMaps,
+) -> Option<FiniteObjectMap> {
+    let mut map = BTreeMap::new();
+    for property in &object.properties {
+        let ObjectPropertyKind::ObjectProperty(property) = property else {
+            return None;
+        };
+        if property.kind != PropertyKind::Init || property.method || property.shorthand {
+            return None;
+        }
+        let key = property.key.static_name()?.to_string();
+        let values = finite_strings_from_expression(&property.value, constants, object_maps)?;
+        map.insert(key, values);
+        if map.len() > MAX_FINITE_STRINGS {
+            return None;
+        }
+    }
+    if map.is_empty() {
+        return None;
+    }
+    Some(map)
+}
+
+fn finite_strings_from_computed_member(
+    member: &ComputedMemberExpression<'_>,
+    constants: &BTreeMap<String, FiniteStrings>,
+    object_maps: &FiniteObjectMaps,
+) -> Option<FiniteStrings> {
+    let object_name = member
+        .object
+        .get_inner_expression()
+        .get_identifier_reference()?
+        .name
+        .as_str();
+    let map = object_maps.get(object_name)?;
+    if let Some(keys) = finite_strings_from_expression(&member.expression, constants, object_maps) {
+        return finite_object_map_values_for_keys(map, keys);
+    }
+    finite_object_map_all_values(map)
+}
+
+fn finite_strings_from_static_member(
+    member: &StaticMemberExpression<'_>,
+    object_maps: &FiniteObjectMaps,
+) -> Option<FiniteStrings> {
+    let object_name = member
+        .object
+        .get_inner_expression()
+        .get_identifier_reference()?
+        .name
+        .as_str();
+    object_maps
+        .get(object_name)?
+        .get(member.property.name.as_str())
+        .cloned()
+}
+
+fn finite_object_map_values_for_keys(
+    map: &FiniteObjectMap,
+    keys: FiniteStrings,
+) -> Option<FiniteStrings> {
+    let mut values = BTreeSet::new();
+    for key in keys {
+        values.extend(map.get(&key)?.iter().cloned());
+        if values.len() > MAX_FINITE_STRINGS {
+            return None;
+        }
+    }
+    Some(values)
+}
+
+fn finite_object_map_all_values(map: &FiniteObjectMap) -> Option<FiniteStrings> {
+    let mut values = BTreeSet::new();
+    for entry_values in map.values() {
+        values.extend(entry_values.iter().cloned());
         if values.len() > MAX_FINITE_STRINGS {
             return None;
         }
@@ -953,44 +1085,76 @@ fn finite_strings_from_array_element(
     element: &ArrayExpressionElement<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
     iterables: &BTreeMap<String, FiniteStrings>,
+    object_maps: &FiniteObjectMaps,
 ) -> Option<FiniteStrings> {
     match element {
         ArrayExpressionElement::StringLiteral(literal) => {
             Some(finite_string(literal.value.to_string()))
         }
         ArrayExpressionElement::TemplateLiteral(literal) => {
-            finite_strings_from_template(literal, constants)
+            finite_strings_from_template(literal, constants, object_maps)
         }
         ArrayExpressionElement::Identifier(identifier) => {
             constants.get(identifier.name.as_str()).cloned()
         }
-        ArrayExpressionElement::CallExpression(call) => finite_strings_from_call(call, constants),
+        ArrayExpressionElement::CallExpression(call) => {
+            finite_strings_from_call(call, constants, object_maps)
+        }
+        ArrayExpressionElement::ComputedMemberExpression(member) => {
+            finite_strings_from_computed_member(member, constants, object_maps)
+        }
+        ArrayExpressionElement::StaticMemberExpression(member) => {
+            finite_strings_from_static_member(member, object_maps)
+        }
         ArrayExpressionElement::ConditionalExpression(conditional) => {
-            finite_strings_from_conditional(conditional, constants)
+            finite_strings_from_conditional(conditional, constants, object_maps)
         }
         ArrayExpressionElement::ParenthesizedExpression(parenthesized) => {
-            finite_strings_from_expression(&parenthesized.expression, constants)
+            finite_strings_from_expression(&parenthesized.expression, constants, object_maps)
         }
-        ArrayExpressionElement::TSAsExpression(expression) => {
-            finite_iterable_from_expression(&expression.expression, constants, iterables)
-                .or_else(|| finite_strings_from_expression(&expression.expression, constants))
-        }
+        ArrayExpressionElement::TSAsExpression(expression) => finite_iterable_from_expression(
+            &expression.expression,
+            constants,
+            iterables,
+            object_maps,
+        )
+        .or_else(|| finite_strings_from_expression(&expression.expression, constants, object_maps)),
         ArrayExpressionElement::TSSatisfiesExpression(expression) => {
-            finite_iterable_from_expression(&expression.expression, constants, iterables)
-                .or_else(|| finite_strings_from_expression(&expression.expression, constants))
+            finite_iterable_from_expression(
+                &expression.expression,
+                constants,
+                iterables,
+                object_maps,
+            )
+            .or_else(|| {
+                finite_strings_from_expression(&expression.expression, constants, object_maps)
+            })
         }
-        ArrayExpressionElement::TSNonNullExpression(expression) => {
-            finite_iterable_from_expression(&expression.expression, constants, iterables)
-                .or_else(|| finite_strings_from_expression(&expression.expression, constants))
-        }
+        ArrayExpressionElement::TSNonNullExpression(expression) => finite_iterable_from_expression(
+            &expression.expression,
+            constants,
+            iterables,
+            object_maps,
+        )
+        .or_else(|| finite_strings_from_expression(&expression.expression, constants, object_maps)),
         ArrayExpressionElement::TSInstantiationExpression(expression) => {
-            finite_iterable_from_expression(&expression.expression, constants, iterables)
-                .or_else(|| finite_strings_from_expression(&expression.expression, constants))
+            finite_iterable_from_expression(
+                &expression.expression,
+                constants,
+                iterables,
+                object_maps,
+            )
+            .or_else(|| {
+                finite_strings_from_expression(&expression.expression, constants, object_maps)
+            })
         }
-        ArrayExpressionElement::TSTypeAssertion(expression) => {
-            finite_iterable_from_expression(&expression.expression, constants, iterables)
-                .or_else(|| finite_strings_from_expression(&expression.expression, constants))
-        }
+        ArrayExpressionElement::TSTypeAssertion(expression) => finite_iterable_from_expression(
+            &expression.expression,
+            constants,
+            iterables,
+            object_maps,
+        )
+        .or_else(|| finite_strings_from_expression(&expression.expression, constants, object_maps)),
         _ => None,
     }
 }
@@ -998,6 +1162,7 @@ fn finite_strings_from_array_element(
 fn finite_strings_from_call(
     call: &CallExpression<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
+    object_maps: &FiniteObjectMaps,
 ) -> Option<FiniteStrings> {
     if !call.arguments.is_empty() {
         return None;
@@ -1005,7 +1170,7 @@ fn finite_strings_from_call(
 
     let member = call.callee.get_member_expr()?;
     let method = member.static_property_name()?;
-    let values = finite_strings_from_expression(member.object(), constants)?;
+    let values = finite_strings_from_expression(member.object(), constants, object_maps)?;
 
     transform_finite_strings(values, &method)
 }
@@ -1028,15 +1193,18 @@ fn transform_finite_strings(values: FiniteStrings, method: &str) -> Option<Finit
 fn finite_strings_from_conditional(
     conditional: &ConditionalExpression<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
+    object_maps: &FiniteObjectMaps,
 ) -> Option<FiniteStrings> {
-    let consequent = finite_strings_from_expression(&conditional.consequent, constants)?;
-    let alternate = finite_strings_from_expression(&conditional.alternate, constants)?;
+    let consequent =
+        finite_strings_from_expression(&conditional.consequent, constants, object_maps)?;
+    let alternate = finite_strings_from_expression(&conditional.alternate, constants, object_maps)?;
     union_finite_strings(consequent, alternate)
 }
 
 fn finite_strings_from_template(
     literal: &TemplateLiteral<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
+    object_maps: &FiniteObjectMaps,
 ) -> Option<FiniteStrings> {
     let mut values = finite_string("");
     for (index, quasi) in literal.quasis.iter().enumerate() {
@@ -1044,7 +1212,8 @@ fn finite_strings_from_template(
         values = append_finite_strings(values, &finite_string(cooked.to_string()))?;
 
         if let Some(expression) = literal.expressions.get(index) {
-            let expression_values = finite_strings_from_expression(expression, constants)?;
+            let expression_values =
+                finite_strings_from_expression(expression, constants, object_maps)?;
             values = append_finite_strings(values, &expression_values)?;
         }
     }
@@ -1055,6 +1224,7 @@ struct HelperBodyCollector {
     param_names: BTreeMap<String, usize>,
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
+    finite_object_maps: FiniteObjectMaps,
     usages: Vec<HelperParamUsage>,
 }
 
@@ -1077,7 +1247,12 @@ impl HelperBodyCollector {
         &self,
         expression: &Expression<'_>,
     ) -> Option<FiniteStrings> {
-        finite_iterable_from_expression(expression, &self.finite_constants, &self.finite_iterables)
+        finite_iterable_from_expression(
+            expression,
+            &self.finite_constants,
+            &self.finite_iterables,
+            &self.finite_object_maps,
+        )
     }
 
     fn with_finite_constant(
@@ -1174,13 +1349,22 @@ impl<'a> Visit<'a> for HelperBodyCollector {
         if declarator.kind == VariableDeclarationKind::Const {
             if let Some(name) = binding_identifier_name(&declarator.id) {
                 if let Some(init) = &declarator.init {
-                    if let Some(values) =
-                        finite_strings_from_expression(init, &self.finite_constants)
-                    {
+                    if let Some(values) = finite_strings_from_expression(
+                        init,
+                        &self.finite_constants,
+                        &self.finite_object_maps,
+                    ) {
                         self.finite_constants.insert(name.to_string(), values);
                     }
                     if let Some(values) = self.finite_iterable_from_expression(init) {
                         self.finite_iterables.insert(name.to_string(), values);
+                    }
+                    if let Some(values) = finite_object_map_from_expression(
+                        init,
+                        &self.finite_constants,
+                        &self.finite_object_maps,
+                    ) {
+                        self.finite_object_maps.insert(name.to_string(), values);
                     }
                 }
             }
@@ -1195,7 +1379,11 @@ impl<'a> Visit<'a> for HelperBodyCollector {
 
         if let Some(param_index) = self.callee_param_index(&call.callee) {
             let keys = call.arguments.first().and_then(|argument| {
-                finite_strings_from_argument(argument, &self.finite_constants)
+                finite_strings_from_argument(
+                    argument,
+                    &self.finite_constants,
+                    &self.finite_object_maps,
+                )
             });
             self.usages.push(HelperParamUsage { param_index, keys });
         }
@@ -1224,6 +1412,7 @@ impl<'a> Visit<'a> for HelperBodyCollector {
 struct ReturnValueCollector {
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
+    finite_object_maps: FiniteObjectMaps,
     return_values: FiniteStrings,
     unknown_return: bool,
 }
@@ -1233,7 +1422,12 @@ impl ReturnValueCollector {
         &self,
         expression: &Expression<'_>,
     ) -> Option<FiniteStrings> {
-        finite_iterable_from_expression(expression, &self.finite_constants, &self.finite_iterables)
+        finite_iterable_from_expression(
+            expression,
+            &self.finite_constants,
+            &self.finite_iterables,
+            &self.finite_object_maps,
+        )
     }
 }
 
@@ -1242,13 +1436,22 @@ impl<'a> Visit<'a> for ReturnValueCollector {
         if declarator.kind == VariableDeclarationKind::Const {
             if let Some(name) = binding_identifier_name(&declarator.id) {
                 if let Some(init) = &declarator.init {
-                    if let Some(values) =
-                        finite_strings_from_expression(init, &self.finite_constants)
-                    {
+                    if let Some(values) = finite_strings_from_expression(
+                        init,
+                        &self.finite_constants,
+                        &self.finite_object_maps,
+                    ) {
                         self.finite_constants.insert(name.to_string(), values);
                     }
                     if let Some(values) = self.finite_iterable_from_expression(init) {
                         self.finite_iterables.insert(name.to_string(), values);
+                    }
+                    if let Some(values) = finite_object_map_from_expression(
+                        init,
+                        &self.finite_constants,
+                        &self.finite_object_maps,
+                    ) {
+                        self.finite_object_maps.insert(name.to_string(), values);
                     }
                 }
             }
@@ -1261,7 +1464,11 @@ impl<'a> Visit<'a> for ReturnValueCollector {
             self.unknown_return = true;
             return;
         };
-        let Some(values) = finite_strings_from_expression(argument, &self.finite_constants) else {
+        let Some(values) = finite_strings_from_expression(
+            argument,
+            &self.finite_constants,
+            &self.finite_object_maps,
+        ) else {
             self.unknown_return = true;
             return;
         };
@@ -1283,6 +1490,7 @@ struct SourceIndexCollector {
     return_helpers: BTreeMap<String, FiniteStrings>,
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
+    finite_object_maps: FiniteObjectMaps,
     export_locals: BTreeMap<String, String>,
     default_local: Option<String>,
     default_summary: Option<HelperSummary>,
@@ -1381,15 +1589,27 @@ impl SourceIndexCollector {
             let Some(init) = &declarator.init else {
                 continue;
             };
-            if let Some(values) = finite_strings_from_expression(init, &self.finite_constants) {
+            if let Some(values) = finite_strings_from_expression(
+                init,
+                &self.finite_constants,
+                &self.finite_object_maps,
+            ) {
                 self.record_finite_constant(name, values);
             }
             if let Some(values) = finite_iterable_from_expression(
                 init,
                 &self.finite_constants,
                 &self.finite_iterables,
+                &self.finite_object_maps,
             ) {
                 self.record_finite_iterable(name, values);
+            }
+            if let Some(values) = finite_object_map_from_expression(
+                init,
+                &self.finite_constants,
+                &self.finite_object_maps,
+            ) {
+                self.finite_object_maps.insert(name.to_string(), values);
             }
         }
     }
@@ -1465,6 +1685,7 @@ impl SourceIndexCollector {
                     array.elements.iter(),
                     &self.finite_constants,
                     &self.finite_iterables,
+                    &self.finite_object_maps,
                 );
             }
             _ => {}
@@ -1524,17 +1745,27 @@ impl<'a> Visit<'a> for SourceIndexCollector {
         if let Some(name) = binding_identifier_name(&declarator.id) {
             if let Some(init) = &declarator.init {
                 if declarator.kind == VariableDeclarationKind::Const {
-                    if let Some(values) =
-                        finite_strings_from_expression(init, &self.finite_constants)
-                    {
+                    if let Some(values) = finite_strings_from_expression(
+                        init,
+                        &self.finite_constants,
+                        &self.finite_object_maps,
+                    ) {
                         self.record_finite_constant(name, values);
                     }
                     if let Some(values) = finite_iterable_from_expression(
                         init,
                         &self.finite_constants,
                         &self.finite_iterables,
+                        &self.finite_object_maps,
                     ) {
                         self.record_finite_iterable(name, values);
+                    }
+                    if let Some(values) = finite_object_map_from_expression(
+                        init,
+                        &self.finite_constants,
+                        &self.finite_object_maps,
+                    ) {
+                        self.finite_object_maps.insert(name.to_string(), values);
                     }
                 }
                 if let Some(summary) = helper_summary_from_expression(init) {
@@ -1583,6 +1814,7 @@ impl SourceUsageCollector {
             get_extracted: BTreeSet::new(),
             finite_constants: BTreeMap::new(),
             finite_iterables: BTreeMap::new(),
+            finite_object_maps: BTreeMap::new(),
             translators: BTreeMap::new(),
             scan: UsageScan::default(),
         }
@@ -1694,6 +1926,7 @@ impl SourceUsageCollector {
                 expression,
                 &self.finite_constants,
                 &self.finite_iterables,
+                &self.finite_object_maps,
             ),
         }
     }
@@ -1903,20 +2136,29 @@ impl SourceUsageCollector {
     fn finite_strings_from_argument(&self, argument: &Argument<'_>) -> Option<FiniteStrings> {
         match argument {
             Argument::CallExpression(call) => self.finite_strings_from_call(call),
-            _ => finite_strings_from_argument(argument, &self.finite_constants),
+            _ => finite_strings_from_argument(
+                argument,
+                &self.finite_constants,
+                &self.finite_object_maps,
+            ),
         }
     }
 
     fn finite_strings_from_expression(&self, expression: &Expression<'_>) -> Option<FiniteStrings> {
         match expression.get_inner_expression() {
             Expression::CallExpression(call) => self.finite_strings_from_call(call),
-            _ => finite_strings_from_expression(expression, &self.finite_constants),
+            _ => finite_strings_from_expression(
+                expression,
+                &self.finite_constants,
+                &self.finite_object_maps,
+            ),
         }
     }
 
     fn finite_strings_from_call(&self, call: &CallExpression<'_>) -> Option<FiniteStrings> {
-        self.return_helper_for_callee(&call.callee)
-            .or_else(|| finite_strings_from_call(call, &self.finite_constants))
+        self.return_helper_for_callee(&call.callee).or_else(|| {
+            finite_strings_from_call(call, &self.finite_constants, &self.finite_object_maps)
+        })
     }
 
     fn with_finite_constant(
@@ -2043,6 +2285,13 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     }
                     if let Some(values) = self.finite_iterable_from_expression(init) {
                         self.finite_iterables.insert(name.to_string(), values);
+                    }
+                    if let Some(values) = finite_object_map_from_expression(
+                        init,
+                        &self.finite_constants,
+                        &self.finite_object_maps,
+                    ) {
+                        self.finite_object_maps.insert(name.to_string(), values);
                     }
                 }
             }
@@ -2244,6 +2493,78 @@ mod tests {
         assert!(scan.used_ids.contains("template.variables.types.number"));
         assert!(scan.used_ids.contains("template.variables.types.text"));
         assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_finite_object_map_unknown_lookup_values() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations();
+            const messageKeyByReason = {
+              blocked: 'notifications.errors.blocked',
+              denied: 'notifications.errors.denied',
+              registrationFailed: 'notifications.errors.registrationFailed',
+              unsupported: 'notifications.errors.unsupported',
+            } as const;
+            t(messageKeyByReason[error.reason]);
+            "#,
+        );
+        assert!(scan.used_ids.contains("notifications.errors.blocked"));
+        assert!(scan.used_ids.contains("notifications.errors.denied"));
+        assert!(
+            scan.used_ids
+                .contains("notifications.errors.registrationFailed")
+        );
+        assert!(scan.used_ids.contains("notifications.errors.unsupported"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_finite_object_map_specific_lookup_values() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('notifications');
+            const reason = failed ? 'registrationFailed' : 'unsupported';
+            const messageKeyByReason = {
+              blocked: 'errors.blocked',
+              denied: 'errors.denied',
+              registrationFailed: 'errors.registrationFailed',
+              unsupported: 'errors.unsupported',
+            };
+            t(messageKeyByReason[reason]);
+            t(messageKeyByReason.blocked);
+            "#,
+        );
+        assert!(scan.used_ids.contains("notifications.errors.blocked"));
+        assert!(!scan.used_ids.contains("notifications.errors.denied"));
+        assert!(
+            scan.used_ids
+                .contains("notifications.errors.registrationFailed")
+        );
+        assert!(scan.used_ids.contains("notifications.errors.unsupported"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn unresolved_object_map_stays_dynamic() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('notifications');
+            const messageKeyByReason = {
+              blocked: 'errors.blocked',
+              ...extraReasons,
+            };
+            t(messageKeyByReason[error.reason]);
+            "#,
+        );
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "notifications")
+        );
     }
 
     #[test]
@@ -2545,6 +2866,27 @@ mod tests {
         );
         assert!(scan.used_ids.contains("settings.first"));
         assert!(scan.used_ids.contains("settings.second"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn traces_helper_finite_object_map_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function helper(tx, reason) {
+              const messageKeyByReason = {
+                blocked: 'notifications.errors.blocked',
+                denied: 'notifications.errors.denied',
+              };
+              tx(messageKeyByReason[reason]);
+            }
+            const t = useTranslations();
+            helper(t, reason);
+            "#,
+        );
+        assert!(scan.used_ids.contains("notifications.errors.blocked"));
+        assert!(scan.used_ids.contains("notifications.errors.denied"));
         assert!(scan.dynamic_usages.is_empty());
     }
 
