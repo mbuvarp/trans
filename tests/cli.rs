@@ -993,6 +993,31 @@ fn unused_resolves_finite_map_callback_keys() {
 }
 
 #[test]
+fn unused_resolves_finite_iterated_string_transforms() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("template.variables.types.number", "Number"),
+            ("template.variables.types.text", "Text"),
+            ("template.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('template');\nconst VARIABLE_TYPES = ['NUMBER', 'TEXT'] as const;\nVARIABLE_TYPES.map(type => t(`variables.types.${type.toLowerCase()}`));\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("template.unused\n");
+}
+
+#[test]
 fn unused_traces_named_helper_import_from_relative_file() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(

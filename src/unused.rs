@@ -802,6 +802,7 @@ fn finite_strings_from_argument(
         Argument::StringLiteral(literal) => Some(finite_string(literal.value.to_string())),
         Argument::TemplateLiteral(literal) => finite_strings_from_template(literal, constants),
         Argument::Identifier(identifier) => constants.get(identifier.name.as_str()).cloned(),
+        Argument::CallExpression(call) => finite_strings_from_call(call, constants),
         Argument::ConditionalExpression(conditional) => {
             finite_strings_from_conditional(conditional, constants)
         }
@@ -835,6 +836,7 @@ fn finite_strings_from_expression(
         Expression::StringLiteral(literal) => Some(finite_string(literal.value.to_string())),
         Expression::TemplateLiteral(literal) => finite_strings_from_template(literal, constants),
         Expression::Identifier(identifier) => constants.get(identifier.name.as_str()).cloned(),
+        Expression::CallExpression(call) => finite_strings_from_call(call, constants),
         Expression::ConditionalExpression(conditional) => {
             finite_strings_from_conditional(conditional, constants)
         }
@@ -887,6 +889,7 @@ fn finite_strings_from_array_element(
         ArrayExpressionElement::Identifier(identifier) => {
             constants.get(identifier.name.as_str()).cloned()
         }
+        ArrayExpressionElement::CallExpression(call) => finite_strings_from_call(call, constants),
         ArrayExpressionElement::ConditionalExpression(conditional) => {
             finite_strings_from_conditional(conditional, constants)
         }
@@ -915,6 +918,36 @@ fn finite_strings_from_array_element(
         }
         _ => None,
     }
+}
+
+fn finite_strings_from_call(
+    call: &CallExpression<'_>,
+    constants: &BTreeMap<String, FiniteStrings>,
+) -> Option<FiniteStrings> {
+    if !call.arguments.is_empty() {
+        return None;
+    }
+
+    let member = call.callee.get_member_expr()?;
+    let method = member.static_property_name()?;
+    let values = finite_strings_from_expression(member.object(), constants)?;
+
+    transform_finite_strings(values, &method)
+}
+
+fn transform_finite_strings(values: FiniteStrings, method: &str) -> Option<FiniteStrings> {
+    let transformed = match method {
+        "toLowerCase" => values
+            .into_iter()
+            .map(|value| value.to_lowercase())
+            .collect(),
+        "toUpperCase" => values
+            .into_iter()
+            .map(|value| value.to_uppercase())
+            .collect(),
+        _ => return None,
+    };
+    Some(transformed)
 }
 
 fn finite_strings_from_conditional(
@@ -1910,6 +1943,53 @@ mod tests {
         assert!(scan.used_ids.contains("files.labels.long"));
         assert!(scan.used_ids.contains("files.labels.short"));
         assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_finite_string_transforms() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('template');
+            const type = compact ? 'NUMBER' : 'TEXT';
+            t(`variables.types.${type.toLowerCase()}`);
+            "#,
+        );
+        assert!(scan.used_ids.contains("template.variables.types.number"));
+        assert!(scan.used_ids.contains("template.variables.types.text"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_finite_iterated_string_transforms() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('template');
+            const VARIABLE_TYPES = ['NUMBER', 'TEXT'] as const;
+            VARIABLE_TYPES.map(type => t(`variables.types.${type.toLowerCase()}`));
+            "#,
+        );
+        assert!(scan.used_ids.contains("template.variables.types.number"));
+        assert!(scan.used_ids.contains("template.variables.types.text"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn unsupported_string_transform_stays_dynamic() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('template');
+            const type = 'number';
+            t(type.trim());
+            "#,
+        );
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "template")
+        );
     }
 
     #[test]
