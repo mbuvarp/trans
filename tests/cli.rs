@@ -1018,6 +1018,66 @@ fn unused_resolves_finite_iterated_string_transforms() {
 }
 
 #[test]
+fn unused_resolves_imported_finite_iterable_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("relation.parent", "Parent"),
+            ("relation.child", "Child"),
+            ("relation.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("relations.ts"),
+        "export const RELATIONS = ['parent', 'child'] as const;\n",
+    )
+    .expect("write values");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {RELATIONS} from './relations';\nconst t = useTranslations('relation');\nRELATIONS.map(relation => t(relation));\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("relation.unused\n");
+}
+
+#[test]
+fn unused_resolves_export_specifier_finite_iterable_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("relation.parent", "Parent"),
+            ("relation.child", "Child"),
+            ("relation.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("relations.ts"),
+        "const RELATIONS = ['parent', 'child'] as const;\nexport { RELATIONS };\n",
+    )
+    .expect("write values");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {RELATIONS} from './relations';\nconst t = useTranslations('relation');\nfor (const relation of RELATIONS) { t(relation); }\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("relation.unused\n");
+}
+
+#[test]
 fn unused_resolves_imported_finite_return_helper_keys() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(

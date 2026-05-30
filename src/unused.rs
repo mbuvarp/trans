@@ -89,8 +89,10 @@ struct SourceFileIndex {
     return_helpers: BTreeMap<String, FiniteStrings>,
     named_exports: BTreeMap<String, HelperSummary>,
     named_return_exports: BTreeMap<String, FiniteStrings>,
+    named_iterable_exports: BTreeMap<String, FiniteStrings>,
     default_export: Option<HelperSummary>,
     default_return_export: Option<FiniteStrings>,
+    default_iterable_export: Option<FiniteStrings>,
 }
 
 #[derive(Debug, Clone)]
@@ -492,6 +494,19 @@ impl ProjectIndex {
         match &target.imported {
             ImportedName::Named(name) => file.named_return_exports.get(name).cloned(),
             ImportedName::Default => file.default_return_export.clone(),
+        }
+    }
+
+    fn finite_iterable_for_import(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+    ) -> Option<FiniteStrings> {
+        let path = self.resolve_module(from, &target.source)?;
+        let file = self.files.get(&path)?;
+        match &target.imported {
+            ImportedName::Named(name) => file.named_iterable_exports.get(name).cloned(),
+            ImportedName::Default => file.default_iterable_export.clone(),
         }
     }
 
@@ -1266,22 +1281,29 @@ struct SourceIndexCollector {
     imports: BTreeMap<String, ImportTarget>,
     helpers: BTreeMap<String, HelperSummary>,
     return_helpers: BTreeMap<String, FiniteStrings>,
+    finite_constants: BTreeMap<String, FiniteStrings>,
+    finite_iterables: BTreeMap<String, FiniteStrings>,
     export_locals: BTreeMap<String, String>,
     default_local: Option<String>,
     default_summary: Option<HelperSummary>,
     default_return_summary: Option<FiniteStrings>,
+    default_iterable_summary: Option<FiniteStrings>,
 }
 
 impl SourceIndexCollector {
     fn finish(self) -> SourceFileIndex {
         let mut named_exports = BTreeMap::new();
         let mut named_return_exports = BTreeMap::new();
+        let mut named_iterable_exports = BTreeMap::new();
         for (exported, local) in self.export_locals {
             if let Some(summary) = self.helpers.get(&local) {
                 named_exports.insert(exported.clone(), summary.clone());
             }
             if let Some(summary) = self.return_helpers.get(&local) {
-                named_return_exports.insert(exported, summary.clone());
+                named_return_exports.insert(exported.clone(), summary.clone());
+            }
+            if let Some(values) = self.finite_iterables.get(&local) {
+                named_iterable_exports.insert(exported, values.clone());
             }
         }
 
@@ -1296,6 +1318,11 @@ impl SourceIndexCollector {
                 .as_ref()
                 .and_then(|name| self.return_helpers.get(name).cloned())
         });
+        let default_iterable_export = self.default_iterable_summary.or_else(|| {
+            default_local
+                .as_ref()
+                .and_then(|name| self.finite_iterables.get(name).cloned())
+        });
 
         SourceFileIndex {
             imports: self.imports,
@@ -1303,8 +1330,10 @@ impl SourceIndexCollector {
             return_helpers: self.return_helpers,
             named_exports,
             named_return_exports,
+            named_iterable_exports,
             default_export,
             default_return_export,
+            default_iterable_export,
         }
     }
 
@@ -1314,6 +1343,14 @@ impl SourceIndexCollector {
 
     fn record_return_helper(&mut self, name: &str, summary: FiniteStrings) {
         self.return_helpers.insert(name.to_string(), summary);
+    }
+
+    fn record_finite_constant(&mut self, name: &str, values: FiniteStrings) {
+        self.finite_constants.insert(name.to_string(), values);
+    }
+
+    fn record_finite_iterable(&mut self, name: &str, values: FiniteStrings) {
+        self.finite_iterables.insert(name.to_string(), values);
     }
 
     fn record_variable_helpers(&mut self, declaration: &VariableDeclaration<'_>) {
@@ -1329,6 +1366,30 @@ impl SourceIndexCollector {
             }
             if let Some(summary) = finite_return_summary_from_expression(init) {
                 self.record_return_helper(name, summary);
+            }
+        }
+    }
+
+    fn record_variable_finite_values(&mut self, declaration: &VariableDeclaration<'_>) {
+        if declaration.kind != VariableDeclarationKind::Const {
+            return;
+        }
+        for declarator in &declaration.declarations {
+            let Some(name) = binding_identifier_name(&declarator.id) else {
+                continue;
+            };
+            let Some(init) = &declarator.init else {
+                continue;
+            };
+            if let Some(values) = finite_strings_from_expression(init, &self.finite_constants) {
+                self.record_finite_constant(name, values);
+            }
+            if let Some(values) = finite_iterable_from_expression(
+                init,
+                &self.finite_constants,
+                &self.finite_iterables,
+            ) {
+                self.record_finite_iterable(name, values);
             }
         }
     }
@@ -1399,6 +1460,13 @@ impl SourceIndexCollector {
                 self.default_summary = helper_summary_from_function(function);
                 self.default_return_summary = finite_return_summary_from_function(function);
             }
+            ExportDefaultDeclarationKind::ArrayExpression(array) => {
+                self.default_iterable_summary = finite_iterable_from_array_elements(
+                    array.elements.iter(),
+                    &self.finite_constants,
+                    &self.finite_iterables,
+                );
+            }
             _ => {}
         }
     }
@@ -1455,6 +1523,20 @@ impl<'a> Visit<'a> for SourceIndexCollector {
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
         if let Some(name) = binding_identifier_name(&declarator.id) {
             if let Some(init) = &declarator.init {
+                if declarator.kind == VariableDeclarationKind::Const {
+                    if let Some(values) =
+                        finite_strings_from_expression(init, &self.finite_constants)
+                    {
+                        self.record_finite_constant(name, values);
+                    }
+                    if let Some(values) = finite_iterable_from_expression(
+                        init,
+                        &self.finite_constants,
+                        &self.finite_iterables,
+                    ) {
+                        self.record_finite_iterable(name, values);
+                    }
+                }
                 if let Some(summary) = helper_summary_from_expression(init) {
                     self.record_helper(name, summary);
                 }
@@ -1470,6 +1552,7 @@ impl<'a> Visit<'a> for SourceIndexCollector {
         if let Some(inner) = &declaration.declaration {
             self.record_export_declaration(inner);
             if let Declaration::VariableDeclaration(variable) = inner {
+                self.record_variable_finite_values(variable);
                 self.record_variable_helpers(variable);
             }
         }
@@ -1601,7 +1684,25 @@ impl SourceUsageCollector {
         &self,
         expression: &Expression<'_>,
     ) -> Option<FiniteStrings> {
-        finite_iterable_from_expression(expression, &self.finite_constants, &self.finite_iterables)
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => self
+                .finite_iterables
+                .get(identifier.name.as_str())
+                .cloned()
+                .or_else(|| self.finite_iterable_for_imported_identifier(identifier.name.as_str())),
+            _ => finite_iterable_from_expression(
+                expression,
+                &self.finite_constants,
+                &self.finite_iterables,
+            ),
+        }
+    }
+
+    fn finite_iterable_for_imported_identifier(&self, name: &str) -> Option<FiniteStrings> {
+        let target = self.file_index.as_ref()?.imports.get(name)?;
+        self.project
+            .as_ref()?
+            .finite_iterable_for_import(&self.path, target)
     }
 
     fn callee_identifier<'a>(&self, expression: &'a Expression<'a>) -> Option<&'a str> {
