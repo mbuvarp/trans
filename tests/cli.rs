@@ -968,6 +968,31 @@ fn unused_resolves_finite_conditional_key_variables() {
 }
 
 #[test]
+fn unused_resolves_finite_map_callback_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("template.tabs.overview.label", "Overview"),
+            ("template.tabs.variables.label", "Variables"),
+            ("template.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('template');\nconst TEMPLATE_TABS = ['overview', 'variables'] as const;\nTEMPLATE_TABS.map(tab => t(`tabs.${tab}.label`));\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("template.unused\n");
+}
+
+#[test]
 fn unused_traces_named_helper_import_from_relative_file() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(

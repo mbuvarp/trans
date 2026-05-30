@@ -5,11 +5,11 @@ use std::process::Command;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, ArrowFunctionExpression, BindingPattern, CallExpression, ConditionalExpression,
-    Declaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind, ExportNamedDeclaration,
-    Expression, Function, FunctionBody, ImportDeclaration, ImportDeclarationSpecifier,
-    ModuleExportName, ObjectPropertyKind, TemplateLiteral, VariableDeclaration,
-    VariableDeclarationKind, VariableDeclarator,
+    Argument, ArrayExpressionElement, ArrowFunctionExpression, BindingPattern, CallExpression,
+    ConditionalExpression, Declaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
+    ExportNamedDeclaration, Expression, ForOfStatement, ForStatementLeft, Function, FunctionBody,
+    ImportDeclaration, ImportDeclarationSpecifier, ModuleExportName, ObjectPropertyKind,
+    TemplateLiteral, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -692,6 +692,7 @@ struct SourceUsageCollector {
     use_extracted: BTreeSet<String>,
     get_extracted: BTreeSet<String>,
     finite_constants: BTreeMap<String, FiniteStrings>,
+    finite_iterables: BTreeMap<String, FiniteStrings>,
     translators: BTreeMap<String, TranslatorBinding>,
     scan: UsageScan,
 }
@@ -727,6 +728,7 @@ fn helper_summary_from_body(
     let mut collector = HelperBodyCollector {
         param_names,
         finite_constants: BTreeMap::new(),
+        finite_iterables: BTreeMap::new(),
         usages: Vec::new(),
     };
     for statement in &body.statements {
@@ -840,6 +842,81 @@ fn finite_strings_from_expression(
     }
 }
 
+fn finite_iterable_from_expression(
+    expression: &Expression<'_>,
+    constants: &BTreeMap<String, FiniteStrings>,
+    iterables: &BTreeMap<String, FiniteStrings>,
+) -> Option<FiniteStrings> {
+    match expression.get_inner_expression() {
+        Expression::ArrayExpression(array) => {
+            finite_iterable_from_array_elements(array.elements.iter(), constants, iterables)
+        }
+        Expression::Identifier(identifier) => iterables.get(identifier.name.as_str()).cloned(),
+        _ => None,
+    }
+}
+
+fn finite_iterable_from_array_elements<'a>(
+    elements: impl Iterator<Item = &'a ArrayExpressionElement<'a>>,
+    constants: &BTreeMap<String, FiniteStrings>,
+    iterables: &BTreeMap<String, FiniteStrings>,
+) -> Option<FiniteStrings> {
+    let mut values = BTreeSet::new();
+    for element in elements {
+        let element_values = finite_strings_from_array_element(element, constants, iterables)?;
+        values.extend(element_values);
+        if values.len() > MAX_FINITE_STRINGS {
+            return None;
+        }
+    }
+    Some(values)
+}
+
+fn finite_strings_from_array_element(
+    element: &ArrayExpressionElement<'_>,
+    constants: &BTreeMap<String, FiniteStrings>,
+    iterables: &BTreeMap<String, FiniteStrings>,
+) -> Option<FiniteStrings> {
+    match element {
+        ArrayExpressionElement::StringLiteral(literal) => {
+            Some(finite_string(literal.value.to_string()))
+        }
+        ArrayExpressionElement::TemplateLiteral(literal) => {
+            finite_strings_from_template(literal, constants)
+        }
+        ArrayExpressionElement::Identifier(identifier) => {
+            constants.get(identifier.name.as_str()).cloned()
+        }
+        ArrayExpressionElement::ConditionalExpression(conditional) => {
+            finite_strings_from_conditional(conditional, constants)
+        }
+        ArrayExpressionElement::ParenthesizedExpression(parenthesized) => {
+            finite_strings_from_expression(&parenthesized.expression, constants)
+        }
+        ArrayExpressionElement::TSAsExpression(expression) => {
+            finite_iterable_from_expression(&expression.expression, constants, iterables)
+                .or_else(|| finite_strings_from_expression(&expression.expression, constants))
+        }
+        ArrayExpressionElement::TSSatisfiesExpression(expression) => {
+            finite_iterable_from_expression(&expression.expression, constants, iterables)
+                .or_else(|| finite_strings_from_expression(&expression.expression, constants))
+        }
+        ArrayExpressionElement::TSNonNullExpression(expression) => {
+            finite_iterable_from_expression(&expression.expression, constants, iterables)
+                .or_else(|| finite_strings_from_expression(&expression.expression, constants))
+        }
+        ArrayExpressionElement::TSInstantiationExpression(expression) => {
+            finite_iterable_from_expression(&expression.expression, constants, iterables)
+                .or_else(|| finite_strings_from_expression(&expression.expression, constants))
+        }
+        ArrayExpressionElement::TSTypeAssertion(expression) => {
+            finite_iterable_from_expression(&expression.expression, constants, iterables)
+                .or_else(|| finite_strings_from_expression(&expression.expression, constants))
+        }
+        _ => None,
+    }
+}
+
 fn finite_strings_from_conditional(
     conditional: &ConditionalExpression<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
@@ -869,6 +946,7 @@ fn finite_strings_from_template(
 struct HelperBodyCollector {
     param_names: BTreeMap<String, usize>,
     finite_constants: BTreeMap<String, FiniteStrings>,
+    finite_iterables: BTreeMap<String, FiniteStrings>,
     usages: Vec<HelperParamUsage>,
 }
 
@@ -886,6 +964,101 @@ impl HelperBodyCollector {
         let object = member.object().get_identifier_reference()?;
         self.param_names.get(object.name.as_str()).copied()
     }
+
+    fn finite_iterable_from_expression(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<FiniteStrings> {
+        finite_iterable_from_expression(expression, &self.finite_constants, &self.finite_iterables)
+    }
+
+    fn with_finite_constant(
+        &mut self,
+        name: &str,
+        values: FiniteStrings,
+        visit: impl FnOnce(&mut Self),
+    ) {
+        let previous = self.finite_constants.insert(name.to_string(), values);
+        visit(self);
+        match previous {
+            Some(values) => {
+                self.finite_constants.insert(name.to_string(), values);
+            }
+            None => {
+                self.finite_constants.remove(name);
+            }
+        }
+    }
+
+    fn visit_finite_iteration_callback(
+        &mut self,
+        callback: &Argument<'_>,
+        values: FiniteStrings,
+    ) -> bool {
+        match callback {
+            Argument::ArrowFunctionExpression(arrow) => {
+                let Some(param) = arrow
+                    .params
+                    .items
+                    .first()
+                    .and_then(|param| binding_identifier_name(&param.pattern))
+                else {
+                    return false;
+                };
+                self.with_finite_constant(param, values, |collector| {
+                    walk::walk_arrow_function_expression(collector, arrow);
+                });
+                true
+            }
+            Argument::FunctionExpression(function) => {
+                let Some(param) = function
+                    .params
+                    .items
+                    .first()
+                    .and_then(|param| binding_identifier_name(&param.pattern))
+                else {
+                    return false;
+                };
+                self.with_finite_constant(param, values, |collector| {
+                    walk::walk_function(collector, function, ScopeFlags::Function);
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn visit_finite_iteration_call(&mut self, call: &CallExpression<'_>) -> bool {
+        let Some(member) = call.callee.get_member_expr() else {
+            return false;
+        };
+        let Some(method) = member.static_property_name() else {
+            return false;
+        };
+        if !matches!(method.as_ref(), "map" | "forEach") {
+            return false;
+        }
+        let Some(values) = self.finite_iterable_from_expression(member.object()) else {
+            return false;
+        };
+        let Some(callback) = call.arguments.first() else {
+            return false;
+        };
+        self.visit_finite_iteration_callback(callback, values)
+    }
+
+    fn for_of_binding_name<'a>(&self, statement: &'a ForOfStatement<'a>) -> Option<&'a str> {
+        match &statement.left {
+            ForStatementLeft::VariableDeclaration(declaration) => declaration
+                .declarations
+                .first()
+                .and_then(|declarator| binding_identifier_name(&declarator.id)),
+            ForStatementLeft::AssignmentTargetIdentifier(identifier) => {
+                Some(identifier.name.as_str())
+            }
+            _ => None,
+        }
+    }
 }
 
 impl<'a> Visit<'a> for HelperBodyCollector {
@@ -898,6 +1071,9 @@ impl<'a> Visit<'a> for HelperBodyCollector {
                     {
                         self.finite_constants.insert(name.to_string(), values);
                     }
+                    if let Some(values) = self.finite_iterable_from_expression(init) {
+                        self.finite_iterables.insert(name.to_string(), values);
+                    }
                 }
             }
         }
@@ -905,6 +1081,10 @@ impl<'a> Visit<'a> for HelperBodyCollector {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if self.visit_finite_iteration_call(call) {
+            return;
+        }
+
         if let Some(param_index) = self.callee_param_index(&call.callee) {
             let keys = call.arguments.first().and_then(|argument| {
                 finite_strings_from_argument(argument, &self.finite_constants)
@@ -917,6 +1097,20 @@ impl<'a> Visit<'a> for HelperBodyCollector {
     fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
 
     fn visit_arrow_function_expression(&mut self, _arrow: &ArrowFunctionExpression<'a>) {}
+
+    fn visit_for_of_statement(&mut self, statement: &ForOfStatement<'a>) {
+        let Some(values) = self.finite_iterable_from_expression(&statement.right) else {
+            walk::walk_for_of_statement(self, statement);
+            return;
+        };
+        let Some(binding) = self.for_of_binding_name(statement).map(str::to_string) else {
+            walk::walk_for_of_statement(self, statement);
+            return;
+        };
+        self.with_finite_constant(&binding, values, |collector| {
+            collector.visit_statement(&statement.body);
+        });
+    }
 }
 
 #[derive(Default)]
@@ -1120,6 +1314,7 @@ impl SourceUsageCollector {
             use_extracted: BTreeSet::new(),
             get_extracted: BTreeSet::new(),
             finite_constants: BTreeMap::new(),
+            finite_iterables: BTreeMap::new(),
             translators: BTreeMap::new(),
             scan: UsageScan::default(),
         }
@@ -1215,6 +1410,13 @@ impl SourceUsageCollector {
     fn string_from_expression(&self, expression: &Expression<'_>) -> Option<String> {
         finite_strings_from_expression(expression, &self.finite_constants)
             .and_then(|values| single_finite_string(&values))
+    }
+
+    fn finite_iterable_from_expression(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<FiniteStrings> {
+        finite_iterable_from_expression(expression, &self.finite_constants, &self.finite_iterables)
     }
 
     fn callee_identifier<'a>(&self, expression: &'a Expression<'a>) -> Option<&'a str> {
@@ -1396,6 +1598,94 @@ impl SourceUsageCollector {
             }
         }
     }
+
+    fn with_finite_constant(
+        &mut self,
+        name: &str,
+        values: FiniteStrings,
+        visit: impl FnOnce(&mut Self),
+    ) {
+        let previous = self.finite_constants.insert(name.to_string(), values);
+        visit(self);
+        match previous {
+            Some(values) => {
+                self.finite_constants.insert(name.to_string(), values);
+            }
+            None => {
+                self.finite_constants.remove(name);
+            }
+        }
+    }
+
+    fn visit_finite_iteration_callback(
+        &mut self,
+        callback: &Argument<'_>,
+        values: FiniteStrings,
+    ) -> bool {
+        match callback {
+            Argument::ArrowFunctionExpression(arrow) => {
+                let Some(param) = arrow
+                    .params
+                    .items
+                    .first()
+                    .and_then(|param| binding_identifier_name(&param.pattern))
+                else {
+                    return false;
+                };
+                self.with_finite_constant(param, values, |collector| {
+                    walk::walk_arrow_function_expression(collector, arrow);
+                });
+                true
+            }
+            Argument::FunctionExpression(function) => {
+                let Some(param) = function
+                    .params
+                    .items
+                    .first()
+                    .and_then(|param| binding_identifier_name(&param.pattern))
+                else {
+                    return false;
+                };
+                self.with_finite_constant(param, values, |collector| {
+                    walk::walk_function(collector, function, ScopeFlags::Function);
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn visit_finite_iteration_call(&mut self, call: &CallExpression<'_>) -> bool {
+        let Some(member) = call.callee.get_member_expr() else {
+            return false;
+        };
+        let Some(method) = member.static_property_name() else {
+            return false;
+        };
+        if !matches!(method.as_ref(), "map" | "forEach") {
+            return false;
+        }
+        let Some(values) = self.finite_iterable_from_expression(member.object()) else {
+            return false;
+        };
+        let Some(callback) = call.arguments.first() else {
+            return false;
+        };
+        self.visit_finite_iteration_callback(callback, values)
+    }
+
+    fn for_of_binding_name<'a>(&self, statement: &'a ForOfStatement<'a>) -> Option<&'a str> {
+        match &statement.left {
+            ForStatementLeft::VariableDeclaration(declaration) => declaration
+                .declarations
+                .first()
+                .and_then(|declarator| binding_identifier_name(&declarator.id)),
+            ForStatementLeft::AssignmentTargetIdentifier(identifier) => {
+                Some(identifier.name.as_str())
+            }
+            _ => None,
+        }
+    }
 }
 
 impl<'a> Visit<'a> for SourceUsageCollector {
@@ -1433,6 +1723,9 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     {
                         self.finite_constants.insert(name.to_string(), values);
                     }
+                    if let Some(values) = self.finite_iterable_from_expression(init) {
+                        self.finite_iterables.insert(name.to_string(), values);
+                    }
                 }
             }
 
@@ -1451,6 +1744,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if self.maybe_extraction_call(call) {
             self.record_extraction_usage();
+        }
+
+        if self.visit_finite_iteration_call(call) {
+            return;
         }
 
         if let Some(binding) = self.maybe_translator_call(&call.callee) {
@@ -1479,6 +1776,20 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         }
 
         walk::walk_call_expression(self, call);
+    }
+
+    fn visit_for_of_statement(&mut self, statement: &ForOfStatement<'a>) {
+        let Some(values) = self.finite_iterable_from_expression(&statement.right) else {
+            walk::walk_for_of_statement(self, statement);
+            return;
+        };
+        let Some(binding) = self.for_of_binding_name(statement).map(str::to_string) else {
+            walk::walk_for_of_statement(self, statement);
+            return;
+        };
+        self.with_finite_constant(&binding, values, |collector| {
+            collector.visit_statement(&statement.body);
+        });
     }
 }
 
@@ -1599,6 +1910,76 @@ mod tests {
         assert!(scan.used_ids.contains("files.labels.long"));
         assert!(scan.used_ids.contains("files.labels.short"));
         assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_finite_map_callback_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('template');
+            const TEMPLATE_TABS = ['overview', 'variables'] as const;
+            TEMPLATE_TABS.map(tab => t(`tabs.${tab}.label`));
+            "#,
+        );
+        assert!(scan.used_ids.contains("template.tabs.overview.label"));
+        assert!(scan.used_ids.contains("template.tabs.variables.label"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_finite_for_each_callback_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('settings');
+            (['REGULAR', 'ABSENCE'] as const).forEach(option => {
+              t(`timeTypes.categories.${option}`);
+            });
+            "#,
+        );
+        assert!(
+            scan.used_ids
+                .contains("settings.timeTypes.categories.REGULAR")
+        );
+        assert!(
+            scan.used_ids
+                .contains("settings.timeTypes.categories.ABSENCE")
+        );
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_finite_for_of_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('relation');
+            const RELATIONS = ['parent', 'child'] as const;
+            for (const relation of RELATIONS) {
+              t(relation);
+            }
+            "#,
+        );
+        assert!(scan.used_ids.contains("relation.parent"));
+        assert!(scan.used_ids.contains("relation.child"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn unresolved_iteration_stays_dynamic() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('template');
+            tabs.map(tab => t(`tabs.${tab}.label`));
+            "#,
+        );
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "template")
+        );
     }
 
     #[test]
@@ -1723,6 +2104,24 @@ mod tests {
         );
         assert!(scan.used_ids.contains("settings.long"));
         assert!(scan.used_ids.contains("settings.short"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn traces_helper_finite_iteration_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function helper(tx) {
+              const keys = ['first', 'second'] as const;
+              keys.forEach(key => tx(key));
+            }
+            const t = useTranslations('settings');
+            helper(t);
+            "#,
+        );
+        assert!(scan.used_ids.contains("settings.first"));
+        assert!(scan.used_ids.contains("settings.second"));
         assert!(scan.dynamic_usages.is_empty());
     }
 
