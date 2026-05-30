@@ -1235,6 +1235,36 @@ fn unused_resolves_imported_finite_return_helper_keys() {
 }
 
 #[test]
+fn unused_resolves_promise_all_destructured_imported_helper_translator() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("common.save", "Save"),
+            ("dashboard.sections.overview", "Overview"),
+            ("dashboard.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("dashboard-data.ts"),
+        "export function buildDashboardStateCopy(tDashboard) {\n  return {overview: tDashboard('sections.overview')};\n}\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {getTranslations} from 'next-intl/server';\nimport {buildDashboardStateCopy} from './dashboard-data';\nconst [{tenant}, tDashboard, tCommon] = await Promise.all([\n  params,\n  getTranslations('dashboard'),\n  getTranslations({locale, namespace: 'common'}),\n]);\nbuildDashboardStateCopy(tDashboard);\ntCommon('save');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("dashboard.unused\n");
+}
+
+#[test]
 fn unused_resolves_imported_finite_record_return_helper_keys() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(

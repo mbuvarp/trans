@@ -85,12 +85,14 @@ pub struct DynamicUsage {
 #[derive(Debug, Clone)]
 struct TranslatorBinding {
     namespace: Option<String>,
+    namespaces: Option<FiniteStrings>,
     dynamic_namespace: bool,
 }
 
 #[derive(Debug, Clone)]
 enum NamespaceArg {
     Scoped(String),
+    Finite(FiniteStrings),
     Unscoped,
     Dynamic,
 }
@@ -1321,6 +1323,45 @@ fn binding_identifier_name<'a>(pattern: &'a BindingPattern<'a>) -> Option<&'a st
         BindingPattern::BindingIdentifier(identifier) => Some(identifier.name.as_str()),
         BindingPattern::AssignmentPattern(assignment) => binding_identifier_name(&assignment.left),
         _ => None,
+    }
+}
+
+fn namespace_arg_from_finite_strings(values: FiniteStrings) -> NamespaceArg {
+    let mut values = values.into_iter();
+    let Some(first) = values.next() else {
+        return NamespaceArg::Dynamic;
+    };
+    let Some(second) = values.next() else {
+        return NamespaceArg::Scoped(first);
+    };
+    let mut namespaces = finite_string(first);
+    namespaces.insert(second);
+    namespaces.extend(values);
+    NamespaceArg::Finite(namespaces)
+}
+
+fn translator_binding_from_namespace_arg(namespace: NamespaceArg) -> TranslatorBinding {
+    match namespace {
+        NamespaceArg::Scoped(namespace) => TranslatorBinding {
+            namespace: Some(namespace),
+            namespaces: None,
+            dynamic_namespace: false,
+        },
+        NamespaceArg::Finite(namespaces) => TranslatorBinding {
+            namespace: None,
+            namespaces: Some(namespaces),
+            dynamic_namespace: false,
+        },
+        NamespaceArg::Unscoped => TranslatorBinding {
+            namespace: None,
+            namespaces: None,
+            dynamic_namespace: false,
+        },
+        NamespaceArg::Dynamic => TranslatorBinding {
+            namespace: None,
+            namespaces: None,
+            dynamic_namespace: true,
+        },
     }
 }
 
@@ -4104,6 +4145,9 @@ impl SourceUsageCollector {
         if let Some(value) = self.string_from_argument(first) {
             return NamespaceArg::Scoped(value);
         }
+        if let Some(values) = self.finite_strings_from_argument(first) {
+            return namespace_arg_from_finite_strings(values);
+        }
 
         match first {
             Argument::ObjectExpression(object) => {
@@ -4116,9 +4160,12 @@ impl SourceUsageCollector {
                                 .static_name()
                                 .is_some_and(|name| name == "namespace")
                             {
+                                if let Some(value) = self.string_from_expression(&property.value) {
+                                    return NamespaceArg::Scoped(value);
+                                }
                                 return self
-                                    .string_from_expression(&property.value)
-                                    .map(NamespaceArg::Scoped)
+                                    .finite_strings_from_expression(&property.value)
+                                    .map(namespace_arg_from_finite_strings)
                                     .unwrap_or(NamespaceArg::Dynamic);
                             }
                         }
@@ -4348,20 +4395,101 @@ impl SourceUsageCollector {
             return None;
         }
 
-        Some(match self.call_namespace(call) {
-            NamespaceArg::Scoped(namespace) => TranslatorBinding {
-                namespace: Some(namespace),
-                dynamic_namespace: false,
-            },
-            NamespaceArg::Unscoped => TranslatorBinding {
-                namespace: None,
-                dynamic_namespace: false,
-            },
-            NamespaceArg::Dynamic => TranslatorBinding {
-                namespace: None,
-                dynamic_namespace: true,
-            },
-        })
+        Some(translator_binding_from_namespace_arg(
+            self.call_namespace(call),
+        ))
+    }
+
+    fn bind_promise_all_translators(
+        &mut self,
+        pattern: &BindingPattern<'_>,
+        expression: &Expression<'_>,
+    ) {
+        let BindingPattern::ArrayPattern(pattern) = pattern else {
+            return;
+        };
+        let call = match expression.get_inner_expression() {
+            Expression::CallExpression(call) => call,
+            Expression::AwaitExpression(await_expression) => {
+                match await_expression.argument.get_inner_expression() {
+                    Expression::CallExpression(call) => call,
+                    _ => return,
+                }
+            }
+            _ => return,
+        };
+        if !self.is_promise_all_call(call) {
+            return;
+        }
+        let Some(Argument::ArrayExpression(array)) = call.arguments.first() else {
+            return;
+        };
+        for (index, binding_pattern) in pattern.elements.iter().enumerate() {
+            let Some(binding_pattern) = binding_pattern else {
+                continue;
+            };
+            let Some(element) = array.elements.get(index) else {
+                continue;
+            };
+            let Some(binding) = self.translator_binding_from_array_element(element) else {
+                continue;
+            };
+            self.bind_translator_pattern(binding_pattern, binding);
+        }
+    }
+
+    fn is_promise_all_call(&self, call: &CallExpression<'_>) -> bool {
+        let Some(member) = call.callee.get_member_expr() else {
+            return false;
+        };
+        member
+            .static_property_name()
+            .is_some_and(|method| method == "all")
+            && is_identifier_expression(member.object(), "Promise")
+    }
+
+    fn bind_translator_pattern(
+        &mut self,
+        pattern: &BindingPattern<'_>,
+        binding: TranslatorBinding,
+    ) {
+        if let Some(name) = binding_identifier_name(pattern) {
+            self.translators.insert(name.to_string(), binding);
+        }
+    }
+
+    fn translator_binding_from_array_element(
+        &self,
+        element: &ArrayExpressionElement<'_>,
+    ) -> Option<TranslatorBinding> {
+        match element {
+            ArrayExpressionElement::Identifier(identifier) => {
+                self.translators.get(identifier.name.as_str()).cloned()
+            }
+            ArrayExpressionElement::CallExpression(call) => self.translator_binding_from_call(call),
+            ArrayExpressionElement::AwaitExpression(await_expression) => {
+                self.translator_binding_from_expression(&await_expression.argument)
+            }
+            ArrayExpressionElement::ParenthesizedExpression(parenthesized) => {
+                self.translator_binding_from_expression(&parenthesized.expression)
+            }
+            ArrayExpressionElement::TSAsExpression(expression) => {
+                self.translator_binding_from_expression(&expression.expression)
+            }
+            ArrayExpressionElement::TSSatisfiesExpression(expression) => {
+                self.translator_binding_from_expression(&expression.expression)
+            }
+            ArrayExpressionElement::TSNonNullExpression(expression) => {
+                self.translator_binding_from_expression(&expression.expression)
+            }
+            ArrayExpressionElement::TSInstantiationExpression(expression) => {
+                self.translator_binding_from_expression(&expression.expression)
+            }
+            ArrayExpressionElement::TSTypeAssertion(expression) => {
+                self.translator_binding_from_expression(&expression.expression)
+            }
+            _ => None,
+        }
     }
 
     fn maybe_extraction_call(&self, call: &CallExpression<'_>) -> bool {
@@ -4463,20 +4591,55 @@ impl SourceUsageCollector {
             return None;
         }
 
-        Some(match self.call_namespace(call) {
-            NamespaceArg::Scoped(namespace) => TranslatorBinding {
-                namespace: Some(namespace),
-                dynamic_namespace: false,
-            },
-            NamespaceArg::Unscoped => TranslatorBinding {
-                namespace: None,
-                dynamic_namespace: false,
-            },
-            NamespaceArg::Dynamic => TranslatorBinding {
-                namespace: None,
-                dynamic_namespace: true,
-            },
-        })
+        Some(translator_binding_from_namespace_arg(
+            self.call_namespace(call),
+        ))
+    }
+
+    fn record_used_key_for_binding(&mut self, binding: &TranslatorBinding, key: &str) {
+        if let Some(namespaces) = &binding.namespaces {
+            for namespace in namespaces {
+                let id = if key.is_empty() {
+                    namespace.clone()
+                } else {
+                    format!("{namespace}.{key}")
+                };
+                self.scan.used_ids.insert(id);
+            }
+            return;
+        }
+
+        let id = match &binding.namespace {
+            Some(namespace) if key.is_empty() => namespace.clone(),
+            Some(namespace) => format!("{namespace}.{key}"),
+            None => key.to_string(),
+        };
+        self.scan.used_ids.insert(id);
+    }
+
+    fn record_dynamic_key_for_binding(
+        &mut self,
+        binding: &TranslatorBinding,
+        start: u32,
+        argument: Option<&Argument<'_>>,
+    ) {
+        if let Some(namespaces) = &binding.namespaces {
+            let namespaces: Vec<_> = namespaces.iter().cloned().collect();
+            for namespace in namespaces {
+                if let Some(argument) = argument {
+                    self.record_dynamic_key_usage(Some(&namespace), start, argument);
+                } else {
+                    self.record_dynamic_usage(Some(&namespace), start);
+                }
+            }
+            return;
+        }
+
+        if let Some(argument) = argument {
+            self.record_dynamic_key_usage(binding.namespace.as_deref(), start, argument);
+        } else {
+            self.record_dynamic_usage(binding.namespace.as_deref(), start);
+        }
     }
 
     fn apply_helper_summary(&mut self, call: &CallExpression<'_>, summary: &HelperSummary) {
@@ -4490,15 +4653,10 @@ impl SourceUsageCollector {
             match (&usage.keys, binding.dynamic_namespace) {
                 (Some(keys), false) => {
                     for key in keys {
-                        let id = match &binding.namespace {
-                            Some(namespace) if key.is_empty() => namespace.clone(),
-                            Some(namespace) => format!("{namespace}.{key}"),
-                            None => key.clone(),
-                        };
-                        self.scan.used_ids.insert(id);
+                        self.record_used_key_for_binding(&binding, key);
                     }
                 }
-                _ => self.record_dynamic_usage(binding.namespace.as_deref(), call.span.start),
+                _ => self.record_dynamic_key_for_binding(&binding, call.span.start, None),
             }
         }
     }
@@ -4506,7 +4664,7 @@ impl SourceUsageCollector {
     fn protect_translator_arguments(&mut self, call: &CallExpression<'_>) {
         for argument in &call.arguments {
             if let Some(binding) = self.translator_binding_from_argument(argument) {
-                self.record_dynamic_usage(binding.namespace.as_deref(), call.span.start);
+                self.record_dynamic_key_for_binding(&binding, call.span.start, None);
             }
         }
     }
@@ -4968,6 +5126,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             }
         }
 
+        if let Some(init) = &declarator.init {
+            self.bind_promise_all_translators(&declarator.id, init);
+        }
+
         if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
             let name = identifier.name.as_str();
             if declarator.kind == VariableDeclarationKind::Const {
@@ -5070,30 +5232,22 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             match keys {
                 Some(keys) if !binding.dynamic_namespace => {
                     for key in keys {
-                        let id = match &binding.namespace {
-                            Some(namespace) if key.is_empty() => namespace.clone(),
-                            Some(namespace) => format!("{namespace}.{key}"),
-                            None => key,
-                        };
-                        self.scan.used_ids.insert(id);
+                        self.record_used_key_for_binding(&binding, &key);
                     }
                 }
                 _ => {
                     if !binding.dynamic_namespace {
                         if let Some(argument) = call.arguments.first() {
-                            self.record_dynamic_key_usage(
-                                binding.namespace.as_deref(),
+                            self.record_dynamic_key_for_binding(
+                                &binding,
                                 call.span.start,
-                                argument,
+                                Some(argument),
                             );
                         } else {
-                            self.record_dynamic_usage(
-                                binding.namespace.as_deref(),
-                                call.span.start,
-                            );
+                            self.record_dynamic_key_for_binding(&binding, call.span.start, None);
                         }
                     } else {
-                        self.record_dynamic_usage(binding.namespace.as_deref(), call.span.start);
+                        self.record_dynamic_key_for_binding(&binding, call.span.start, None);
                     }
                 }
             }
@@ -5220,6 +5374,54 @@ mod tests {
         );
         assert!(scan.used_ids.contains("auth.login"));
         assert!(scan.used_ids.contains("metadata.title"));
+    }
+
+    #[test]
+    fn collects_promise_all_destructured_get_translations() {
+        let scan = scan(
+            r#"
+            import {getTranslations} from 'next-intl/server';
+            const [{tenant}, tDashboard, , tProjects, tEmptyPages] = await Promise.all([
+              params,
+              getTranslations('dashboard'),
+              getLocale(),
+              getTranslations({locale, namespace: 'projects.checklists'}),
+              getTranslations(
+                activeTab === 'templates'
+                  ? 'empty-pages.checklistTemplates'
+                  : 'empty-pages.checklists',
+              ),
+            ]);
+            tDashboard('labels.offer');
+            tProjects('ongoing');
+            tEmptyPages('header');
+            "#,
+        );
+        assert!(scan.used_ids.contains("dashboard.labels.offer"));
+        assert!(scan.used_ids.contains("projects.checklists.ongoing"));
+        assert!(
+            scan.used_ids
+                .contains("empty-pages.checklistTemplates.header")
+        );
+        assert!(scan.used_ids.contains("empty-pages.checklists.header"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn traces_helper_from_promise_all_destructured_get_translations() {
+        let scan = scan(
+            r#"
+            import {getTranslations} from 'next-intl/server';
+            function buildCopy(translate) {
+              translate('sections.overview');
+            }
+            const [tDashboard] = await Promise.all([
+              getTranslations('dashboard'),
+            ]);
+            buildCopy(tDashboard);
+            "#,
+        );
+        assert!(scan.used_ids.contains("dashboard.sections.overview"));
     }
 
     #[test]
