@@ -1110,26 +1110,98 @@ struct SourceUsageCollector {
     scan: UsageScan,
 }
 
-fn helper_summary_from_expression(expression: &Expression<'_>) -> Option<HelperSummary> {
+fn helper_summary_from_expression_with_context(
+    expression: &Expression<'_>,
+    finite_constants: &BTreeMap<String, FiniteStrings>,
+    finite_iterables: &BTreeMap<String, FiniteStrings>,
+    finite_object_maps: &FiniteObjectMaps,
+    finite_record_constants: &FiniteRecordBindings,
+    finite_record_iterables: &FiniteRecordBindings,
+    finite_record_maps: &FiniteRecordMaps,
+    enum_member_domains: &TypeDomains,
+) -> Option<HelperSummary> {
     match expression.get_inner_expression() {
-        Expression::ArrowFunctionExpression(arrow) => Some(helper_summary_from_arrow(arrow)),
-        Expression::FunctionExpression(function) => helper_summary_from_function(function),
+        Expression::ArrowFunctionExpression(arrow) => Some(helper_summary_from_arrow_with_context(
+            arrow,
+            finite_constants,
+            finite_iterables,
+            finite_object_maps,
+            finite_record_constants,
+            finite_record_iterables,
+            finite_record_maps,
+            enum_member_domains,
+        )),
+        Expression::FunctionExpression(function) => helper_summary_from_function_with_context(
+            function,
+            finite_constants,
+            finite_iterables,
+            finite_object_maps,
+            finite_record_constants,
+            finite_record_iterables,
+            finite_record_maps,
+            enum_member_domains,
+        ),
         _ => None,
     }
 }
 
-fn helper_summary_from_arrow(arrow: &ArrowFunctionExpression<'_>) -> HelperSummary {
-    helper_summary_from_body(&arrow.params, &arrow.body)
+fn helper_summary_from_arrow_with_context(
+    arrow: &ArrowFunctionExpression<'_>,
+    finite_constants: &BTreeMap<String, FiniteStrings>,
+    finite_iterables: &BTreeMap<String, FiniteStrings>,
+    finite_object_maps: &FiniteObjectMaps,
+    finite_record_constants: &FiniteRecordBindings,
+    finite_record_iterables: &FiniteRecordBindings,
+    finite_record_maps: &FiniteRecordMaps,
+    enum_member_domains: &TypeDomains,
+) -> HelperSummary {
+    helper_summary_from_body_with_context(
+        &arrow.params,
+        &arrow.body,
+        finite_constants,
+        finite_iterables,
+        finite_object_maps,
+        finite_record_constants,
+        finite_record_iterables,
+        finite_record_maps,
+        enum_member_domains,
+    )
 }
 
-fn helper_summary_from_function(function: &Function<'_>) -> Option<HelperSummary> {
+fn helper_summary_from_function_with_context(
+    function: &Function<'_>,
+    finite_constants: &BTreeMap<String, FiniteStrings>,
+    finite_iterables: &BTreeMap<String, FiniteStrings>,
+    finite_object_maps: &FiniteObjectMaps,
+    finite_record_constants: &FiniteRecordBindings,
+    finite_record_iterables: &FiniteRecordBindings,
+    finite_record_maps: &FiniteRecordMaps,
+    enum_member_domains: &TypeDomains,
+) -> Option<HelperSummary> {
     let body = function.body.as_ref()?;
-    Some(helper_summary_from_body(&function.params, body))
+    Some(helper_summary_from_body_with_context(
+        &function.params,
+        body,
+        finite_constants,
+        finite_iterables,
+        finite_object_maps,
+        finite_record_constants,
+        finite_record_iterables,
+        finite_record_maps,
+        enum_member_domains,
+    ))
 }
 
-fn helper_summary_from_body(
+fn helper_summary_from_body_with_context(
     params: &oxc_ast::ast::FormalParameters<'_>,
     body: &FunctionBody<'_>,
+    finite_constants: &BTreeMap<String, FiniteStrings>,
+    finite_iterables: &BTreeMap<String, FiniteStrings>,
+    finite_object_maps: &FiniteObjectMaps,
+    finite_record_constants: &FiniteRecordBindings,
+    finite_record_iterables: &FiniteRecordBindings,
+    finite_record_maps: &FiniteRecordMaps,
+    enum_member_domains: &TypeDomains,
 ) -> HelperSummary {
     let mut param_names = BTreeMap::new();
     for (index, parameter) in params.items.iter().enumerate() {
@@ -1140,13 +1212,13 @@ fn helper_summary_from_body(
 
     let mut collector = HelperBodyCollector {
         param_names,
-        finite_constants: BTreeMap::new(),
-        finite_iterables: BTreeMap::new(),
-        finite_object_maps: BTreeMap::new(),
-        finite_record_constants: BTreeMap::new(),
-        finite_record_iterables: BTreeMap::new(),
-        finite_record_maps: BTreeMap::new(),
-        enum_member_domains: BTreeMap::new(),
+        finite_constants: finite_constants.clone(),
+        finite_iterables: finite_iterables.clone(),
+        finite_object_maps: finite_object_maps.clone(),
+        finite_record_constants: finite_record_constants.clone(),
+        finite_record_iterables: finite_record_iterables.clone(),
+        finite_record_maps: finite_record_maps.clone(),
+        enum_member_domains: enum_member_domains.clone(),
         usages: Vec::new(),
     };
     for statement in &body.statements {
@@ -1213,6 +1285,7 @@ fn finite_record_return_summary_from_arrow(
         BTreeMap::new(),
         BTreeMap::new(),
         BTreeMap::new(),
+        BTreeMap::new(),
     )
 }
 
@@ -1220,6 +1293,7 @@ fn finite_record_return_summary_from_function(function: &Function<'_>) -> Option
     let body = function.body.as_ref()?;
     finite_record_return_summary_from_body(
         body,
+        BTreeMap::new(),
         BTreeMap::new(),
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1234,6 +1308,7 @@ fn finite_record_return_summary_from_function_with_context(
     constants: &BTreeMap<String, FiniteStrings>,
     iterables: &BTreeMap<String, FiniteStrings>,
     object_maps: &FiniteObjectMaps,
+    record_constants: &FiniteRecordBindings,
     record_iterables: &FiniteRecordBindings,
     record_maps: &FiniteRecordMaps,
     enum_member_domains: &TypeDomains,
@@ -1244,6 +1319,7 @@ fn finite_record_return_summary_from_function_with_context(
         constants.clone(),
         iterables.clone(),
         object_maps.clone(),
+        record_constants.clone(),
         record_iterables.clone(),
         record_maps.clone(),
         enum_member_domains.clone(),
@@ -1255,6 +1331,7 @@ fn finite_record_return_summary_from_body(
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
     finite_object_maps: FiniteObjectMaps,
+    finite_record_constants: FiniteRecordBindings,
     finite_record_iterables: FiniteRecordBindings,
     finite_record_maps: FiniteRecordMaps,
     enum_member_domains: TypeDomains,
@@ -1263,7 +1340,7 @@ fn finite_record_return_summary_from_body(
         finite_constants,
         finite_iterables,
         finite_object_maps,
-        finite_record_constants: BTreeMap::new(),
+        finite_record_constants,
         finite_record_iterables,
         finite_record_maps,
         enum_member_domains,
@@ -2143,6 +2220,7 @@ fn finite_records_from_callback_argument(
                 constants.clone(),
                 iterables.clone(),
                 object_maps.clone(),
+                BTreeMap::new(),
                 record_iterables.clone(),
                 record_maps.clone(),
                 enum_member_domains.clone(),
@@ -2153,6 +2231,7 @@ fn finite_records_from_callback_argument(
             constants.clone(),
             iterables.clone(),
             object_maps.clone(),
+            BTreeMap::new(),
             record_iterables.clone(),
             record_maps.clone(),
             enum_member_domains.clone(),
@@ -2496,16 +2575,52 @@ fn finite_record_from_expression(
         }
         Expression::LogicalExpression(logical) => {
             if logical.operator == LogicalOperator::Coalesce {
-                finite_record_from_expression(
+                let left = finite_record_from_expression(
                     &logical.left,
                     constants,
                     object_maps,
                     enum_member_domains,
                     record_iterables,
                     record_maps,
-                )
+                );
+                let right = finite_record_from_expression(
+                    &logical.right,
+                    constants,
+                    object_maps,
+                    enum_member_domains,
+                    record_iterables,
+                    record_maps,
+                );
+                match (left, right) {
+                    (Some(left), Some(right)) => merge_finite_records(left, right),
+                    (Some(values), None) | (None, Some(values)) => Some(values),
+                    (None, None) => None,
+                }
             } else {
                 None
+            }
+        }
+        Expression::ConditionalExpression(conditional) => {
+            let consequent = finite_record_from_expression(
+                &conditional.consequent,
+                constants,
+                object_maps,
+                enum_member_domains,
+                record_iterables,
+                record_maps,
+            );
+            let alternate = finite_record_from_expression(
+                &conditional.alternate,
+                constants,
+                object_maps,
+                enum_member_domains,
+                record_iterables,
+                record_maps,
+            );
+            match (consequent, alternate) {
+                (Some(consequent), Some(alternate)) => merge_finite_records(consequent, alternate),
+                (Some(values), None) | (None, Some(values)) => Some(values),
+                (None, None) => None,
             }
         }
         Expression::TSNonNullExpression(expression) => finite_record_from_expression(
@@ -2788,6 +2903,51 @@ impl HelperBodyCollector {
         }
     }
 
+    fn finite_record_from_expression(&self, expression: &Expression<'_>) -> Option<FiniteRecords> {
+        match expression.get_inner_expression() {
+            Expression::LogicalExpression(logical)
+                if logical.operator == LogicalOperator::Coalesce =>
+            {
+                let left = self.finite_record_from_expression(&logical.left);
+                let right = self.finite_record_from_expression(&logical.right);
+                return match (left, right) {
+                    (Some(left), Some(right)) => merge_finite_records(left, right),
+                    (Some(values), None) | (None, Some(values)) => Some(values),
+                    (None, None) => None,
+                };
+            }
+            Expression::ConditionalExpression(conditional) => {
+                let consequent = self.finite_record_from_expression(&conditional.consequent);
+                let alternate = self.finite_record_from_expression(&conditional.alternate);
+                return match (consequent, alternate) {
+                    (Some(consequent), Some(alternate)) => {
+                        merge_finite_records(consequent, alternate)
+                    }
+                    (Some(values), None) | (None, Some(values)) => Some(values),
+                    (None, None) => None,
+                };
+            }
+            _ => {}
+        }
+        finite_record_from_expression(
+            expression,
+            &self.finite_constants,
+            &self.finite_object_maps,
+            &self.enum_member_domains,
+            &self.finite_record_iterables,
+            &self.finite_record_maps,
+        )
+        .or_else(|| {
+            if let Expression::Identifier(identifier) = expression.get_inner_expression() {
+                self.finite_record_constants
+                    .get(identifier.name.as_str())
+                    .cloned()
+            } else {
+                None
+            }
+        })
+    }
+
     fn finite_strings_from_argument(&self, argument: &Argument<'_>) -> Option<FiniteStrings> {
         match argument {
             Argument::StaticMemberExpression(member) => {
@@ -3000,14 +3160,7 @@ impl<'a> Visit<'a> for HelperBodyCollector {
                         self.finite_record_iterables
                             .insert(name.to_string(), values);
                     }
-                    if let Some(values) = finite_record_from_expression(
-                        init,
-                        &self.finite_constants,
-                        &self.finite_object_maps,
-                        &self.enum_member_domains,
-                        &self.finite_record_iterables,
-                        &self.finite_record_maps,
-                    ) {
+                    if let Some(values) = self.finite_record_from_expression(init) {
                         self.finite_record_constants
                             .insert(name.to_string(), values);
                     }
@@ -3327,6 +3480,7 @@ struct SourceIndexCollector {
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
     finite_object_maps: FiniteObjectMaps,
+    finite_record_constants: FiniteRecordBindings,
     finite_record_iterables: FiniteRecordBindings,
     finite_record_maps: FiniteRecordMaps,
     return_record_helpers: BTreeMap<String, FiniteRecords>,
@@ -3435,6 +3589,11 @@ impl SourceIndexCollector {
             .insert(name.to_string(), values);
     }
 
+    fn record_finite_record_constant(&mut self, name: &str, values: FiniteRecords) {
+        self.finite_record_constants
+            .insert(name.to_string(), values);
+    }
+
     fn record_variable_helpers(&mut self, declaration: &VariableDeclaration<'_>) {
         for declarator in &declaration.declarations {
             let Some(name) = binding_identifier_name(&declarator.id) else {
@@ -3443,7 +3602,16 @@ impl SourceIndexCollector {
             let Some(init) = &declarator.init else {
                 continue;
             };
-            if let Some(summary) = helper_summary_from_expression(init) {
+            if let Some(summary) = helper_summary_from_expression_with_context(
+                init,
+                &self.finite_constants,
+                &self.finite_iterables,
+                &self.finite_object_maps,
+                &self.finite_record_constants,
+                &self.finite_record_iterables,
+                &self.finite_record_maps,
+                &self.enum_member_domains,
+            ) {
                 self.record_helper(name, summary);
             }
             if let Some(summary) = finite_return_summary_from_expression(init) {
@@ -3502,6 +3670,16 @@ impl SourceIndexCollector {
             ) {
                 self.record_finite_record_iterable(name, values);
             }
+            if let Some(values) = finite_record_from_expression(
+                init,
+                &self.finite_constants,
+                &self.finite_object_maps,
+                &self.enum_member_domains,
+                &self.finite_record_iterables,
+                &self.finite_record_maps,
+            ) {
+                self.record_finite_record_constant(name, values);
+            }
             if let Some(values) = finite_record_map_from_expression(
                 init,
                 &self.finite_constants,
@@ -3554,7 +3732,16 @@ impl SourceIndexCollector {
     fn record_default_export(&mut self, declaration: &ExportDefaultDeclaration<'_>) {
         match &declaration.declaration {
             ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
-                if let Some(summary) = helper_summary_from_function(function) {
+                if let Some(summary) = helper_summary_from_function_with_context(
+                    function,
+                    &self.finite_constants,
+                    &self.finite_iterables,
+                    &self.finite_object_maps,
+                    &self.finite_record_constants,
+                    &self.finite_record_iterables,
+                    &self.finite_record_maps,
+                    &self.enum_member_domains,
+                ) {
                     self.default_summary = Some(summary);
                 }
                 if let Some(summary) = finite_return_summary_from_function(function) {
@@ -3566,6 +3753,7 @@ impl SourceIndexCollector {
                         &self.finite_constants,
                         &self.finite_iterables,
                         &self.finite_object_maps,
+                        &self.finite_record_constants,
                         &self.finite_record_iterables,
                         &self.finite_record_maps,
                         &self.enum_member_domains,
@@ -3588,14 +3776,32 @@ impl SourceIndexCollector {
                 self.default_local = Some(identifier.name.to_string());
             }
             ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
-                self.default_summary = Some(helper_summary_from_arrow(arrow));
+                self.default_summary = Some(helper_summary_from_arrow_with_context(
+                    arrow,
+                    &self.finite_constants,
+                    &self.finite_iterables,
+                    &self.finite_object_maps,
+                    &self.finite_record_constants,
+                    &self.finite_record_iterables,
+                    &self.finite_record_maps,
+                    &self.enum_member_domains,
+                ));
                 self.default_return_summary = finite_return_summary_from_arrow(arrow);
                 if let Some(summary) = finite_record_return_summary_from_arrow(arrow) {
                     self.default_record_return_summary = Some(summary);
                 }
             }
             ExportDefaultDeclarationKind::FunctionExpression(function) => {
-                self.default_summary = helper_summary_from_function(function);
+                self.default_summary = helper_summary_from_function_with_context(
+                    function,
+                    &self.finite_constants,
+                    &self.finite_iterables,
+                    &self.finite_object_maps,
+                    &self.finite_record_constants,
+                    &self.finite_record_iterables,
+                    &self.finite_record_maps,
+                    &self.enum_member_domains,
+                );
                 self.default_return_summary = finite_return_summary_from_function(function);
                 if let Some(summary) = finite_record_return_summary_from_function(function) {
                     self.default_record_return_summary = Some(summary);
@@ -3661,7 +3867,16 @@ impl<'a> Visit<'a> for SourceIndexCollector {
 
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
         if let Some(id) = &function.id {
-            if let Some(summary) = helper_summary_from_function(function) {
+            if let Some(summary) = helper_summary_from_function_with_context(
+                function,
+                &self.finite_constants,
+                &self.finite_iterables,
+                &self.finite_object_maps,
+                &self.finite_record_constants,
+                &self.finite_record_iterables,
+                &self.finite_record_maps,
+                &self.enum_member_domains,
+            ) {
                 self.record_helper(id.name.as_str(), summary);
             }
             if let Some(summary) = finite_return_summary_from_function(function) {
@@ -3672,6 +3887,7 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                 &self.finite_constants,
                 &self.finite_iterables,
                 &self.finite_object_maps,
+                &self.finite_record_constants,
                 &self.finite_record_iterables,
                 &self.finite_record_maps,
                 &self.enum_member_domains,
@@ -3722,6 +3938,16 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                     ) {
                         self.record_finite_record_iterable(name, values);
                     }
+                    if let Some(values) = finite_record_from_expression(
+                        init,
+                        &self.finite_constants,
+                        &self.finite_object_maps,
+                        &self.enum_member_domains,
+                        &self.finite_record_iterables,
+                        &self.finite_record_maps,
+                    ) {
+                        self.record_finite_record_constant(name, values);
+                    }
                     if let Some(values) = finite_record_map_from_expression(
                         init,
                         &self.finite_constants,
@@ -3733,7 +3959,16 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                         self.finite_record_maps.insert(name.to_string(), values);
                     }
                 }
-                if let Some(summary) = helper_summary_from_expression(init) {
+                if let Some(summary) = helper_summary_from_expression_with_context(
+                    init,
+                    &self.finite_constants,
+                    &self.finite_iterables,
+                    &self.finite_object_maps,
+                    &self.finite_record_constants,
+                    &self.finite_record_iterables,
+                    &self.finite_record_maps,
+                    &self.enum_member_domains,
+                ) {
                     self.record_helper(name, summary);
                 }
                 if let Some(summary) = finite_return_summary_from_expression(init) {
@@ -6048,6 +6283,58 @@ mod tests {
         );
         assert!(scan.used_ids.contains("notifications.errors.blocked"));
         assert!(scan.used_ids.contains("notifications.errors.denied"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn traces_helper_keys_from_module_scope_object_map() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const labelKeyByStatus = {
+              CREATED: 'status-created',
+              SENT: 'status-sent',
+            } as const;
+            function getStatusLabel(status, translate) {
+              const labelKey = status === 'SENT' ? 'status-opened' : labelKeyByStatus[status];
+              return translate(labelKey);
+            }
+            const t = useTranslations('offers');
+            getStatusLabel(status, t);
+            "#,
+        );
+        assert!(scan.used_ids.contains("offers.status-created"));
+        assert!(scan.used_ids.contains("offers.status-sent"));
+        assert!(scan.used_ids.contains("offers.status-opened"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn traces_helper_keys_from_module_scope_record_lookup() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const statusViewByStatus = {
+              SENT: {labelKey: 'status.sent', className: 'sent'},
+              DECLINED: {labelKey: 'status.declined', className: 'declined'},
+            } as const;
+            const openedStatusView = {labelKey: 'opened', className: 'opened'} as const;
+            const draftStatusView = {labelKey: 'status.draft', className: 'draft'} as const;
+            function getStatusView(status, translate, firstOpenedAt) {
+              const view =
+                status === 'SENT' && firstOpenedAt
+                  ? openedStatusView
+                  : (statusViewByStatus[status] ?? draftStatusView);
+              return translate(view.labelKey);
+            }
+            const t = useTranslations('projects.offers');
+            getStatusView(status, t, firstOpenedAt);
+            "#,
+        );
+        assert!(scan.used_ids.contains("projects.offers.status.sent"));
+        assert!(scan.used_ids.contains("projects.offers.status.declined"));
+        assert!(scan.used_ids.contains("projects.offers.opened"));
+        assert!(scan.used_ids.contains("projects.offers.status.draft"));
         assert!(scan.dynamic_usages.is_empty());
     }
 

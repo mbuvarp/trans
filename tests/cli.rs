@@ -1265,6 +1265,33 @@ fn unused_resolves_promise_all_destructured_imported_helper_translator() {
 }
 
 #[test]
+fn unused_resolves_module_scope_helper_lookup_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.offers.opened", "Opened"),
+            ("projects.offers.status.declined", "Declined"),
+            ("projects.offers.status.draft", "Draft"),
+            ("projects.offers.status.sent", "Sent"),
+            ("projects.offers.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst statusViewByStatus = {\n  SENT: {labelKey: 'status.sent', className: 'sent'},\n  DECLINED: {labelKey: 'status.declined', className: 'declined'},\n} as const;\nconst openedStatusView = {labelKey: 'opened', className: 'opened'} as const;\nconst draftStatusView = {labelKey: 'status.draft', className: 'draft'} as const;\nfunction getStatusView(status, tProjectOffers, firstOpenedAt) {\n  const view = status === 'SENT' && firstOpenedAt ? openedStatusView : (statusViewByStatus[status] ?? draftStatusView);\n  return tProjectOffers(view.labelKey);\n}\nconst t = useTranslations('projects.offers');\ngetStatusView(status, t, firstOpenedAt);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("projects.offers.unused\n");
+}
+
+#[test]
 fn unused_resolves_imported_finite_record_return_helper_keys() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(
