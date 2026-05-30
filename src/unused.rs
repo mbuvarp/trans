@@ -2045,6 +2045,79 @@ fn finite_record_property_iterable(
     }
 }
 
+fn call_is_callback_value_wrapper(call: &CallExpression<'_>, name: &str) -> bool {
+    if call
+        .callee
+        .get_identifier_reference()
+        .is_some_and(|identifier| identifier.name.as_str() == name)
+    {
+        return true;
+    }
+
+    call.callee
+        .get_member_expr()
+        .and_then(|member| member.static_property_name())
+        .is_some_and(|property| property == name)
+}
+
+fn finite_records_from_callback_argument(
+    callback: &Argument<'_>,
+    constants: &BTreeMap<String, FiniteStrings>,
+    iterables: &BTreeMap<String, FiniteStrings>,
+    object_maps: &FiniteObjectMaps,
+    enum_member_domains: &TypeDomains,
+    record_iterables: &FiniteRecordBindings,
+    record_maps: &FiniteRecordMaps,
+) -> Option<FiniteRecords> {
+    match callback {
+        Argument::ArrowFunctionExpression(arrow) => {
+            if arrow.expression {
+                if let Some(Statement::ExpressionStatement(statement)) =
+                    arrow.body.statements.first()
+                {
+                    return finite_record_iterable_from_expression(
+                        &statement.expression,
+                        constants,
+                        object_maps,
+                        enum_member_domains,
+                        record_iterables,
+                        record_maps,
+                    )
+                    .or_else(|| {
+                        finite_record_from_expression(
+                            &statement.expression,
+                            constants,
+                            object_maps,
+                            enum_member_domains,
+                            record_iterables,
+                            record_maps,
+                        )
+                    });
+                }
+            }
+            finite_record_return_summary_from_body(
+                &arrow.body,
+                constants.clone(),
+                iterables.clone(),
+                object_maps.clone(),
+                record_iterables.clone(),
+                record_maps.clone(),
+                enum_member_domains.clone(),
+            )
+        }
+        Argument::FunctionExpression(function) => finite_record_return_summary_from_body(
+            function.body.as_ref()?,
+            constants.clone(),
+            iterables.clone(),
+            object_maps.clone(),
+            record_iterables.clone(),
+            record_maps.clone(),
+            enum_member_domains.clone(),
+        ),
+        _ => None,
+    }
+}
+
 fn finite_records_from_object_values(
     object: &ObjectExpression<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
@@ -2219,6 +2292,19 @@ fn finite_record_iterable_from_expression(
             finite_record_property_iterable(records, member.property.name.as_str())
         }
         Expression::CallExpression(call) => {
+            if call_is_callback_value_wrapper(call, "useMemo") {
+                return call.arguments.first().and_then(|callback| {
+                    finite_records_from_callback_argument(
+                        callback,
+                        constants,
+                        &BTreeMap::new(),
+                        object_maps,
+                        enum_member_domains,
+                        record_iterables,
+                        record_maps,
+                    )
+                });
+            }
             let member = call.callee.get_member_expr()?;
             let method = member.static_property_name()?;
             let records = finite_record_iterable_from_expression(
@@ -4186,6 +4272,20 @@ impl SourceUsageCollector {
         }
     }
 
+    fn finite_record_from_expression(&self, expression: &Expression<'_>) -> Option<FiniteRecords> {
+        self.return_record_helper_for_callee_from_expression(expression)
+            .or_else(|| {
+                finite_record_from_expression(
+                    expression,
+                    &self.finite_constants,
+                    &self.finite_object_maps,
+                    &self.enum_member_domains,
+                    &self.finite_record_iterables,
+                    &self.finite_record_maps,
+                )
+            })
+    }
+
     fn callee_identifier<'a>(&self, expression: &'a Expression<'a>) -> Option<&'a str> {
         expression
             .get_inner_expression()
@@ -4782,6 +4882,37 @@ impl SourceUsageCollector {
             }
         }
     }
+
+    fn bind_pattern_finite_record_properties(
+        &mut self,
+        pattern: &BindingPattern<'_>,
+        records: &FiniteRecords,
+    ) {
+        let BindingPattern::ObjectPattern(object) = pattern else {
+            return;
+        };
+        for property in &object.properties {
+            if property.computed {
+                continue;
+            }
+            let Some(property_name) = property.key.static_name() else {
+                continue;
+            };
+            let Some(binding_name) = binding_identifier_name(&property.value) else {
+                continue;
+            };
+            if let Some(values) = finite_record_property_strings(records, property_name.as_ref()) {
+                self.finite_constants
+                    .insert(binding_name.to_string(), values.clone());
+                self.finite_iterables
+                    .insert(binding_name.to_string(), values);
+            }
+            if let Some(values) = finite_record_property_iterable(records, property_name.as_ref()) {
+                self.finite_record_iterables
+                    .insert(binding_name.to_string(), values);
+            }
+        }
+    }
 }
 
 impl<'a> Visit<'a> for SourceUsageCollector {
@@ -4827,6 +4958,14 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     }
 
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if declarator.kind == VariableDeclarationKind::Const {
+            if let Some(init) = &declarator.init {
+                if let Some(records) = self.finite_record_from_expression(init) {
+                    self.bind_pattern_finite_record_properties(&declarator.id, &records);
+                }
+            }
+        }
+
         if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
             let name = identifier.name.as_str();
             if declarator.kind == VariableDeclarationKind::Const {
@@ -5811,6 +5950,33 @@ mod tests {
         );
         assert!(scan.used_ids.contains("offers.history.event-created"));
         assert!(scan.used_ids.contains("offers.history.event-sent"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_destructured_finite_record_iterable_from_hook_return() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            import {useTranslations} from 'next-intl';
+            const ITEMS = [
+              {id: 'home', labelKey: 'common.home'},
+              {id: 'offers', labelKey: 'common.offers'},
+            ];
+            function useFooterNavigationPreferences(itemIds) {
+              const visibleItems = useMemo(
+                () => ITEMS.filter(item => itemIds.includes(item.id)),
+                [itemIds],
+              );
+              return {visibleItems};
+            }
+            const t = useTranslations();
+            const {visibleItems} = useFooterNavigationPreferences(itemIds);
+            visibleItems.map(item => t(item.labelKey));
+            "#,
+        );
+        assert!(scan.used_ids.contains("common.home"));
+        assert!(scan.used_ids.contains("common.offers"));
         assert!(scan.dynamic_usages.is_empty());
     }
 

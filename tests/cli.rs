@@ -1329,6 +1329,37 @@ fn unused_resolves_imported_record_indexed_return_helper_keys() {
 }
 
 #[test]
+fn unused_resolves_hook_returned_record_iterable_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("common.home", "Home"),
+            ("common.offers", "Offers"),
+            ("common.projects", "Projects"),
+            ("common.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("footer-navigation.ts"),
+        "import {useMemo} from 'react';\nexport const FOOTER_NAV_ITEMS = [\n  {id: 'home', labelKey: 'common.home'},\n  {id: 'offers', labelKey: 'common.offers'},\n  {id: 'projects', labelKey: 'common.projects'},\n];\nexport function useFooterNavigationPreferences(itemIds: string[]) {\n  const visibleItems = useMemo(\n    () => FOOTER_NAV_ITEMS.filter(item => itemIds.includes(item.id)),\n    [itemIds],\n  );\n  return {visibleItems};\n}\n",
+    )
+    .expect("write nav hook");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {useFooterNavigationPreferences} from './footer-navigation';\nconst t = useTranslations();\nconst {visibleItems} = useFooterNavigationPreferences(itemIds);\nvisibleItems.map(item => t(item.labelKey));\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("common.unused\n");
+}
+
+#[test]
 fn unused_resolves_imported_finite_record_map_get_helper_keys() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(
