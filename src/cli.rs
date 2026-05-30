@@ -321,9 +321,21 @@ pub enum UnusedCommand {
     Remove {
         #[arg(
             long,
+            help = "Actually remove unused keys; required because unused removal is experimental"
+        )]
+        apply: bool,
+        #[arg(
+            long,
             help = "Remove unused keys even when dynamic translation key usage is detected"
         )]
         force: bool,
+        #[arg(
+            short = 'x',
+            long = "exclude",
+            value_name = "PATTERNS",
+            help = "Comma-separated unused key patterns to keep, supports * wildcards"
+        )]
+        exclude: Option<String>,
     },
 }
 

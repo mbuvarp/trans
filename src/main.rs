@@ -39,7 +39,10 @@ use trans::verify_ai::verify_with_ai;
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("Error: {err}");
+        match err {
+            TransError::CommandRefused(message) => eprintln!("{message}"),
+            err => eprintln!("Error: {err}"),
+        }
         process::exit(1);
     }
 }
@@ -508,12 +511,20 @@ fn run() -> Result<()> {
                     }
                     Ok(())
                 }
-                Some(UnusedCommand::Remove { force }) => {
+                Some(UnusedCommand::Remove {
+                    apply,
+                    force,
+                    exclude,
+                }) => {
+                    if !apply {
+                        return Err(TransError::CommandRefused(unused_remove_apply_warning()));
+                    }
                     let report = trans::unused::remove_unused_with_ts_checker(
                         &root,
                         &config,
                         force,
                         use_ts_checker,
+                        exclude.as_deref(),
                     )?;
                     for warning in &report.warnings {
                         eprintln!("Warning: {warning}");
@@ -604,6 +615,13 @@ fn format_find_match_kind(kind: FindMatchKind) -> String {
         FindMatchKind::Casing => style("casing").yellow().to_string(),
         FindMatchKind::Partial => style("partial").color256(208).to_string(),
     }
+}
+
+fn unused_remove_apply_warning() -> String {
+    format!(
+        "{} This feature is experimental. I cannot fully guarantee that there are no false positives. Run with --apply to remove unused keys.",
+        style("Warning!").color256(208).bold()
+    )
 }
 
 fn format_terminal_link(display: &str, url: &str) -> String {

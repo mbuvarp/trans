@@ -927,6 +927,24 @@ fn unused_fallback_scanner_excludes_generated_directories() {
 }
 
 #[test]
+fn unused_ignores_declaration_files() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(dir.path(), &[("app.declared", "Declared")]);
+    std::fs::write(
+        dir.path().join("schema.d.ts"),
+        "import {z} from 'zod';\nexport const Schema = z.object({message: z.string()});\n",
+    )
+    .expect("write declaration source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("unused")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Unused keys: 1 / 1 (100%)"));
+}
+
+#[test]
 fn unused_reports_dynamic_usage_locations() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(
@@ -1262,6 +1280,80 @@ fn unused_resolves_promise_all_destructured_imported_helper_translator() {
         .assert()
         .success()
         .stdout("dashboard.unused\n");
+}
+
+#[test]
+fn unused_traces_translator_calls_inside_nested_callbacks() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("settings.validation.required", "Required"),
+            ("settings.validation.mismatch", "Mismatch"),
+            ("settings.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nfunction createSchema(t) {\n  return z.object({name: z.string().min(1, t('validation.required'))}).superRefine((values, ctx) => {\n    ctx.addIssue({message: t('validation.mismatch')});\n  });\n}\nconst t = useTranslations('settings');\ncreateSchema(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_traces_message_keys_in_workspace_package_exports() {
+    let dir = tempdir().expect("tempdir");
+    let workspace = dir.path();
+    let app = workspace.join("apps/app");
+    let package = workspace.join("packages/pdf");
+    std::fs::create_dir_all(&app).expect("mkdir app");
+    std::fs::create_dir_all(package.join("lib/offers")).expect("mkdir package");
+    std::fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages:\n  - apps/*\n  - packages/*\n",
+    )
+    .expect("write workspace");
+    std::fs::write(
+        package.join("package.json"),
+        "{\n  \"name\": \"@workspace/pdf\",\n  \"exports\": {\n    \"./offers\": \"./lib/offers/index.ts\"\n  }\n}\n",
+    )
+    .expect("write package json");
+    std::fs::write(
+        package.join("lib/offers/index.ts"),
+        "export {buildOfferPdfLabels} from './offer-pdf';\n",
+    )
+    .expect("write package index");
+    std::fs::write(
+        package.join("lib/offers/offer-pdf.ts"),
+        "function getMessage(messages, key) { return messages[key]; }\nexport function buildOfferPdfLabels(messages) {\n  const label = key => getMessage(messages, key);\n  return {title: label('customer-offer.title')};\n}\n",
+    )
+    .expect("write package source");
+    setup_next_intl_project_with_keys(
+        &app,
+        &[
+            ("customer-offer.title", "Title"),
+            ("customer-offer.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        app.join("route.ts"),
+        "import {buildOfferPdfLabels} from '@workspace/pdf/offers';\nimport messages from './messages/en.json';\nbuildOfferPdfLabels(messages);\n",
+    )
+    .expect("write app source");
+
+    trans_cmd()
+        .current_dir(&app)
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("customer-offer.unused\n");
 }
 
 #[test]
@@ -1715,7 +1807,7 @@ fn unused_remove_removes_safe_unused_keys() {
 
     trans_cmd()
         .current_dir(dir.path())
-        .args(["unused", "remove"])
+        .args(["unused", "remove", "--apply"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
@@ -1727,6 +1819,144 @@ fn unused_remove_removes_safe_unused_keys() {
     assert!(en.contains_key("app.title"));
     assert!(!en.contains_key("app.unused"));
     assert!(!nb.contains_key("app.unused"));
+}
+
+#[test]
+fn unused_remove_requires_apply_before_deleting_keys() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("app.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "remove"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Warning!"))
+        .stderr(predicate::str::contains(
+            "This feature is experimental. I cannot fully guarantee that there are no false positives. Run with --apply to remove unused keys.",
+        ))
+        .stderr(predicate::str::contains("Error:").not());
+
+    let en = load_language_translations(dir.path(), &config, "en").expect("load en");
+    let nb = load_language_translations(dir.path(), &config, "nb").expect("load nb");
+    assert!(en.contains_key("app.unused"));
+    assert!(nb.contains_key("app.unused"));
+}
+
+#[test]
+fn unused_remove_excludes_exact_key_from_removal() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("app.title", "Title"),
+            ("app.keep", "Keep"),
+            ("app.remove", "Remove"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "remove", "--apply", "--exclude", "app.keep"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed 1 unused translation ids.",
+        ));
+
+    let en = load_language_translations(dir.path(), &config, "en").expect("load en");
+    let nb = load_language_translations(dir.path(), &config, "nb").expect("load nb");
+    assert!(en.contains_key("app.keep"));
+    assert!(nb.contains_key("app.keep"));
+    assert!(!en.contains_key("app.remove"));
+    assert!(!nb.contains_key("app.remove"));
+}
+
+#[test]
+fn unused_remove_excludes_wildcard_patterns_from_removal() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("app.title", "Title"),
+            ("common.none", "None"),
+            ("project.status.draft", "Draft"),
+            ("project.status.published", "Published"),
+            ("project.other", "Other"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args([
+            "unused",
+            "remove",
+            "--apply",
+            "-x",
+            "common.none, project.status.*",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed 1 unused translation ids.",
+        ));
+
+    let en = load_language_translations(dir.path(), &config, "en").expect("load en");
+    assert!(en.contains_key("common.none"));
+    assert!(en.contains_key("project.status.draft"));
+    assert!(en.contains_key("project.status.published"));
+    assert!(!en.contains_key("project.other"));
+}
+
+#[test]
+fn unused_remove_force_still_respects_exclude_patterns() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("app.keep", "Keep")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\nt(key);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args([
+            "unused",
+            "remove",
+            "--apply",
+            "--force",
+            "--exclude",
+            "app.*",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed 0 unused translation ids.",
+        ));
+
+    let en = load_language_translations(dir.path(), &config, "en").expect("load en");
+    assert!(en.contains_key("app.keep"));
 }
 
 #[test]
@@ -1744,7 +1974,7 @@ fn unused_remove_refuses_dynamic_usage_without_force() {
 
     trans_cmd()
         .current_dir(dir.path())
-        .args(["unused", "remove"])
+        .args(["unused", "remove", "--apply"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -1767,7 +1997,7 @@ fn unused_remove_force_allows_dynamic_usage() {
 
     trans_cmd()
         .current_dir(dir.path())
-        .args(["unused", "remove", "--force"])
+        .args(["unused", "remove", "--apply", "--force"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
@@ -1791,7 +2021,7 @@ fn unused_remove_refuses_extraction_usage_even_with_force() {
 
     trans_cmd()
         .current_dir(dir.path())
-        .args(["unused", "remove", "--force"])
+        .args(["unused", "remove", "--apply", "--force"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(

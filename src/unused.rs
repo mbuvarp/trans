@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -20,6 +20,7 @@ use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::{operator::LogicalOperator, scope::ScopeFlags};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::config::{ConfigMode, TransConfig};
 use crate::error::{Result, TransError};
@@ -102,11 +103,14 @@ struct ProjectIndex {
     files: BTreeMap<PathBuf, SourceFileIndex>,
     source_files: BTreeSet<PathBuf>,
     aliases: PathAliases,
+    packages: WorkspacePackages,
 }
 
 #[derive(Debug, Clone, Default)]
 struct SourceFileIndex {
     imports: BTreeMap<String, ImportTarget>,
+    re_exports: BTreeMap<String, ImportTarget>,
+    dependency_sources: BTreeSet<String>,
     helpers: BTreeMap<String, HelperSummary>,
     return_helpers: BTreeMap<String, FiniteStrings>,
     return_record_helpers: BTreeMap<String, FiniteRecords>,
@@ -156,6 +160,18 @@ struct PathAlias {
     prefix: String,
     suffix: String,
     targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorkspacePackages {
+    packages: BTreeMap<String, WorkspacePackage>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspacePackage {
+    root: PathBuf,
+    exports: BTreeMap<String, String>,
+    main: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -383,7 +399,7 @@ pub fn remove_unused(
     config: &TransConfig,
     force: bool,
 ) -> Result<UnusedReport> {
-    remove_unused_with_ts_checker(root, config, force, true)
+    remove_unused_with_ts_checker(root, config, force, true, None)
 }
 
 pub fn remove_unused_with_ts_checker(
@@ -391,9 +407,10 @@ pub fn remove_unused_with_ts_checker(
     config: &TransConfig,
     force: bool,
     use_ts_checker: bool,
+    exclude: Option<&str>,
 ) -> Result<UnusedReport> {
     let root = root.as_ref();
-    let report = find_unused_with_options(root, config, !force, use_ts_checker)?;
+    let mut report = find_unused_with_options(root, config, !force, use_ts_checker)?;
 
     if report.extraction_usage_detected {
         return Err(TransError::InvalidInput(
@@ -405,6 +422,12 @@ pub fn remove_unused_with_ts_checker(
             "dynamic translation key usage detected; rerun with --force to remove anyway"
                 .to_string(),
         ));
+    }
+    let exclude_patterns = parse_unused_exclude_patterns(exclude)?;
+    if !exclude_patterns.is_empty() {
+        report
+            .unused_ids
+            .retain(|id| !exclude_patterns.iter().any(|pattern| pattern.matches(id)));
     }
     if report.unused_ids.is_empty() {
         return Ok(report);
@@ -433,6 +456,72 @@ pub fn remove_unused_with_ts_checker(
     }
 
     Ok(report)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnusedExcludePattern {
+    segments: Vec<String>,
+}
+
+impl UnusedExcludePattern {
+    fn new(pattern: &str) -> Self {
+        Self {
+            segments: pattern.split('*').map(ToOwned::to_owned).collect(),
+        }
+    }
+
+    fn matches(&self, id: &str) -> bool {
+        if self.segments.len() == 1 {
+            return self.segments[0] == id;
+        }
+
+        let mut rest = id;
+        let starts_with_wildcard = self.segments.first().is_some_and(String::is_empty);
+        let ends_with_wildcard = self.segments.last().is_some_and(String::is_empty);
+
+        for (index, segment) in self.segments.iter().enumerate() {
+            if segment.is_empty() {
+                continue;
+            }
+            if index == 0 && !starts_with_wildcard {
+                let Some(next_rest) = rest.strip_prefix(segment) else {
+                    return false;
+                };
+                rest = next_rest;
+                continue;
+            }
+
+            let Some(position) = rest.find(segment) else {
+                return false;
+            };
+            rest = &rest[position + segment.len()..];
+        }
+
+        ends_with_wildcard
+            || self
+                .segments
+                .last()
+                .is_none_or(|segment| rest.is_empty() || segment.is_empty())
+    }
+}
+
+fn parse_unused_exclude_patterns(exclude: Option<&str>) -> Result<Vec<UnusedExcludePattern>> {
+    let Some(exclude) = exclude else {
+        return Ok(Vec::new());
+    };
+
+    let mut patterns = Vec::new();
+    for pattern in exclude.split(',') {
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            return Err(TransError::InvalidInput(
+                "unused remove exclude patterns cannot be empty".to_string(),
+            ));
+        }
+        patterns.push(UnusedExcludePattern::new(pattern));
+    }
+
+    Ok(patterns)
 }
 
 fn find_unused_with_options(
@@ -544,7 +633,7 @@ fn file_url_path(path: &Path) -> String {
 fn collect_usage_from_files(root: &Path, paths: &[PathBuf]) -> Result<UsageScan> {
     let project = ProjectIndex::build(root, paths)?;
     let mut combined = UsageScan::default();
-    for path in paths {
+    for path in project.files.keys() {
         let source = fs::read_to_string(path)?;
         let scan = collect_usage_from_source_with_project(&source, path, Some(&project))?;
         combined.used_ids.extend(scan.used_ids);
@@ -690,6 +779,7 @@ fn collect_usage_from_source_with_project(
                 files,
                 source_files,
                 aliases: PathAliases::default(),
+                packages: WorkspacePackages::default(),
             };
             Some(&local_project)
         }
@@ -777,21 +867,55 @@ fn collect_source_files_fallback(dir: &Path, files: &mut Vec<PathBuf>) -> Result
 }
 
 fn is_source_file(path: &Path) -> bool {
+    if is_declaration_file(path) {
+        return false;
+    }
+
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| SOURCE_EXTENSIONS.contains(&extension))
 }
 
+fn is_declaration_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    file_name.ends_with(".d.ts") || file_name.ends_with(".d.mts") || file_name.ends_with(".d.cts")
+}
+
+fn is_allowed_source_file(path: &Path) -> bool {
+    path.is_file()
+        && is_source_file(path)
+        && !path.components().any(|component| {
+            let Component::Normal(name) = component else {
+                return false;
+            };
+            name.to_str()
+                .is_some_and(|name| FALLBACK_EXCLUDED_DIRS.contains(&name))
+        })
+}
+
 impl ProjectIndex {
     fn build(root: &Path, paths: &[PathBuf]) -> Result<Self> {
         let aliases = PathAliases::load(root);
-        let source_files: BTreeSet<PathBuf> = paths.iter().cloned().collect();
-        let mut files = BTreeMap::new();
+        let packages = WorkspacePackages::load(root);
+        let mut project = Self {
+            files: BTreeMap::new(),
+            source_files: paths.iter().map(|path| normalize_path(path)).collect(),
+            aliases,
+            packages,
+        };
+        let mut queue: VecDeque<PathBuf> = paths.iter().map(|path| normalize_path(path)).collect();
 
-        for path in paths {
-            let source = fs::read_to_string(path)?;
+        while let Some(path) = queue.pop_front() {
+            let path = normalize_path(&path);
+            if project.files.contains_key(&path) || !is_allowed_source_file(&path) {
+                continue;
+            }
+
+            let source = fs::read_to_string(&path)?;
             let allocator = Allocator::default();
-            let source_type = SourceType::from_path(path).unwrap_or_default();
+            let source_type = SourceType::from_path(&path).unwrap_or_default();
             let ret = Parser::new(&allocator, &source, source_type).parse();
             if !ret.errors.is_empty() {
                 return Err(TransError::InvalidInput(format!(
@@ -803,21 +927,50 @@ impl ProjectIndex {
 
             let mut collector = SourceIndexCollector::default();
             collector.visit_program(&ret.program);
-            files.insert(path.clone(), collector.finish());
+            let index = collector.finish();
+            let dependency_sources: Vec<_> = index.dependency_sources.iter().cloned().collect();
+            project.source_files.insert(path.clone());
+            project.files.insert(path.clone(), index);
+
+            for source in dependency_sources {
+                let Some(dependency) = project.resolve_module(&path, &source) else {
+                    continue;
+                };
+                if project.files.contains_key(&dependency)
+                    || project.source_files.contains(&dependency)
+                    || !is_allowed_source_file(&dependency)
+                {
+                    continue;
+                }
+                project.source_files.insert(dependency.clone());
+                queue.push_back(dependency);
+            }
         }
 
-        Ok(Self {
-            files,
-            source_files,
-            aliases,
-        })
+        Ok(project)
     }
 
     fn helper_for_import(&self, from: &Path, target: &ImportTarget) -> Option<HelperSummary> {
+        self.helper_for_import_at_depth(from, target, 0)
+    }
+
+    fn helper_for_import_at_depth(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+        depth: usize,
+    ) -> Option<HelperSummary> {
+        if depth > 16 {
+            return None;
+        }
         let path = self.resolve_module(from, &target.source)?;
         let file = self.files.get(&path)?;
         match &target.imported {
-            ImportedName::Named(name) => file.named_exports.get(name).cloned(),
+            ImportedName::Named(name) => file.named_exports.get(name).cloned().or_else(|| {
+                file.re_exports
+                    .get(name)
+                    .and_then(|target| self.helper_for_import_at_depth(&path, target, depth + 1))
+            }),
             ImportedName::Default => file.default_export.clone(),
         }
     }
@@ -827,10 +980,28 @@ impl ProjectIndex {
         from: &Path,
         target: &ImportTarget,
     ) -> Option<FiniteStrings> {
+        self.return_helper_for_import_at_depth(from, target, 0)
+    }
+
+    fn return_helper_for_import_at_depth(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+        depth: usize,
+    ) -> Option<FiniteStrings> {
+        if depth > 16 {
+            return None;
+        }
         let path = self.resolve_module(from, &target.source)?;
         let file = self.files.get(&path)?;
         match &target.imported {
-            ImportedName::Named(name) => file.named_return_exports.get(name).cloned(),
+            ImportedName::Named(name) => {
+                file.named_return_exports.get(name).cloned().or_else(|| {
+                    file.re_exports.get(name).and_then(|target| {
+                        self.return_helper_for_import_at_depth(&path, target, depth + 1)
+                    })
+                })
+            }
             ImportedName::Default => file.default_return_export.clone(),
         }
     }
@@ -840,10 +1011,28 @@ impl ProjectIndex {
         from: &Path,
         target: &ImportTarget,
     ) -> Option<FiniteStrings> {
+        self.finite_iterable_for_import_at_depth(from, target, 0)
+    }
+
+    fn finite_iterable_for_import_at_depth(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+        depth: usize,
+    ) -> Option<FiniteStrings> {
+        if depth > 16 {
+            return None;
+        }
         let path = self.resolve_module(from, &target.source)?;
         let file = self.files.get(&path)?;
         match &target.imported {
-            ImportedName::Named(name) => file.named_iterable_exports.get(name).cloned(),
+            ImportedName::Named(name) => {
+                file.named_iterable_exports.get(name).cloned().or_else(|| {
+                    file.re_exports.get(name).and_then(|target| {
+                        self.finite_iterable_for_import_at_depth(&path, target, depth + 1)
+                    })
+                })
+            }
             ImportedName::Default => file.default_iterable_export.clone(),
         }
     }
@@ -853,10 +1042,30 @@ impl ProjectIndex {
         from: &Path,
         target: &ImportTarget,
     ) -> Option<FiniteRecords> {
+        self.finite_record_iterable_for_import_at_depth(from, target, 0)
+    }
+
+    fn finite_record_iterable_for_import_at_depth(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+        depth: usize,
+    ) -> Option<FiniteRecords> {
+        if depth > 16 {
+            return None;
+        }
         let path = self.resolve_module(from, &target.source)?;
         let file = self.files.get(&path)?;
         match &target.imported {
-            ImportedName::Named(name) => file.named_record_iterable_exports.get(name).cloned(),
+            ImportedName::Named(name) => file
+                .named_record_iterable_exports
+                .get(name)
+                .cloned()
+                .or_else(|| {
+                    file.re_exports.get(name).and_then(|target| {
+                        self.finite_record_iterable_for_import_at_depth(&path, target, depth + 1)
+                    })
+                }),
             ImportedName::Default => file.default_record_iterable_export.clone(),
         }
     }
@@ -866,10 +1075,30 @@ impl ProjectIndex {
         from: &Path,
         target: &ImportTarget,
     ) -> Option<FiniteRecords> {
+        self.return_record_helper_for_import_at_depth(from, target, 0)
+    }
+
+    fn return_record_helper_for_import_at_depth(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+        depth: usize,
+    ) -> Option<FiniteRecords> {
+        if depth > 16 {
+            return None;
+        }
         let path = self.resolve_module(from, &target.source)?;
         let file = self.files.get(&path)?;
         match &target.imported {
-            ImportedName::Named(name) => file.named_record_return_exports.get(name).cloned(),
+            ImportedName::Named(name) => file
+                .named_record_return_exports
+                .get(name)
+                .cloned()
+                .or_else(|| {
+                    file.re_exports.get(name).and_then(|target| {
+                        self.return_record_helper_for_import_at_depth(&path, target, depth + 1)
+                    })
+                }),
             ImportedName::Default => file.default_record_return_export.clone(),
         }
     }
@@ -886,6 +1115,12 @@ impl ProjectIndex {
             }
         }
 
+        if let Some(candidate) = self.packages.expand(source) {
+            if let Some(path) = self.resolve_candidate(&candidate) {
+                return Some(path);
+            }
+        }
+
         None
     }
 
@@ -894,7 +1129,7 @@ impl ProjectIndex {
         candidates
             .into_iter()
             .map(|candidate| normalize_path(&candidate))
-            .find(|candidate| self.source_files.contains(candidate))
+            .find(|candidate| is_allowed_source_file(candidate))
     }
 }
 
@@ -973,6 +1208,158 @@ impl PathAliases {
 
         candidates
     }
+}
+
+impl WorkspacePackages {
+    fn load(root: &Path) -> Self {
+        let workspace_root = workspace_root(root).unwrap_or_else(|| root.to_path_buf());
+        let mut packages = BTreeMap::new();
+        collect_workspace_packages(&workspace_root, &mut packages);
+        Self { packages }
+    }
+
+    fn expand(&self, source: &str) -> Option<PathBuf> {
+        let (package_name, subpath) = split_package_source(source)?;
+        let package = self.packages.get(package_name)?;
+        let export_key = if subpath.is_empty() {
+            ".".to_string()
+        } else {
+            format!("./{subpath}")
+        };
+
+        package
+            .exports
+            .get(&export_key)
+            .map(|target| package.root.join(target))
+            .or_else(|| {
+                if subpath.is_empty() {
+                    package.main.as_ref().map(|main| package.root.join(main))
+                } else {
+                    Some(package.root.join(subpath))
+                }
+            })
+    }
+}
+
+fn workspace_root(root: &Path) -> Option<PathBuf> {
+    if let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
+        if output.status.success() {
+            let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+            if !path.as_os_str().is_empty() {
+                return Some(path);
+            }
+        }
+    }
+
+    root.ancestors()
+        .find(|ancestor| ancestor.join("pnpm-workspace.yaml").is_file())
+        .map(Path::to_path_buf)
+}
+
+fn collect_workspace_packages(root: &Path, packages: &mut BTreeMap<String, WorkspacePackage>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| FALLBACK_EXCLUDED_DIRS.contains(&name))
+            {
+                continue;
+            }
+            collect_workspace_packages(&path, packages);
+        } else if file_type.is_file() && path.file_name().is_some_and(|name| name == "package.json")
+        {
+            if let Some(package) = workspace_package_from_package_json(&path) {
+                packages.insert(package.0, package.1);
+            }
+        }
+    }
+}
+
+fn workspace_package_from_package_json(path: &Path) -> Option<(String, WorkspacePackage)> {
+    let contents = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&contents).ok()?;
+    let name = value.get("name")?.as_str()?.to_string();
+    let root = path.parent()?.to_path_buf();
+    let exports = value
+        .get("exports")
+        .map(package_exports)
+        .unwrap_or_default();
+    let main = value
+        .get("source")
+        .or_else(|| value.get("module"))
+        .or_else(|| value.get("main"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some((
+        name,
+        WorkspacePackage {
+            root,
+            exports,
+            main,
+        },
+    ))
+}
+
+fn package_exports(value: &Value) -> BTreeMap<String, String> {
+    let mut exports = BTreeMap::new();
+    match value {
+        Value::String(target) => {
+            exports.insert(".".to_string(), target.to_string());
+        }
+        Value::Object(object) => {
+            for (key, value) in object {
+                if !key.starts_with('.') {
+                    continue;
+                }
+                if let Some(target) = package_export_target(value) {
+                    exports.insert(key.to_string(), target);
+                }
+            }
+        }
+        _ => {}
+    }
+    exports
+}
+
+fn package_export_target(value: &Value) -> Option<String> {
+    match value {
+        Value::String(target) => Some(target.to_string()),
+        Value::Object(object) => ["source", "import", "default", "module", "require", "types"]
+            .into_iter()
+            .find_map(|key| object.get(key).and_then(package_export_target))
+            .or_else(|| object.values().find_map(package_export_target)),
+        _ => None,
+    }
+}
+
+fn split_package_source(source: &str) -> Option<(&str, &str)> {
+    if source.starts_with('.') || source.starts_with('/') {
+        return None;
+    }
+    if source.starts_with('@') {
+        let mut parts = source.splitn(3, '/');
+        let scope = parts.next()?;
+        let package = parts.next()?;
+        let rest = parts.next().unwrap_or_default();
+        let package_name_len = scope.len() + 1 + package.len();
+        return Some((&source[..package_name_len], rest));
+    }
+    let mut parts = source.splitn(2, '/');
+    let package = parts.next()?;
+    Some((package, parts.next().unwrap_or_default()))
 }
 
 fn module_candidates(base: &Path) -> Vec<PathBuf> {
@@ -2985,6 +3372,26 @@ impl HelperBodyCollector {
         }
     }
 
+    fn visit_callback_arguments(&mut self, call: &CallExpression<'_>) {
+        for argument in &call.arguments {
+            match argument {
+                Argument::ArrowFunctionExpression(arrow) => {
+                    for statement in &arrow.body.statements {
+                        self.visit_statement(statement);
+                    }
+                }
+                Argument::FunctionExpression(function) => {
+                    if let Some(body) = &function.body {
+                        for statement in &body.statements {
+                            self.visit_statement(statement);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn finite_iterable_from_expression(
         &self,
         expression: &Expression<'_>,
@@ -3322,6 +3729,7 @@ impl<'a> Visit<'a> for HelperBodyCollector {
                 .and_then(|argument| self.finite_strings_from_argument(argument));
             self.usages.push(HelperParamUsage { param_index, keys });
         }
+        self.visit_callback_arguments(call);
         walk::walk_call_expression(self, call);
     }
 
@@ -3601,6 +4009,8 @@ impl<'a> Visit<'a> for ReturnValueCollector {
 #[derive(Default)]
 struct SourceIndexCollector {
     imports: BTreeMap<String, ImportTarget>,
+    re_exports: BTreeMap<String, ImportTarget>,
+    dependency_sources: BTreeSet<String>,
     helpers: BTreeMap<String, HelperSummary>,
     return_helpers: BTreeMap<String, FiniteStrings>,
     finite_constants: BTreeMap<String, FiniteStrings>,
@@ -3674,6 +4084,8 @@ impl SourceIndexCollector {
 
         SourceFileIndex {
             imports: self.imports,
+            re_exports: self.re_exports,
+            dependency_sources: self.dependency_sources,
             helpers: self.helpers,
             return_helpers: self.return_helpers,
             return_record_helpers: self.return_record_helpers,
@@ -3841,7 +4253,28 @@ impl SourceIndexCollector {
     }
 
     fn record_export_specifiers(&mut self, declaration: &ExportNamedDeclaration<'_>) {
-        if declaration.source.is_some() {
+        if let Some(source) = &declaration.source {
+            let source = source.value.as_str();
+            self.dependency_sources.insert(source.to_string());
+            for specifier in &declaration.specifiers {
+                let Some(local) = module_export_name(&specifier.local) else {
+                    continue;
+                };
+                let Some(exported) = module_export_name(&specifier.exported) else {
+                    continue;
+                };
+                self.re_exports.insert(
+                    exported.to_string(),
+                    ImportTarget {
+                        source: source.to_string(),
+                        imported: if local == "default" {
+                            ImportedName::Default
+                        } else {
+                            ImportedName::Named(local.to_string())
+                        },
+                    },
+                );
+            }
             return;
         }
         for specifier in &declaration.specifiers {
@@ -3963,6 +4396,7 @@ impl<'a> Visit<'a> for SourceIndexCollector {
     fn visit_import_declaration(&mut self, declaration: &ImportDeclaration<'a>) {
         let source = declaration.source.value.as_str();
         if source != "next-intl" && source != "next-intl/server" {
+            self.dependency_sources.insert(source.to_string());
             if let Some(specifiers) = &declaration.specifiers {
                 for specifier in specifiers {
                     match specifier {
