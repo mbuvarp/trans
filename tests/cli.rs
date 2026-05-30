@@ -72,6 +72,17 @@ fn setup_next_intl_project(root: &std::path::Path) -> TransConfig {
     config
 }
 
+fn setup_next_intl_project_with_keys(root: &std::path::Path, keys: &[(&str, &str)]) -> TransConfig {
+    let mut config = base_config();
+    config.mode = trans::config::ConfigMode::NextIntl;
+    config.save_to_root(root).expect("save config");
+
+    save_language_translations(root, &config, "en", &translations(keys)).expect("save en");
+    save_language_translations(root, &config, "nb", &translations(keys)).expect("save nb");
+
+    config
+}
+
 fn setup_project_with_ai(root: &std::path::Path) -> TransConfig {
     let mut config = base_config();
     config.ai = Some(AiConfig {
@@ -816,6 +827,233 @@ fn next_intl_non_string_values_fail_in_non_interactive_commands() {
         .stderr(predicate::str::contains("next-intl non-string values"));
 
     let _ = config;
+}
+
+#[test]
+fn unused_lists_unused_next_intl_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("app.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("unused")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Unused keys: 1"))
+        .stdout(predicate::str::contains("app.unused").not())
+        .stdout(predicate::str::contains("app.title").not());
+}
+
+#[test]
+fn unused_keys_flag_outputs_only_unused_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("app.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\nt(key);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("app.unused\n")
+        .stderr("");
+}
+
+#[test]
+fn unused_respects_gitignored_files() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(dir.path(), &[("app.ignored", "Ignored")]);
+    std::fs::write(dir.path().join(".gitignore"), "ignored.tsx\n").expect("write gitignore");
+    std::fs::write(
+        dir.path().join("ignored.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('ignored');\n",
+    )
+    .expect("write ignored source");
+    Command::new("git")
+        .arg("init")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("unused")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Unused keys: 1"));
+}
+
+#[test]
+fn unused_fallback_scanner_excludes_generated_directories() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(dir.path(), &[("app.generated", "Generated")]);
+    std::fs::create_dir_all(dir.path().join(".next")).expect("mkdir");
+    std::fs::write(
+        dir.path().join(".next/generated.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('generated');\n",
+    )
+    .expect("write generated source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("unused")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Unused keys: 1"));
+}
+
+#[test]
+fn unused_reports_dynamic_usage_locations() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("other.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt(key);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("unused")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Unused keys: 1"))
+        .stdout(predicate::str::contains(
+            "Warning: dynamic translation key usage detected in 1 place(s):",
+        ))
+        .stdout(predicate::str::contains("./page.tsx:3"));
+}
+
+#[test]
+fn unused_remove_removes_safe_unused_keys() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("app.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "remove"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed 1 unused translation ids.",
+        ));
+
+    let en = load_language_translations(dir.path(), &config, "en").expect("load en");
+    let nb = load_language_translations(dir.path(), &config, "nb").expect("load nb");
+    assert!(en.contains_key("app.title"));
+    assert!(!en.contains_key("app.unused"));
+    assert!(!nb.contains_key("app.unused"));
+}
+
+#[test]
+fn unused_remove_refuses_dynamic_usage_without_force() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("app.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt(key);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "remove"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "dynamic translation key usage detected",
+        ));
+}
+
+#[test]
+fn unused_remove_force_allows_dynamic_usage() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("app.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\nt(key);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "remove", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed 1 unused translation ids.",
+        ));
+
+    let en = load_language_translations(dir.path(), &config, "en").expect("load en");
+    assert!(en.contains_key("app.title"));
+    assert!(!en.contains_key("app.unused"));
+}
+
+#[test]
+fn unused_remove_refuses_extraction_usage_even_with_force() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(dir.path(), &[("app.unused", "Unused")]);
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useExtracted} from 'next-intl';\nconst t = useExtracted();\nt('Close');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "remove", "--force"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "cannot remove unused keys while next-intl extraction usage is detected",
+        ));
+}
+
+#[test]
+fn unused_reports_react_intl_as_unsupported() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("unused")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "trans unused currently supports next-intl mode only",
+        ));
 }
 
 #[test]

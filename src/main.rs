@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -9,7 +10,8 @@ use console::style;
 use dialoguer::Confirm;
 
 use trans::cli::{
-    Cli, Command, ConfigFormat, ConfigKey, ConfigSection, parse_lang_list, parse_values,
+    Cli, Command, ConfigFormat, ConfigKey, ConfigSection, UnusedCommand, parse_lang_list,
+    parse_values,
 };
 use trans::config::{
     ConfigField, ConfigFormat as ConfigFileFormat, ConfigMode, ExportFormat, TransConfig,
@@ -455,6 +457,52 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Some(Command::Unused { keys, command }) => {
+            let root = config_root(&effective_cwd)?;
+            let config = TransConfig::load_from_root(&root)?;
+            match command {
+                None => {
+                    if keys {
+                        let ids = trans::unused::find_unused_keys(&root, &config)?;
+                        for id in &ids {
+                            println!("{id}");
+                        }
+                    } else {
+                        let report = trans::unused::find_unused(&root, &config)?;
+                        println!("Unused keys: {}", style(report.unused_ids.len()).bold());
+                        if !report.dynamic_usage_locations.is_empty() {
+                            println!();
+                            println!(
+                                "{}",
+                                style(format!(
+                                    "Warning: dynamic translation key usage detected in {} place(s):",
+                                    report.dynamic_usage_locations.len()
+                                ))
+                                .yellow()
+                            );
+                            for location in &report.dynamic_usage_locations {
+                                println!(
+                                    "{}",
+                                    format_terminal_link(&location.display, &location.url)
+                                );
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                Some(UnusedCommand::Remove { force }) => {
+                    let report = trans::unused::remove_unused(&root, &config, force)?;
+                    for warning in &report.warnings {
+                        eprintln!("Warning: {warning}");
+                    }
+                    println!(
+                        "Removed {} unused translation ids.",
+                        report.unused_ids.len()
+                    );
+                    Ok(())
+                }
+            }
+        }
         Some(Command::Sync) => {
             let root = config_root(&effective_cwd)?;
             let config = TransConfig::load_from_root(&root)?;
@@ -532,6 +580,14 @@ fn format_find_match_kind(kind: FindMatchKind) -> String {
         FindMatchKind::Exact => style("exact").green().to_string(),
         FindMatchKind::Casing => style("casing").yellow().to_string(),
         FindMatchKind::Partial => style("partial").color256(208).to_string(),
+    }
+}
+
+fn format_terminal_link(display: &str, url: &str) -> String {
+    if std::io::stdout().is_terminal() {
+        format!("\x1b]8;;{url}\x1b\\{display}\x1b]8;;\x1b\\")
+    } else {
+        display.to_string()
     }
 }
 

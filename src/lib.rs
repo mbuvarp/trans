@@ -15,6 +15,7 @@ pub mod query;
 pub mod spinner;
 pub mod sync;
 pub mod translations;
+pub mod unused;
 pub mod update_check;
 pub mod verify;
 pub mod verify_ai;
