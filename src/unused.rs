@@ -1,17 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, BindingPattern, CallExpression, Expression, ImportDeclaration,
-    ImportDeclarationSpecifier, ModuleExportName, ObjectPropertyKind, VariableDeclarationKind,
-    VariableDeclarator,
+    Argument, ArrowFunctionExpression, BindingPattern, CallExpression, Declaration,
+    ExportDefaultDeclaration, ExportDefaultDeclarationKind, ExportNamedDeclaration, Expression,
+    Function, FunctionBody, ImportDeclaration, ImportDeclarationSpecifier, ModuleExportName,
+    ObjectPropertyKind, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
+use oxc_syntax::scope::ScopeFlags;
+use serde::Deserialize;
 
 use crate::config::{ConfigMode, TransConfig};
 use crate::error::{Result, TransError};
@@ -65,6 +68,70 @@ enum NamespaceArg {
     Scoped(String),
     Unscoped,
     Dynamic,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProjectIndex {
+    files: BTreeMap<PathBuf, SourceFileIndex>,
+    source_files: BTreeSet<PathBuf>,
+    aliases: PathAliases,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SourceFileIndex {
+    imports: BTreeMap<String, ImportTarget>,
+    helpers: BTreeMap<String, HelperSummary>,
+    named_exports: BTreeMap<String, HelperSummary>,
+    default_export: Option<HelperSummary>,
+}
+
+#[derive(Debug, Clone)]
+struct ImportTarget {
+    source: String,
+    imported: ImportedName,
+}
+
+#[derive(Debug, Clone)]
+enum ImportedName {
+    Named(String),
+    Default,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HelperSummary {
+    param_usages: Vec<HelperParamUsage>,
+}
+
+#[derive(Debug, Clone)]
+struct HelperParamUsage {
+    param_index: usize,
+    key: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PathAliases {
+    base_url: Option<PathBuf>,
+    paths: Vec<PathAlias>,
+}
+
+#[derive(Debug, Clone)]
+struct PathAlias {
+    prefix: String,
+    suffix: String,
+    targets: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TsConfig {
+    compiler_options: Option<TsCompilerOptions>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TsCompilerOptions {
+    base_url: Option<String>,
+    paths: Option<BTreeMap<String, Vec<String>>>,
 }
 
 pub fn find_unused(root: impl AsRef<Path>, config: &TransConfig) -> Result<UnusedReport> {
@@ -138,7 +205,7 @@ fn find_unused_with_options(
     verify_language_files(root, config)?;
     let primary = load_language_translations(root, config, &config.primary_language)?;
     let source_files = discover_source_files(root)?;
-    let scan = collect_usage_from_files(&source_files)?;
+    let scan = collect_usage_from_files(root, &source_files)?;
 
     let mut unused_ids = Vec::new();
     for id in primary.keys() {
@@ -224,11 +291,12 @@ fn file_url_path(path: &Path) -> String {
         .collect()
 }
 
-fn collect_usage_from_files(paths: &[PathBuf]) -> Result<UsageScan> {
+fn collect_usage_from_files(root: &Path, paths: &[PathBuf]) -> Result<UsageScan> {
+    let project = ProjectIndex::build(root, paths)?;
     let mut combined = UsageScan::default();
     for path in paths {
         let source = fs::read_to_string(path)?;
-        let scan = collect_usage_from_source(&source, path)?;
+        let scan = collect_usage_from_source_with_project(&source, path, Some(&project))?;
         combined.used_ids.extend(scan.used_ids);
         combined.dynamic_usages.extend(scan.dynamic_usages);
         combined.extraction_usages.extend(scan.extraction_usages);
@@ -241,6 +309,14 @@ fn collect_usage_from_files(paths: &[PathBuf]) -> Result<UsageScan> {
 }
 
 pub fn collect_usage_from_source(source: &str, path: &Path) -> Result<UsageScan> {
+    collect_usage_from_source_with_project(source, path, None)
+}
+
+fn collect_usage_from_source_with_project(
+    source: &str,
+    path: &Path,
+    project: Option<&ProjectIndex>,
+) -> Result<UsageScan> {
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(path).unwrap_or_default();
     let ret = Parser::new(&allocator, source, source_type).parse();
@@ -252,7 +328,26 @@ pub fn collect_usage_from_source(source: &str, path: &Path) -> Result<UsageScan>
         )));
     }
 
-    let mut collector = SourceUsageCollector::new(path, source);
+    let local_project;
+    let project = match project {
+        Some(project) => Some(project),
+        None => {
+            let mut index_collector = SourceIndexCollector::default();
+            index_collector.visit_program(&ret.program);
+            let mut files = BTreeMap::new();
+            files.insert(path.to_path_buf(), index_collector.finish());
+            let mut source_files = BTreeSet::new();
+            source_files.insert(path.to_path_buf());
+            local_project = ProjectIndex {
+                files,
+                source_files,
+                aliases: PathAliases::default(),
+            };
+            Some(&local_project)
+        }
+    };
+
+    let mut collector = SourceUsageCollector::new(path, source, project);
     collector.visit_program(&ret.program);
     Ok(collector.finish())
 }
@@ -339,10 +434,255 @@ fn is_source_file(path: &Path) -> bool {
         .is_some_and(|extension| SOURCE_EXTENSIONS.contains(&extension))
 }
 
+impl ProjectIndex {
+    fn build(root: &Path, paths: &[PathBuf]) -> Result<Self> {
+        let aliases = PathAliases::load(root);
+        let source_files: BTreeSet<PathBuf> = paths.iter().cloned().collect();
+        let mut files = BTreeMap::new();
+
+        for path in paths {
+            let source = fs::read_to_string(path)?;
+            let allocator = Allocator::default();
+            let source_type = SourceType::from_path(path).unwrap_or_default();
+            let ret = Parser::new(&allocator, &source, source_type).parse();
+            if !ret.errors.is_empty() {
+                return Err(TransError::InvalidInput(format!(
+                    "failed to parse source file '{}' ({} parser error(s))",
+                    path.display(),
+                    ret.errors.len()
+                )));
+            }
+
+            let mut collector = SourceIndexCollector::default();
+            collector.visit_program(&ret.program);
+            files.insert(path.clone(), collector.finish());
+        }
+
+        Ok(Self {
+            files,
+            source_files,
+            aliases,
+        })
+    }
+
+    fn helper_for_import(&self, from: &Path, target: &ImportTarget) -> Option<HelperSummary> {
+        let path = self.resolve_module(from, &target.source)?;
+        let file = self.files.get(&path)?;
+        match &target.imported {
+            ImportedName::Named(name) => file.named_exports.get(name).cloned(),
+            ImportedName::Default => file.default_export.clone(),
+        }
+    }
+
+    fn resolve_module(&self, from: &Path, source: &str) -> Option<PathBuf> {
+        if source.starts_with('.') {
+            let base = from.parent()?.join(source);
+            return self.resolve_candidate(&base);
+        }
+
+        for candidate in self.aliases.expand(source) {
+            if let Some(path) = self.resolve_candidate(&candidate) {
+                return Some(path);
+            }
+        }
+
+        None
+    }
+
+    fn resolve_candidate(&self, base: &Path) -> Option<PathBuf> {
+        let candidates = module_candidates(base);
+        candidates
+            .into_iter()
+            .map(|candidate| normalize_path(&candidate))
+            .find(|candidate| self.source_files.contains(candidate))
+    }
+}
+
+impl SourceFileIndex {
+    fn helper_for_local(&self, name: &str) -> Option<HelperSummary> {
+        self.helpers.get(name).cloned()
+    }
+}
+
+impl PathAliases {
+    fn load(root: &Path) -> Self {
+        for file_name in ["tsconfig.json", "jsconfig.json"] {
+            let path = root.join(file_name);
+            let Ok(contents) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let stripped = strip_json_comments(&contents);
+            let Ok(config) = serde_json::from_str::<TsConfig>(&stripped) else {
+                continue;
+            };
+            let Some(options) = config.compiler_options else {
+                return Self::default();
+            };
+
+            let base_url = options.base_url.map(|value| root.join(value));
+            let base = base_url.clone().unwrap_or_else(|| root.to_path_buf());
+            let mut paths = Vec::new();
+            if let Some(config_paths) = options.paths {
+                for (alias, targets) in config_paths {
+                    let (prefix, suffix) = split_alias_pattern(&alias);
+                    paths.push(PathAlias {
+                        prefix,
+                        suffix,
+                        targets: targets
+                            .into_iter()
+                            .map(|target| base.join(target).to_string_lossy().to_string())
+                            .collect(),
+                    });
+                }
+            }
+
+            return Self { base_url, paths };
+        }
+
+        Self::default()
+    }
+
+    fn expand(&self, source: &str) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        for alias in &self.paths {
+            if let Some(capture) = match_alias(source, &alias.prefix, &alias.suffix) {
+                for target in &alias.targets {
+                    let path = if target.contains('*') {
+                        target.replace('*', capture)
+                    } else {
+                        target.clone()
+                    };
+                    candidates.push(PathBuf::from(path));
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            if let Some(base_url) = &self.base_url {
+                candidates.push(base_url.join(source));
+            }
+        }
+
+        candidates
+    }
+}
+
+fn module_candidates(base: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if is_source_file(base) {
+        candidates.push(base.to_path_buf());
+    } else {
+        for extension in SOURCE_EXTENSIONS {
+            candidates.push(path_with_appended_extension(base, extension));
+        }
+    }
+
+    for extension in SOURCE_EXTENSIONS {
+        candidates.push(base.join(format!("index.{extension}")));
+    }
+
+    candidates
+}
+
+fn path_with_appended_extension(base: &Path, extension: &str) -> PathBuf {
+    let mut path = base.as_os_str().to_os_string();
+    path.push(".");
+    path.push(extension);
+    PathBuf::from(path)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn split_alias_pattern(pattern: &str) -> (String, String) {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) => (prefix.to_string(), suffix.to_string()),
+        None => (pattern.to_string(), String::new()),
+    }
+}
+
+fn match_alias<'a>(source: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+    if suffix.is_empty() && source == prefix {
+        return Some("");
+    }
+    source.strip_prefix(prefix)?.strip_suffix(suffix)
+}
+
+fn strip_json_comments(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            escaped = ch == '\\' && !escaped;
+            if ch == '"' && !escaped {
+                in_string = false;
+            }
+            output.push(ch);
+            if ch != '\\' {
+                escaped = false;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            output.push(ch);
+            continue;
+        }
+
+        if ch == '/' {
+            match chars.peek().copied() {
+                Some('/') => {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            output.push('\n');
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut previous = '\0';
+                    for next in chars.by_ref() {
+                        if previous == '*' && next == '/' {
+                            break;
+                        }
+                        previous = next;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        output.push(ch);
+    }
+
+    output
+}
+
 #[derive(Debug)]
 struct SourceUsageCollector {
     path: PathBuf,
     line_starts: Vec<usize>,
+    project: Option<ProjectIndex>,
+    file_index: Option<SourceFileIndex>,
     use_translations: BTreeSet<String>,
     get_translations: BTreeSet<String>,
     use_extracted: BTreeSet<String>,
@@ -352,11 +692,338 @@ struct SourceUsageCollector {
     scan: UsageScan,
 }
 
+fn helper_summary_from_expression(expression: &Expression<'_>) -> Option<HelperSummary> {
+    match expression.get_inner_expression() {
+        Expression::ArrowFunctionExpression(arrow) => Some(helper_summary_from_arrow(arrow)),
+        Expression::FunctionExpression(function) => helper_summary_from_function(function),
+        _ => None,
+    }
+}
+
+fn helper_summary_from_arrow(arrow: &ArrowFunctionExpression<'_>) -> HelperSummary {
+    helper_summary_from_body(&arrow.params, &arrow.body)
+}
+
+fn helper_summary_from_function(function: &Function<'_>) -> Option<HelperSummary> {
+    let body = function.body.as_ref()?;
+    Some(helper_summary_from_body(&function.params, body))
+}
+
+fn helper_summary_from_body(
+    params: &oxc_ast::ast::FormalParameters<'_>,
+    body: &FunctionBody<'_>,
+) -> HelperSummary {
+    let mut param_names = BTreeMap::new();
+    for (index, parameter) in params.items.iter().enumerate() {
+        if let Some(name) = binding_identifier_name(&parameter.pattern) {
+            param_names.insert(name.to_string(), index);
+        }
+    }
+
+    let mut collector = HelperBodyCollector {
+        param_names,
+        string_constants: BTreeMap::new(),
+        usages: Vec::new(),
+    };
+    for statement in &body.statements {
+        collector.visit_statement(statement);
+    }
+
+    HelperSummary {
+        param_usages: collector.usages,
+    }
+}
+
+fn binding_identifier_name<'a>(pattern: &'a BindingPattern<'a>) -> Option<&'a str> {
+    match pattern {
+        BindingPattern::BindingIdentifier(identifier) => Some(identifier.name.as_str()),
+        BindingPattern::AssignmentPattern(assignment) => binding_identifier_name(&assignment.left),
+        _ => None,
+    }
+}
+
+fn module_export_name<'a>(name: &'a ModuleExportName<'a>) -> Option<&'a str> {
+    match name {
+        ModuleExportName::IdentifierName(identifier) => Some(identifier.name.as_str()),
+        ModuleExportName::IdentifierReference(identifier) => Some(identifier.name.as_str()),
+        ModuleExportName::StringLiteral(literal) => Some(literal.value.as_str()),
+    }
+}
+
+struct HelperBodyCollector {
+    param_names: BTreeMap<String, usize>,
+    string_constants: BTreeMap<String, String>,
+    usages: Vec<HelperParamUsage>,
+}
+
+impl HelperBodyCollector {
+    fn string_from_argument(&self, argument: &Argument<'_>) -> Option<String> {
+        match argument {
+            Argument::StringLiteral(literal) => Some(literal.value.to_string()),
+            Argument::TemplateLiteral(literal) => {
+                literal.single_quasi().map(|value| value.to_string())
+            }
+            Argument::Identifier(identifier) => {
+                self.string_constants.get(identifier.name.as_str()).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    fn string_from_expression(&self, expression: &Expression<'_>) -> Option<String> {
+        match expression.get_inner_expression() {
+            Expression::StringLiteral(literal) => Some(literal.value.to_string()),
+            Expression::TemplateLiteral(literal) => {
+                literal.single_quasi().map(|value| value.to_string())
+            }
+            Expression::Identifier(identifier) => {
+                self.string_constants.get(identifier.name.as_str()).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    fn callee_param_index(&self, expression: &Expression<'_>) -> Option<usize> {
+        if let Some(identifier) = expression.get_identifier_reference() {
+            return self.param_names.get(identifier.name.as_str()).copied();
+        }
+
+        let member = expression.get_member_expr()?;
+        let method = member.static_property_name()?;
+        if !TRANSLATOR_METHODS.contains(&method) {
+            return None;
+        }
+        let object = member.object().get_identifier_reference()?;
+        self.param_names.get(object.name.as_str()).copied()
+    }
+}
+
+impl<'a> Visit<'a> for HelperBodyCollector {
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if declarator.kind == VariableDeclarationKind::Const {
+            if let Some(name) = binding_identifier_name(&declarator.id) {
+                if let Some(init) = &declarator.init {
+                    if let Some(value) = self.string_from_expression(init) {
+                        self.string_constants.insert(name.to_string(), value);
+                    }
+                }
+            }
+        }
+        walk::walk_variable_declarator(self, declarator);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if let Some(param_index) = self.callee_param_index(&call.callee) {
+            let key = call
+                .arguments
+                .first()
+                .and_then(|argument| self.string_from_argument(argument));
+            self.usages.push(HelperParamUsage { param_index, key });
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+
+    fn visit_arrow_function_expression(&mut self, _arrow: &ArrowFunctionExpression<'a>) {}
+}
+
+#[derive(Default)]
+struct SourceIndexCollector {
+    imports: BTreeMap<String, ImportTarget>,
+    helpers: BTreeMap<String, HelperSummary>,
+    export_locals: BTreeMap<String, String>,
+    default_local: Option<String>,
+    default_summary: Option<HelperSummary>,
+}
+
+impl SourceIndexCollector {
+    fn finish(self) -> SourceFileIndex {
+        let mut named_exports = BTreeMap::new();
+        for (exported, local) in self.export_locals {
+            if let Some(summary) = self.helpers.get(&local) {
+                named_exports.insert(exported, summary.clone());
+            }
+        }
+
+        let default_export = self.default_summary.or_else(|| {
+            self.default_local
+                .and_then(|name| self.helpers.get(&name).cloned())
+        });
+
+        SourceFileIndex {
+            imports: self.imports,
+            helpers: self.helpers,
+            named_exports,
+            default_export,
+        }
+    }
+
+    fn record_helper(&mut self, name: &str, summary: HelperSummary) {
+        self.helpers.insert(name.to_string(), summary);
+    }
+
+    fn record_variable_helpers(&mut self, declaration: &VariableDeclaration<'_>) {
+        for declarator in &declaration.declarations {
+            let Some(name) = binding_identifier_name(&declarator.id) else {
+                continue;
+            };
+            let Some(init) = &declarator.init else {
+                continue;
+            };
+            if let Some(summary) = helper_summary_from_expression(init) {
+                self.record_helper(name, summary);
+            }
+        }
+    }
+
+    fn record_export_declaration(&mut self, declaration: &Declaration<'_>) {
+        match declaration {
+            Declaration::FunctionDeclaration(function) => {
+                if let Some(id) = &function.id {
+                    self.export_locals
+                        .insert(id.name.to_string(), id.name.to_string());
+                }
+            }
+            Declaration::VariableDeclaration(variable) => {
+                for declarator in &variable.declarations {
+                    if let Some(name) = binding_identifier_name(&declarator.id) {
+                        self.export_locals
+                            .insert(name.to_string(), name.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_export_specifiers(&mut self, declaration: &ExportNamedDeclaration<'_>) {
+        if declaration.source.is_some() {
+            return;
+        }
+        for specifier in &declaration.specifiers {
+            let Some(local) = module_export_name(&specifier.local) else {
+                continue;
+            };
+            let Some(exported) = module_export_name(&specifier.exported) else {
+                continue;
+            };
+            self.export_locals
+                .insert(exported.to_string(), local.to_string());
+        }
+    }
+
+    fn record_default_export(&mut self, declaration: &ExportDefaultDeclaration<'_>) {
+        match &declaration.declaration {
+            ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
+                if let Some(summary) = helper_summary_from_function(function) {
+                    self.default_summary = Some(summary);
+                }
+                if let Some(id) = &function.id {
+                    self.record_helper(
+                        id.name.as_str(),
+                        self.default_summary.clone().unwrap_or_default(),
+                    );
+                }
+            }
+            ExportDefaultDeclarationKind::Identifier(identifier) => {
+                self.default_local = Some(identifier.name.to_string());
+            }
+            ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
+                self.default_summary = Some(helper_summary_from_arrow(arrow));
+            }
+            ExportDefaultDeclarationKind::FunctionExpression(function) => {
+                self.default_summary = helper_summary_from_function(function);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<'a> Visit<'a> for SourceIndexCollector {
+    fn visit_import_declaration(&mut self, declaration: &ImportDeclaration<'a>) {
+        let source = declaration.source.value.as_str();
+        if source != "next-intl" && source != "next-intl/server" {
+            if let Some(specifiers) = &declaration.specifiers {
+                for specifier in specifiers {
+                    match specifier {
+                        ImportDeclarationSpecifier::ImportSpecifier(specifier) => {
+                            if let Some(imported) = module_export_name(&specifier.imported) {
+                                self.imports.insert(
+                                    specifier.local.name.to_string(),
+                                    ImportTarget {
+                                        source: source.to_string(),
+                                        imported: ImportedName::Named(imported.to_string()),
+                                    },
+                                );
+                            }
+                        }
+                        ImportDeclarationSpecifier::ImportDefaultSpecifier(specifier) => {
+                            self.imports.insert(
+                                specifier.local.name.to_string(),
+                                ImportTarget {
+                                    source: source.to_string(),
+                                    imported: ImportedName::Default,
+                                },
+                            );
+                        }
+                        ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => {}
+                    }
+                }
+            }
+        }
+
+        walk::walk_import_declaration(self, declaration);
+    }
+
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if let Some(id) = &function.id {
+            if let Some(summary) = helper_summary_from_function(function) {
+                self.record_helper(id.name.as_str(), summary);
+            }
+        }
+        walk::walk_function(self, function, flags);
+    }
+
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if let Some(name) = binding_identifier_name(&declarator.id) {
+            if let Some(init) = &declarator.init {
+                if let Some(summary) = helper_summary_from_expression(init) {
+                    self.record_helper(name, summary);
+                }
+            }
+        }
+        walk::walk_variable_declarator(self, declarator);
+    }
+
+    fn visit_export_named_declaration(&mut self, declaration: &ExportNamedDeclaration<'a>) {
+        if let Some(inner) = &declaration.declaration {
+            self.record_export_declaration(inner);
+            if let Declaration::VariableDeclaration(variable) = inner {
+                self.record_variable_helpers(variable);
+            }
+        }
+        self.record_export_specifiers(declaration);
+        walk::walk_export_named_declaration(self, declaration);
+    }
+
+    fn visit_export_default_declaration(&mut self, declaration: &ExportDefaultDeclaration<'a>) {
+        self.record_default_export(declaration);
+        walk::walk_export_default_declaration(self, declaration);
+    }
+}
+
 impl SourceUsageCollector {
-    fn new(path: &Path, source: &str) -> Self {
+    fn new(path: &Path, source: &str, project: Option<&ProjectIndex>) -> Self {
+        let project = project.cloned();
+        let file_index = project
+            .as_ref()
+            .and_then(|project| project.files.get(path).cloned());
         Self {
             path: path.to_path_buf(),
             line_starts: line_starts(source),
+            project,
+            file_index,
             use_translations: BTreeSet::new(),
             get_translations: BTreeSet::new(),
             use_extracted: BTreeSet::new(),
@@ -557,6 +1224,101 @@ impl SourceUsageCollector {
         };
         self.use_extracted.contains(callee) || self.get_extracted.contains(callee)
     }
+
+    fn helper_summary_for_callee(&self, expression: &Expression<'_>) -> Option<HelperSummary> {
+        let callee = self.callee_identifier(expression)?;
+        if let Some(file_index) = &self.file_index {
+            if let Some(summary) = file_index.helper_for_local(callee) {
+                return Some(summary);
+            }
+            if let Some(target) = file_index.imports.get(callee) {
+                if let Some(project) = &self.project {
+                    return project.helper_for_import(&self.path, target);
+                }
+            }
+        }
+        None
+    }
+
+    fn callee_is_potential_helper(&self, expression: &Expression<'_>) -> bool {
+        let Some(callee) = self.callee_identifier(expression) else {
+            return false;
+        };
+        if self.use_translations.contains(callee)
+            || self.get_translations.contains(callee)
+            || self.use_extracted.contains(callee)
+            || self.get_extracted.contains(callee)
+            || self.translators.contains_key(callee)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn translator_binding_from_argument(
+        &self,
+        argument: &Argument<'_>,
+    ) -> Option<TranslatorBinding> {
+        match argument {
+            Argument::Identifier(identifier) => {
+                self.translators.get(identifier.name.as_str()).cloned()
+            }
+            Argument::CallExpression(call) => self.translator_binding_from_call(call),
+            _ => None,
+        }
+    }
+
+    fn translator_binding_from_call(&self, call: &CallExpression<'_>) -> Option<TranslatorBinding> {
+        let callee = self.callee_identifier(&call.callee)?;
+        if !self.use_translations.contains(callee) && !self.get_translations.contains(callee) {
+            return None;
+        }
+
+        Some(match self.call_namespace(call) {
+            NamespaceArg::Scoped(namespace) => TranslatorBinding {
+                namespace: Some(namespace),
+                dynamic_namespace: false,
+            },
+            NamespaceArg::Unscoped => TranslatorBinding {
+                namespace: None,
+                dynamic_namespace: false,
+            },
+            NamespaceArg::Dynamic => TranslatorBinding {
+                namespace: None,
+                dynamic_namespace: true,
+            },
+        })
+    }
+
+    fn apply_helper_summary(&mut self, call: &CallExpression<'_>, summary: &HelperSummary) {
+        for usage in &summary.param_usages {
+            let Some(argument) = call.arguments.get(usage.param_index) else {
+                continue;
+            };
+            let Some(binding) = self.translator_binding_from_argument(argument) else {
+                continue;
+            };
+            match (&usage.key, binding.dynamic_namespace) {
+                (Some(key), false) => {
+                    let id = match &binding.namespace {
+                        Some(namespace) if key.is_empty() => namespace.clone(),
+                        Some(namespace) => format!("{namespace}.{key}"),
+                        None => key.clone(),
+                    };
+                    self.scan.used_ids.insert(id);
+                }
+                _ => self.record_dynamic_usage(binding.namespace.as_deref(), call.span.start),
+            }
+        }
+    }
+
+    fn protect_translator_arguments(&mut self, call: &CallExpression<'_>) {
+        for argument in &call.arguments {
+            if let Some(binding) = self.translator_binding_from_argument(argument) {
+                self.record_dynamic_usage(binding.namespace.as_deref(), call.span.start);
+            }
+        }
+    }
 }
 
 impl<'a> Visit<'a> for SourceUsageCollector {
@@ -628,6 +1390,12 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 }
                 _ => self.record_dynamic_usage(binding.namespace.as_deref(), call.span.start),
             }
+        }
+
+        if let Some(summary) = self.helper_summary_for_callee(&call.callee) {
+            self.apply_helper_summary(call, &summary);
+        } else if self.callee_is_potential_helper(&call.callee) {
+            self.protect_translator_arguments(call);
         }
 
         walk::walk_call_expression(self, call);
@@ -757,5 +1525,89 @@ mod tests {
             "#,
         );
         assert_eq!(scan.extraction_usages.len(), 2);
+    }
+
+    #[test]
+    fn traces_same_file_function_helper_by_parameter_position() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function getMessage(tSettings) {
+              return tSettings('navigation.title');
+            }
+            const t = useTranslations('settings');
+            getMessage(t);
+            "#,
+        );
+        assert!(scan.used_ids.contains("settings.navigation.title"));
+    }
+
+    #[test]
+    fn traces_arrow_and_function_expression_helpers() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const getTitle = (translate) => translate('title');
+            const getDescription = function(tx) { return tx('description'); };
+            const t = useTranslations('settings');
+            getTitle(t);
+            getDescription(t);
+            "#,
+        );
+        assert!(scan.used_ids.contains("settings.title"));
+        assert!(scan.used_ids.contains("settings.description"));
+    }
+
+    #[test]
+    fn traces_helper_method_variants_and_multiple_params() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function helper(first, second) {
+              first.rich('title');
+              second.markup('body');
+              second.raw('payload');
+              first.has('optional');
+            }
+            const settings = useTranslations('settings');
+            const common = useTranslations('common');
+            helper(settings, common);
+            "#,
+        );
+        assert!(scan.used_ids.contains("settings.title"));
+        assert!(scan.used_ids.contains("settings.optional"));
+        assert!(scan.used_ids.contains("common.body"));
+        assert!(scan.used_ids.contains("common.payload"));
+    }
+
+    #[test]
+    fn helper_dynamic_key_protects_translator_namespace() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function helper(tx, key) {
+              tx(key);
+            }
+            const t = useTranslations('settings');
+            helper(t, key);
+            "#,
+        );
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "settings")
+        );
+    }
+
+    #[test]
+    fn label_key_data_is_not_translation_usage() {
+        let scan = scan(
+            r#"
+            const section = {
+              labelKey: 'navigation.sections.account'
+            };
+            "#,
+        );
+        assert!(!scan.used_ids.contains("navigation.sections.account"));
     }
 }

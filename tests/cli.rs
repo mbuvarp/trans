@@ -943,6 +943,231 @@ fn unused_reports_dynamic_usage_locations() {
 }
 
 #[test]
+fn unused_traces_named_helper_import_from_relative_file() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("settings.title", "Title"), ("settings.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("settings-helper.ts"),
+        "export function getTitle(tSettings) { return tSettings('title'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getTitle} from './settings-helper';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_traces_named_helper_import_from_parent_relative_file() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.validation.customerRequired", "Required"),
+            ("projects.unused", "Unused"),
+        ],
+    );
+    std::fs::create_dir_all(dir.path().join("src/projects")).expect("mkdir projects");
+    std::fs::create_dir_all(dir.path().join("src/offers")).expect("mkdir offers");
+    std::fs::write(
+        dir.path().join("src/projects/project-form-shared.tsx"),
+        "export function createProjectFormSchema(tProjects) { return tProjects('validation.customerRequired'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("src/offers/offer-create-dialog.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {createProjectFormSchema} from '../projects/project-form-shared';\nconst tProjects = useTranslations('projects');\ncreateProjectFormSchema(tProjects);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("projects.unused\n");
+}
+
+#[test]
+fn unused_traces_named_helper_import_with_dotted_file_stem() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("checklists.stage-ongoing", "Ongoing"),
+            ("checklists.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("checklist-detail-page.shared.ts"),
+        "export function getChecklistStatusLabel(status, tChecklists) { return tChecklists('stage-ongoing'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getChecklistStatusLabel} from './checklist-detail-page.shared';\nconst tChecklists = useTranslations('checklists');\ngetChecklistStatusLabel('ONGOING', tChecklists);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("checklists.unused\n");
+}
+
+#[test]
+fn unused_traces_default_helper_import_from_relative_file() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("settings.title", "Title"), ("settings.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("settings-helper.ts"),
+        "export default function getTitle(tSettings) { return tSettings('title'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport getTitle from './settings-helper';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_traces_export_specifier_helper() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("settings.title", "Title"), ("settings.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("settings-helper.ts"),
+        "function getTitle(tSettings) { return tSettings('title'); }\nexport { getTitle };\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getTitle} from './settings-helper';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_traces_helper_import_through_tsconfig_path_alias() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("settings.title", "Title"), ("settings.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("tsconfig.json"),
+        r#"{
+          "compilerOptions": {
+            "baseUrl": ".",
+            "paths": {
+              "@/*": ["src/*"]
+            }
+          }
+        }"#,
+    )
+    .expect("write tsconfig");
+    std::fs::create_dir_all(dir.path().join("src")).expect("mkdir src");
+    std::fs::write(
+        dir.path().join("src/settings-helper.ts"),
+        "export function getTitle(tSettings) { return tSettings('title'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getTitle} from '@/settings-helper';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_traces_helper_import_via_index_file() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("settings.title", "Title"), ("settings.unused", "Unused")],
+    );
+    std::fs::create_dir_all(dir.path().join("helpers")).expect("mkdir helpers");
+    std::fs::write(
+        dir.path().join("helpers/index.ts"),
+        "export function getTitle(tSettings) { return tSettings('title'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getTitle} from './helpers';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_unresolved_import_with_translator_argument_is_dynamic() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(dir.path(), &[("settings.title", "Title")]);
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getTitle} from './missing';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("unused")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Unused keys: 0"))
+        .stdout(predicate::str::contains(
+            "Warning: dynamic translation key usage detected in 1 place(s):",
+        ));
+}
+
+#[test]
 fn unused_remove_removes_safe_unused_keys() {
     let dir = tempdir().expect("tempdir");
     let config = setup_next_intl_project_with_keys(
