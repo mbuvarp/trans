@@ -943,6 +943,31 @@ fn unused_reports_dynamic_usage_locations() {
 }
 
 #[test]
+fn unused_resolves_finite_conditional_key_variables() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("files.folder-count", "Folders"),
+            ("files.subfolder-count", "Subfolders"),
+            ("files.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('files');\nconst folderCountKey = searchAllFolders ? 'folder-count' : 'subfolder-count';\nt(folderCountKey);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("files.unused\n");
+}
+
+#[test]
 fn unused_traces_named_helper_import_from_relative_file() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(

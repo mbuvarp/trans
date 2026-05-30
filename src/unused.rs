@@ -5,10 +5,11 @@ use std::process::Command;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, ArrowFunctionExpression, BindingPattern, CallExpression, Declaration,
-    ExportDefaultDeclaration, ExportDefaultDeclarationKind, ExportNamedDeclaration, Expression,
-    Function, FunctionBody, ImportDeclaration, ImportDeclarationSpecifier, ModuleExportName,
-    ObjectPropertyKind, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    Argument, ArrowFunctionExpression, BindingPattern, CallExpression, ConditionalExpression,
+    Declaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind, ExportNamedDeclaration,
+    Expression, Function, FunctionBody, ImportDeclaration, ImportDeclarationSpecifier,
+    ModuleExportName, ObjectPropertyKind, TemplateLiteral, VariableDeclaration,
+    VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -27,6 +28,9 @@ const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts"];
 const FALLBACK_EXCLUDED_DIRS: &[&str] =
     &[".git", "node_modules", ".next", "dist", "build", "coverage"];
 const TRANSLATOR_METHODS: &[&str] = &["rich", "markup", "raw", "has"];
+const MAX_FINITE_STRINGS: usize = 128;
+
+type FiniteStrings = BTreeSet<String>;
 
 #[derive(Debug, Clone, Default)]
 pub struct UnusedReport {
@@ -105,7 +109,7 @@ struct HelperSummary {
 #[derive(Debug, Clone)]
 struct HelperParamUsage {
     param_index: usize,
-    key: Option<String>,
+    keys: Option<FiniteStrings>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -687,7 +691,7 @@ struct SourceUsageCollector {
     get_translations: BTreeSet<String>,
     use_extracted: BTreeSet<String>,
     get_extracted: BTreeSet<String>,
-    string_constants: BTreeMap<String, String>,
+    finite_constants: BTreeMap<String, FiniteStrings>,
     translators: BTreeMap<String, TranslatorBinding>,
     scan: UsageScan,
 }
@@ -722,7 +726,7 @@ fn helper_summary_from_body(
 
     let mut collector = HelperBodyCollector {
         param_names,
-        string_constants: BTreeMap::new(),
+        finite_constants: BTreeMap::new(),
         usages: Vec::new(),
     };
     for statement in &body.statements {
@@ -750,39 +754,125 @@ fn module_export_name<'a>(name: &'a ModuleExportName<'a>) -> Option<&'a str> {
     }
 }
 
+fn finite_string(value: impl Into<String>) -> FiniteStrings {
+    BTreeSet::from([value.into()])
+}
+
+fn single_finite_string(values: &FiniteStrings) -> Option<String> {
+    if values.len() == 1 {
+        values.first().cloned()
+    } else {
+        None
+    }
+}
+
+fn union_finite_strings(left: FiniteStrings, right: FiniteStrings) -> Option<FiniteStrings> {
+    let mut values = left;
+    values.extend(right);
+    if values.len() > MAX_FINITE_STRINGS {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+fn append_finite_strings(
+    prefixes: FiniteStrings,
+    suffixes: &FiniteStrings,
+) -> Option<FiniteStrings> {
+    let mut values = BTreeSet::new();
+    for prefix in prefixes {
+        for suffix in suffixes {
+            values.insert(format!("{prefix}{suffix}"));
+            if values.len() > MAX_FINITE_STRINGS {
+                return None;
+            }
+        }
+    }
+    Some(values)
+}
+
+fn finite_strings_from_argument(
+    argument: &Argument<'_>,
+    constants: &BTreeMap<String, FiniteStrings>,
+) -> Option<FiniteStrings> {
+    match argument {
+        Argument::StringLiteral(literal) => Some(finite_string(literal.value.to_string())),
+        Argument::TemplateLiteral(literal) => finite_strings_from_template(literal, constants),
+        Argument::Identifier(identifier) => constants.get(identifier.name.as_str()).cloned(),
+        Argument::ConditionalExpression(conditional) => {
+            finite_strings_from_conditional(conditional, constants)
+        }
+        Argument::ParenthesizedExpression(parenthesized) => {
+            finite_strings_from_expression(&parenthesized.expression, constants)
+        }
+        Argument::TSAsExpression(expression) => {
+            finite_strings_from_expression(&expression.expression, constants)
+        }
+        Argument::TSSatisfiesExpression(expression) => {
+            finite_strings_from_expression(&expression.expression, constants)
+        }
+        Argument::TSNonNullExpression(expression) => {
+            finite_strings_from_expression(&expression.expression, constants)
+        }
+        Argument::TSInstantiationExpression(expression) => {
+            finite_strings_from_expression(&expression.expression, constants)
+        }
+        Argument::TSTypeAssertion(expression) => {
+            finite_strings_from_expression(&expression.expression, constants)
+        }
+        _ => None,
+    }
+}
+
+fn finite_strings_from_expression(
+    expression: &Expression<'_>,
+    constants: &BTreeMap<String, FiniteStrings>,
+) -> Option<FiniteStrings> {
+    match expression.get_inner_expression() {
+        Expression::StringLiteral(literal) => Some(finite_string(literal.value.to_string())),
+        Expression::TemplateLiteral(literal) => finite_strings_from_template(literal, constants),
+        Expression::Identifier(identifier) => constants.get(identifier.name.as_str()).cloned(),
+        Expression::ConditionalExpression(conditional) => {
+            finite_strings_from_conditional(conditional, constants)
+        }
+        _ => None,
+    }
+}
+
+fn finite_strings_from_conditional(
+    conditional: &ConditionalExpression<'_>,
+    constants: &BTreeMap<String, FiniteStrings>,
+) -> Option<FiniteStrings> {
+    let consequent = finite_strings_from_expression(&conditional.consequent, constants)?;
+    let alternate = finite_strings_from_expression(&conditional.alternate, constants)?;
+    union_finite_strings(consequent, alternate)
+}
+
+fn finite_strings_from_template(
+    literal: &TemplateLiteral<'_>,
+    constants: &BTreeMap<String, FiniteStrings>,
+) -> Option<FiniteStrings> {
+    let mut values = finite_string("");
+    for (index, quasi) in literal.quasis.iter().enumerate() {
+        let cooked = quasi.value.cooked.as_ref()?;
+        values = append_finite_strings(values, &finite_string(cooked.to_string()))?;
+
+        if let Some(expression) = literal.expressions.get(index) {
+            let expression_values = finite_strings_from_expression(expression, constants)?;
+            values = append_finite_strings(values, &expression_values)?;
+        }
+    }
+    Some(values)
+}
+
 struct HelperBodyCollector {
     param_names: BTreeMap<String, usize>,
-    string_constants: BTreeMap<String, String>,
+    finite_constants: BTreeMap<String, FiniteStrings>,
     usages: Vec<HelperParamUsage>,
 }
 
 impl HelperBodyCollector {
-    fn string_from_argument(&self, argument: &Argument<'_>) -> Option<String> {
-        match argument {
-            Argument::StringLiteral(literal) => Some(literal.value.to_string()),
-            Argument::TemplateLiteral(literal) => {
-                literal.single_quasi().map(|value| value.to_string())
-            }
-            Argument::Identifier(identifier) => {
-                self.string_constants.get(identifier.name.as_str()).cloned()
-            }
-            _ => None,
-        }
-    }
-
-    fn string_from_expression(&self, expression: &Expression<'_>) -> Option<String> {
-        match expression.get_inner_expression() {
-            Expression::StringLiteral(literal) => Some(literal.value.to_string()),
-            Expression::TemplateLiteral(literal) => {
-                literal.single_quasi().map(|value| value.to_string())
-            }
-            Expression::Identifier(identifier) => {
-                self.string_constants.get(identifier.name.as_str()).cloned()
-            }
-            _ => None,
-        }
-    }
-
     fn callee_param_index(&self, expression: &Expression<'_>) -> Option<usize> {
         if let Some(identifier) = expression.get_identifier_reference() {
             return self.param_names.get(identifier.name.as_str()).copied();
@@ -803,8 +893,10 @@ impl<'a> Visit<'a> for HelperBodyCollector {
         if declarator.kind == VariableDeclarationKind::Const {
             if let Some(name) = binding_identifier_name(&declarator.id) {
                 if let Some(init) = &declarator.init {
-                    if let Some(value) = self.string_from_expression(init) {
-                        self.string_constants.insert(name.to_string(), value);
+                    if let Some(values) =
+                        finite_strings_from_expression(init, &self.finite_constants)
+                    {
+                        self.finite_constants.insert(name.to_string(), values);
                     }
                 }
             }
@@ -814,11 +906,10 @@ impl<'a> Visit<'a> for HelperBodyCollector {
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if let Some(param_index) = self.callee_param_index(&call.callee) {
-            let key = call
-                .arguments
-                .first()
-                .and_then(|argument| self.string_from_argument(argument));
-            self.usages.push(HelperParamUsage { param_index, key });
+            let keys = call.arguments.first().and_then(|argument| {
+                finite_strings_from_argument(argument, &self.finite_constants)
+            });
+            self.usages.push(HelperParamUsage { param_index, keys });
         }
         walk::walk_call_expression(self, call);
     }
@@ -1028,7 +1119,7 @@ impl SourceUsageCollector {
             get_translations: BTreeSet::new(),
             use_extracted: BTreeSet::new(),
             get_extracted: BTreeSet::new(),
-            string_constants: BTreeMap::new(),
+            finite_constants: BTreeMap::new(),
             translators: BTreeMap::new(),
             scan: UsageScan::default(),
         }
@@ -1117,29 +1208,13 @@ impl SourceUsageCollector {
     }
 
     fn string_from_argument(&self, argument: &Argument<'_>) -> Option<String> {
-        match argument {
-            Argument::StringLiteral(literal) => Some(literal.value.to_string()),
-            Argument::TemplateLiteral(literal) => {
-                literal.single_quasi().map(|value| value.to_string())
-            }
-            Argument::Identifier(identifier) => {
-                self.string_constants.get(identifier.name.as_str()).cloned()
-            }
-            _ => None,
-        }
+        finite_strings_from_argument(argument, &self.finite_constants)
+            .and_then(|values| single_finite_string(&values))
     }
 
     fn string_from_expression(&self, expression: &Expression<'_>) -> Option<String> {
-        match expression.get_inner_expression() {
-            Expression::StringLiteral(literal) => Some(literal.value.to_string()),
-            Expression::TemplateLiteral(literal) => {
-                literal.single_quasi().map(|value| value.to_string())
-            }
-            Expression::Identifier(identifier) => {
-                self.string_constants.get(identifier.name.as_str()).cloned()
-            }
-            _ => None,
-        }
+        finite_strings_from_expression(expression, &self.finite_constants)
+            .and_then(|values| single_finite_string(&values))
     }
 
     fn callee_identifier<'a>(&self, expression: &'a Expression<'a>) -> Option<&'a str> {
@@ -1298,14 +1373,16 @@ impl SourceUsageCollector {
             let Some(binding) = self.translator_binding_from_argument(argument) else {
                 continue;
             };
-            match (&usage.key, binding.dynamic_namespace) {
-                (Some(key), false) => {
-                    let id = match &binding.namespace {
-                        Some(namespace) if key.is_empty() => namespace.clone(),
-                        Some(namespace) => format!("{namespace}.{key}"),
-                        None => key.clone(),
-                    };
-                    self.scan.used_ids.insert(id);
+            match (&usage.keys, binding.dynamic_namespace) {
+                (Some(keys), false) => {
+                    for key in keys {
+                        let id = match &binding.namespace {
+                            Some(namespace) if key.is_empty() => namespace.clone(),
+                            Some(namespace) => format!("{namespace}.{key}"),
+                            None => key.clone(),
+                        };
+                        self.scan.used_ids.insert(id);
+                    }
                 }
                 _ => self.record_dynamic_usage(binding.namespace.as_deref(), call.span.start),
             }
@@ -1351,8 +1428,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             let name = identifier.name.as_str();
             if declarator.kind == VariableDeclarationKind::Const {
                 if let Some(init) = &declarator.init {
-                    if let Some(value) = self.string_from_expression(init) {
-                        self.string_constants.insert(name.to_string(), value);
+                    if let Some(values) =
+                        finite_strings_from_expression(init, &self.finite_constants)
+                    {
+                        self.finite_constants.insert(name.to_string(), values);
                     }
                 }
             }
@@ -1375,18 +1454,19 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         }
 
         if let Some(binding) = self.maybe_translator_call(&call.callee) {
-            let key = call
-                .arguments
-                .first()
-                .and_then(|argument| self.string_from_argument(argument));
-            match key {
-                Some(key) if !binding.dynamic_namespace => {
-                    let id = match &binding.namespace {
-                        Some(namespace) if key.is_empty() => namespace.clone(),
-                        Some(namespace) => format!("{namespace}.{key}"),
-                        None => key,
-                    };
-                    self.scan.used_ids.insert(id);
+            let keys = call.arguments.first().and_then(|argument| {
+                finite_strings_from_argument(argument, &self.finite_constants)
+            });
+            match keys {
+                Some(keys) if !binding.dynamic_namespace => {
+                    for key in keys {
+                        let id = match &binding.namespace {
+                            Some(namespace) if key.is_empty() => namespace.clone(),
+                            Some(namespace) => format!("{namespace}.{key}"),
+                            None => key,
+                        };
+                        self.scan.used_ids.insert(id);
+                    }
                 }
                 _ => self.record_dynamic_usage(binding.namespace.as_deref(), call.span.start),
             }
@@ -1492,6 +1572,54 @@ mod tests {
     }
 
     #[test]
+    fn resolves_finite_conditional_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('files');
+            const folderCountKey = searchAllFolders ? 'folder-count' : 'subfolder-count';
+            t(folderCountKey);
+            "#,
+        );
+        assert!(scan.used_ids.contains("files.folder-count"));
+        assert!(scan.used_ids.contains("files.subfolder-count"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_finite_template_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('files');
+            const suffix = compact ? 'short' : 'long';
+            t(`labels.${suffix}`);
+            "#,
+        );
+        assert!(scan.used_ids.contains("files.labels.long"));
+        assert!(scan.used_ids.contains("files.labels.short"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn finite_expression_unknown_branch_stays_dynamic() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('files');
+            const key = enabled ? 'known' : unknownKey;
+            t(key);
+            "#,
+        );
+        assert!(!scan.used_ids.contains("files.known"));
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "files")
+        );
+    }
+
+    #[test]
     fn detects_dynamic_keys_and_namespaces() {
         let scan = scan(
             r#"
@@ -1578,6 +1706,24 @@ mod tests {
         assert!(scan.used_ids.contains("settings.optional"));
         assert!(scan.used_ids.contains("common.body"));
         assert!(scan.used_ids.contains("common.payload"));
+    }
+
+    #[test]
+    fn traces_helper_finite_conditional_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function helper(tx) {
+              const key = compact ? 'short' : 'long';
+              tx(key);
+            }
+            const t = useTranslations('settings');
+            helper(t);
+            "#,
+        );
+        assert!(scan.used_ids.contains("settings.long"));
+        assert!(scan.used_ids.contains("settings.short"));
+        assert!(scan.dynamic_usages.is_empty());
     }
 
     #[test]
