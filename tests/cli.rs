@@ -1023,6 +1023,36 @@ fn unused_resolves_typed_finite_domain_keys() {
 }
 
 #[test]
+fn unused_resolves_zod_inferred_property_domain_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("users.relations.parent", "Parent"),
+            ("users.relations.partner", "Partner"),
+            ("users.relations.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("emergency-contact-shared.ts"),
+        "export const EMERGENCY_CONTACT_RELATION_VALUES = ['parent', 'partner'] as const;\n",
+    )
+    .expect("write relation values");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {UseFormReturn, useWatch} from 'react-hook-form';\nimport {z} from 'zod';\nimport {EMERGENCY_CONTACT_RELATION_VALUES} from './emergency-contact-shared';\nconst EmergencyContactFormSchema = z.object({\n  relation: z.enum(EMERGENCY_CONTACT_RELATION_VALUES),\n});\ntype EmergencyContactFormValues = z.infer<typeof EmergencyContactFormSchema>;\nfunction Fields({form}: {form: UseFormReturn<EmergencyContactFormValues>}) {\n  const watchedValues = useWatch({ control: form.control }) as EmergencyContactFormValues | undefined;\n  const values = watchedValues ?? form.getValues();\n  const tRelation = useTranslations('users.relations');\n  tRelation(values.relation);\n}\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("users.relations.unused\n");
+}
+
+#[test]
 fn unused_resolves_finite_map_callback_keys() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(

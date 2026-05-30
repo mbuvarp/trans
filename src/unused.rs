@@ -11,8 +11,8 @@ use oxc_ast::ast::{
     ForStatementLeft, Function, FunctionBody, ImportDeclaration, ImportDeclarationSpecifier,
     ModuleExportName, ObjectExpression, ObjectPropertyKind, PropertyKind, ReturnStatement,
     Statement, StaticMemberExpression, TSInterfaceDeclaration, TSLiteral, TSSignature, TSType,
-    TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator, TemplateLiteral,
-    VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator, TSTypeQueryExprName,
+    TemplateLiteral, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -41,6 +41,7 @@ type FiniteRecordBindings = BTreeMap<String, FiniteRecords>;
 type FiniteRecordMaps = BTreeMap<String, FiniteRecords>;
 type TypeDomains = BTreeMap<String, FiniteStrings>;
 type TypePropertyDomains = BTreeMap<String, BTreeMap<String, FiniteStrings>>;
+type PropertyDomains = BTreeMap<String, FiniteStrings>;
 
 #[derive(Debug, Clone, Default)]
 struct FiniteRecord {
@@ -786,6 +787,7 @@ struct SourceUsageCollector {
     typed_object_property_domains: TypePropertyDomains,
     type_domains: TypeDomains,
     type_property_domains: TypePropertyDomains,
+    zod_schema_property_domains: TypePropertyDomains,
     enum_member_domains: TypeDomains,
     translators: BTreeMap<String, TranslatorBinding>,
     scan: UsageScan,
@@ -1022,6 +1024,31 @@ fn ts_type_name_identifier<'a>(name: &'a TSTypeName<'a>) -> Option<&'a str> {
     }
 }
 
+fn ts_type_name_parts(name: &TSTypeName<'_>) -> Option<Vec<String>> {
+    match name {
+        TSTypeName::IdentifierReference(identifier) => Some(vec![identifier.name.to_string()]),
+        TSTypeName::QualifiedName(qualified) => {
+            let mut parts = ts_type_name_parts(&qualified.left)?;
+            parts.push(qualified.right.name.to_string());
+            Some(parts)
+        }
+        _ => None,
+    }
+}
+
+fn ts_type_query_expr_identifier<'a>(name: &'a TSTypeQueryExprName<'a>) -> Option<&'a str> {
+    match name {
+        TSTypeQueryExprName::IdentifierReference(identifier) => Some(identifier.name.as_str()),
+        _ => None,
+    }
+}
+
+fn is_identifier_expression(expression: &Expression<'_>, expected: &str) -> bool {
+    expression
+        .get_identifier_reference()
+        .is_some_and(|identifier| identifier.name == expected)
+}
+
 fn finite_strings_from_ts_type(
     ty: &TSType<'_>,
     type_domains: &TypeDomains,
@@ -1117,9 +1144,10 @@ fn finite_iterable_from_ts_type(
 
 fn property_domains_from_type_literal(
     members: &[TSSignature<'_>],
+    _type_property_domains: &TypePropertyDomains,
     type_domains: &TypeDomains,
     enum_member_domains: &TypeDomains,
-) -> BTreeMap<String, FiniteStrings> {
+) -> PropertyDomains {
     let mut properties = BTreeMap::new();
     for member in members {
         let TSSignature::TSPropertySignature(property) = member else {
@@ -1152,21 +1180,106 @@ fn property_domains_from_type_literal(
     properties
 }
 
+fn type_literal_property_annotation<'a>(
+    members: &'a [TSSignature<'a>],
+    property_name: &str,
+) -> Option<&'a TSType<'a>> {
+    for member in members {
+        let TSSignature::TSPropertySignature(property) = member else {
+            continue;
+        };
+        if property.computed {
+            continue;
+        }
+        if property
+            .key
+            .static_name()
+            .is_some_and(|name| name == property_name)
+        {
+            return property
+                .type_annotation
+                .as_ref()
+                .map(|annotation| &annotation.type_annotation);
+        }
+    }
+    None
+}
+
+fn merge_property_domains(
+    left: PropertyDomains,
+    right: PropertyDomains,
+) -> Option<PropertyDomains> {
+    let mut merged = left;
+    for (property, values) in right {
+        let entry = merged.entry(property).or_default();
+        entry.extend(values);
+        if entry.len() > MAX_FINITE_STRINGS {
+            return None;
+        }
+    }
+    Some(merged)
+}
+
 fn property_domains_from_ts_type(
     ty: &TSType<'_>,
     type_property_domains: &TypePropertyDomains,
     type_domains: &TypeDomains,
     enum_member_domains: &TypeDomains,
-) -> Option<BTreeMap<String, FiniteStrings>> {
+    zod_schema_property_domains: &TypePropertyDomains,
+) -> Option<PropertyDomains> {
     match ty {
         TSType::TSTypeLiteral(literal) => Some(property_domains_from_type_literal(
             &literal.members,
+            type_property_domains,
             type_domains,
             enum_member_domains,
         ))
         .filter(|properties| !properties.is_empty()),
+        TSType::TSUnionType(union) => {
+            let mut merged = BTreeMap::new();
+            for ty in &union.types {
+                if let Some(properties) = property_domains_from_ts_type(
+                    ty,
+                    type_property_domains,
+                    type_domains,
+                    enum_member_domains,
+                    zod_schema_property_domains,
+                ) {
+                    merged = merge_property_domains(merged, properties)?;
+                }
+            }
+            Some(merged).filter(|properties| !properties.is_empty())
+        }
+        TSType::TSParenthesizedType(parenthesized) => property_domains_from_ts_type(
+            &parenthesized.type_annotation,
+            type_property_domains,
+            type_domains,
+            enum_member_domains,
+            zod_schema_property_domains,
+        ),
         TSType::TSTypeReference(reference) => {
+            if ts_type_name_parts(&reference.type_name)
+                .is_some_and(|parts| parts.len() == 2 && parts[0] == "z" && parts[1] == "infer")
+            {
+                let first = reference.type_arguments.as_ref()?.params.first()?;
+                let TSType::TSTypeQuery(query) = first else {
+                    return None;
+                };
+                let schema_name = ts_type_query_expr_identifier(&query.expr_name)?;
+                return zod_schema_property_domains.get(schema_name).cloned();
+            }
+
             let name = ts_type_name_identifier(&reference.type_name)?;
+            if matches!(name, "UseFormReturn" | "Partial" | "Required" | "Readonly") {
+                let first = reference.type_arguments.as_ref()?.params.first()?;
+                return property_domains_from_ts_type(
+                    first,
+                    type_property_domains,
+                    type_domains,
+                    enum_member_domains,
+                    zod_schema_property_domains,
+                );
+            }
             type_property_domains.get(name).cloned()
         }
         TSType::TSTypeOperatorType(operator)
@@ -1177,6 +1290,7 @@ fn property_domains_from_ts_type(
                 type_property_domains,
                 type_domains,
                 enum_member_domains,
+                zod_schema_property_domains,
             )
         }
         _ => None,
@@ -3134,6 +3248,7 @@ impl SourceUsageCollector {
             typed_object_property_domains: BTreeMap::new(),
             type_domains: BTreeMap::new(),
             type_property_domains: BTreeMap::new(),
+            zod_schema_property_domains: BTreeMap::new(),
             enum_member_domains: BTreeMap::new(),
             translators: BTreeMap::new(),
             scan: UsageScan::default(),
@@ -3162,6 +3277,172 @@ impl SourceUsageCollector {
         }
     }
 
+    fn zod_schema_property_domains_from_expression(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<PropertyDomains> {
+        match expression.get_inner_expression() {
+            Expression::CallExpression(call) => {
+                let member = call.callee.get_member_expr()?;
+                let method = member.static_property_name()?;
+                if method == "object" && is_identifier_expression(member.object(), "z") {
+                    let Argument::ObjectExpression(object) = call.arguments.first()? else {
+                        return None;
+                    };
+                    return self.zod_schema_property_domains_from_object(object);
+                }
+
+                if matches!(
+                    method.as_ref(),
+                    "and"
+                        | "brand"
+                        | "catch"
+                        | "default"
+                        | "describe"
+                        | "nullable"
+                        | "nullish"
+                        | "optional"
+                        | "or"
+                        | "pipe"
+                        | "readonly"
+                        | "refine"
+                        | "superRefine"
+                        | "transform"
+                ) {
+                    return self.zod_schema_property_domains_from_expression(member.object());
+                }
+
+                None
+            }
+            Expression::TSAsExpression(expression) => {
+                self.zod_schema_property_domains_from_expression(&expression.expression)
+            }
+            Expression::TSSatisfiesExpression(expression) => {
+                self.zod_schema_property_domains_from_expression(&expression.expression)
+            }
+            Expression::TSNonNullExpression(expression) => {
+                self.zod_schema_property_domains_from_expression(&expression.expression)
+            }
+            Expression::TSTypeAssertion(expression) => {
+                self.zod_schema_property_domains_from_expression(&expression.expression)
+            }
+            _ => None,
+        }
+    }
+
+    fn zod_schema_property_domains_from_object(
+        &self,
+        object: &ObjectExpression<'_>,
+    ) -> Option<PropertyDomains> {
+        let mut properties = BTreeMap::new();
+        for property in &object.properties {
+            let ObjectPropertyKind::ObjectProperty(property) = property else {
+                continue;
+            };
+            if property.kind != PropertyKind::Init || property.method || property.computed {
+                continue;
+            }
+            let Some(name) = property.key.static_name() else {
+                continue;
+            };
+            if let Some(values) = self.zod_finite_values_from_expression(&property.value) {
+                properties.insert(name.to_string(), values);
+            }
+        }
+        Some(properties).filter(|properties| !properties.is_empty())
+    }
+
+    fn zod_finite_values_from_expression(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<FiniteStrings> {
+        match expression.get_inner_expression() {
+            Expression::CallExpression(call) => self.zod_finite_values_from_call(call),
+            Expression::TSAsExpression(expression) => {
+                self.zod_finite_values_from_expression(&expression.expression)
+            }
+            Expression::TSSatisfiesExpression(expression) => {
+                self.zod_finite_values_from_expression(&expression.expression)
+            }
+            Expression::TSNonNullExpression(expression) => {
+                self.zod_finite_values_from_expression(&expression.expression)
+            }
+            Expression::TSTypeAssertion(expression) => {
+                self.zod_finite_values_from_expression(&expression.expression)
+            }
+            _ => None,
+        }
+    }
+
+    fn zod_finite_values_from_call(&self, call: &CallExpression<'_>) -> Option<FiniteStrings> {
+        let member = call.callee.get_member_expr()?;
+        let method = member.static_property_name()?;
+        if method == "enum" && is_identifier_expression(member.object(), "z") {
+            let first = call.arguments.first()?;
+            return self.finite_iterable_from_zod_argument(first);
+        }
+        if method == "literal" && is_identifier_expression(member.object(), "z") {
+            let first = call.arguments.first()?;
+            return self.finite_strings_from_argument(first);
+        }
+        if method == "union" && is_identifier_expression(member.object(), "z") {
+            let Argument::ArrayExpression(array) = call.arguments.first()? else {
+                return None;
+            };
+            let mut values = BTreeSet::new();
+            for element in &array.elements {
+                let ArrayExpressionElement::CallExpression(call) = element else {
+                    return None;
+                };
+                values.extend(self.zod_finite_values_from_call(call)?);
+                if values.len() > MAX_FINITE_STRINGS {
+                    return None;
+                }
+            }
+            return Some(values);
+        }
+
+        if matches!(
+            method.as_ref(),
+            "and"
+                | "brand"
+                | "catch"
+                | "default"
+                | "describe"
+                | "nullable"
+                | "nullish"
+                | "optional"
+                | "or"
+                | "pipe"
+                | "readonly"
+                | "refine"
+                | "superRefine"
+                | "transform"
+        ) {
+            return self.zod_finite_values_from_expression(member.object());
+        }
+
+        None
+    }
+
+    fn finite_iterable_from_zod_argument(&self, argument: &Argument<'_>) -> Option<FiniteStrings> {
+        match argument {
+            Argument::ArrayExpression(array) => finite_iterable_from_array_elements(
+                array.elements.iter(),
+                &self.finite_constants,
+                &self.finite_iterables,
+                &self.finite_object_maps,
+                &self.enum_member_domains,
+            ),
+            Argument::Identifier(identifier) => self
+                .finite_iterables
+                .get(identifier.name.as_str())
+                .cloned()
+                .or_else(|| self.finite_iterable_for_imported_identifier(identifier.name.as_str())),
+            _ => self.finite_strings_from_argument(argument),
+        }
+    }
+
     fn record_ts_type_alias(&mut self, declaration: &TSTypeAliasDeclaration<'_>) {
         let name = declaration.id.name.as_str();
         if let Some(values) = finite_strings_from_ts_type(
@@ -3176,6 +3457,7 @@ impl SourceUsageCollector {
             &self.type_property_domains,
             &self.type_domains,
             &self.enum_member_domains,
+            &self.zod_schema_property_domains,
         ) {
             self.type_property_domains
                 .insert(name.to_string(), properties);
@@ -3185,6 +3467,7 @@ impl SourceUsageCollector {
     fn record_ts_interface(&mut self, declaration: &TSInterfaceDeclaration<'_>) {
         let properties = property_domains_from_type_literal(
             &declaration.body.body,
+            &self.type_property_domains,
             &self.type_domains,
             &self.enum_member_domains,
         );
@@ -3219,6 +3502,7 @@ impl SourceUsageCollector {
                 &self.type_property_domains,
                 &self.type_domains,
                 &self.enum_member_domains,
+                &self.zod_schema_property_domains,
             ) {
                 self.typed_object_property_domains
                     .insert(name.to_string(), properties);
@@ -3229,13 +3513,17 @@ impl SourceUsageCollector {
         let BindingPattern::ObjectPattern(object) = pattern else {
             return;
         };
-        let Some(properties) = property_domains_from_ts_type(
+        let properties = property_domains_from_ts_type(
             type_annotation,
             &self.type_property_domains,
             &self.type_domains,
             &self.enum_member_domains,
-        ) else {
-            return;
+            &self.zod_schema_property_domains,
+        )
+        .unwrap_or_default();
+        let type_literal_members = match type_annotation {
+            TSType::TSTypeLiteral(literal) => Some(literal.members.as_slice()),
+            _ => None,
         };
         for property in &object.properties {
             if property.computed {
@@ -3244,14 +3532,27 @@ impl SourceUsageCollector {
             let Some(property_name) = property.key.static_name() else {
                 continue;
             };
-            let Some(values) = properties.get(property_name.as_ref()) else {
-                continue;
-            };
             if let Some(binding_name) = binding_identifier_name(&property.value) {
-                self.finite_iterables
-                    .insert(binding_name.to_string(), values.clone());
-                self.finite_constants
-                    .insert(binding_name.to_string(), values.clone());
+                if let Some(values) = properties.get(property_name.as_ref()) {
+                    self.finite_iterables
+                        .insert(binding_name.to_string(), values.clone());
+                    self.finite_constants
+                        .insert(binding_name.to_string(), values.clone());
+                }
+                if let Some(property_type) = type_literal_members.and_then(|members| {
+                    type_literal_property_annotation(members, property_name.as_ref())
+                }) {
+                    if let Some(properties) = property_domains_from_ts_type(
+                        property_type,
+                        &self.type_property_domains,
+                        &self.type_domains,
+                        &self.enum_member_domains,
+                        &self.zod_schema_property_domains,
+                    ) {
+                        self.typed_object_property_domains
+                            .insert(binding_name.to_string(), properties);
+                    }
+                }
             }
         }
     }
@@ -3673,13 +3974,31 @@ impl SourceUsageCollector {
         property: &str,
     ) -> Option<FiniteStrings> {
         let object = object.get_identifier_reference()?;
-        let records = self.finite_record_constants.get(object.name.as_str())?;
-        finite_record_property_strings(records, property)
+        if let Some(records) = self.finite_record_constants.get(object.name.as_str()) {
+            if let Some(values) = finite_record_property_strings(records, property) {
+                return Some(values);
+            }
+        }
+        self.typed_object_property_domains
+            .get(object.name.as_str())?
+            .get(property)
+            .cloned()
     }
 
     fn finite_strings_from_call(&self, call: &CallExpression<'_>) -> Option<FiniteStrings> {
         if let Some(values) = self.finite_strings_from_typed_property_call(call) {
             return Some(values);
+        }
+        if call.arguments.is_empty() {
+            if let Some(member) = call.callee.get_member_expr() {
+                if let Some(method) = member.static_property_name() {
+                    if let Some(values) = self.finite_strings_from_expression(member.object()) {
+                        if let Some(values) = transform_finite_strings(values, &method) {
+                            return Some(values);
+                        }
+                    }
+                }
+            }
         }
         self.return_helper_for_callee(&call.callee).or_else(|| {
             finite_strings_from_call(
@@ -3715,6 +4034,69 @@ impl SourceUsageCollector {
         properties.get(&property).cloned()
     }
 
+    fn property_domains_from_expression(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<PropertyDomains> {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => self
+                .typed_object_property_domains
+                .get(identifier.name.as_str())
+                .cloned(),
+            Expression::CallExpression(call) => self.property_domains_from_call(call),
+            Expression::LogicalExpression(logical)
+                if logical.operator == LogicalOperator::Coalesce =>
+            {
+                let left = self.property_domains_from_expression(&logical.left);
+                let right = self.property_domains_from_expression(&logical.right);
+                match (left, right) {
+                    (Some(left), Some(right)) => merge_property_domains(left, right),
+                    (Some(values), None) | (None, Some(values)) => Some(values),
+                    (None, None) => None,
+                }
+            }
+            Expression::TSAsExpression(expression) => property_domains_from_ts_type(
+                &expression.type_annotation,
+                &self.type_property_domains,
+                &self.type_domains,
+                &self.enum_member_domains,
+                &self.zod_schema_property_domains,
+            )
+            .or_else(|| self.property_domains_from_expression(&expression.expression)),
+            Expression::TSSatisfiesExpression(expression) => property_domains_from_ts_type(
+                &expression.type_annotation,
+                &self.type_property_domains,
+                &self.type_domains,
+                &self.enum_member_domains,
+                &self.zod_schema_property_domains,
+            )
+            .or_else(|| self.property_domains_from_expression(&expression.expression)),
+            Expression::TSNonNullExpression(expression) => {
+                self.property_domains_from_expression(&expression.expression)
+            }
+            Expression::TSTypeAssertion(expression) => property_domains_from_ts_type(
+                &expression.type_annotation,
+                &self.type_property_domains,
+                &self.type_domains,
+                &self.enum_member_domains,
+                &self.zod_schema_property_domains,
+            )
+            .or_else(|| self.property_domains_from_expression(&expression.expression)),
+            _ => None,
+        }
+    }
+
+    fn property_domains_from_call(&self, call: &CallExpression<'_>) -> Option<PropertyDomains> {
+        let member = call.callee.get_member_expr()?;
+        if !call.arguments.is_empty() || member.static_property_name()? != "getValues" {
+            return None;
+        }
+        let object = member.object().get_identifier_reference()?;
+        self.typed_object_property_domains
+            .get(object.name.as_str())
+            .cloned()
+    }
+
     fn property_domains_from_call_type_arguments(
         &self,
         expression: &Expression<'_>,
@@ -3728,6 +4110,7 @@ impl SourceUsageCollector {
             &self.type_property_domains,
             &self.type_domains,
             &self.enum_member_domains,
+            &self.zod_schema_property_domains,
         )
     }
 
@@ -3949,6 +4332,11 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     if let Some(annotation) = &declarator.type_annotation {
                         self.bind_pattern_type_domains(&declarator.id, &annotation.type_annotation);
                     }
+                    if let Some(properties) = self.zod_schema_property_domains_from_expression(init)
+                    {
+                        self.zod_schema_property_domains
+                            .insert(name.to_string(), properties);
+                    }
                     if let Some(values) = self.finite_strings_from_expression(init) {
                         self.finite_constants.insert(name.to_string(), values);
                     }
@@ -3993,6 +4381,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                         self.finite_record_maps.insert(name.to_string(), values);
                     }
                     if let Some(properties) = self.property_domains_from_call_type_arguments(init) {
+                        self.typed_object_property_domains
+                            .insert(name.to_string(), properties);
+                    }
+                    if let Some(properties) = self.property_domains_from_expression(init) {
                         self.typed_object_property_domains
                             .insert(name.to_string(), properties);
                     }
@@ -4298,6 +4690,58 @@ mod tests {
         );
         assert!(scan.used_ids.contains("users.user-types.ADMIN"));
         assert!(scan.used_ids.contains("users.user-types.USER"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_zod_inferred_use_form_watch_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            import {useForm} from 'react-hook-form';
+            import {z} from 'zod';
+            const RELATION_VALUES = ['parent', 'partner'] as const;
+            const EmergencyContactFormSchema = z
+              .object({
+                relation: z.enum(RELATION_VALUES),
+              })
+              .superRefine(() => {});
+            type EmergencyContactFormValues = z.infer<typeof EmergencyContactFormSchema>;
+            const form = useForm<EmergencyContactFormValues>();
+            const relation = form.watch('relation');
+            const tRelation = useTranslations('users.relations');
+            tRelation(relation);
+            "#,
+        );
+        assert!(scan.used_ids.contains("users.relations.parent"));
+        assert!(scan.used_ids.contains("users.relations.partner"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_zod_inferred_use_watch_value_properties() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            import {UseFormReturn, useWatch} from 'react-hook-form';
+            import {z} from 'zod';
+            const RELATION_VALUES = ['parent', 'partner'] as const;
+            const EmergencyContactFormSchema = z.object({
+              relation: z.enum(RELATION_VALUES),
+            });
+            type EmergencyContactFormValues = z.infer<typeof EmergencyContactFormSchema>;
+            function Fields({form}: {form: UseFormReturn<EmergencyContactFormValues>}) {
+              const watchedValues = useWatch({
+                control: form.control,
+              }) as EmergencyContactFormValues | undefined;
+              const values = watchedValues ?? form.getValues();
+              const tRelation = useTranslations('users.relations');
+              tRelation(values.relation);
+            }
+            "#,
+        );
+        assert!(scan.used_ids.contains("users.relations.parent"));
+        assert!(scan.used_ids.contains("users.relations.partner"));
         assert!(scan.dynamic_usages.is_empty());
     }
 
