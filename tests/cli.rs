@@ -1133,6 +1133,38 @@ fn unused_resolves_imported_finite_iterable_keys() {
 }
 
 #[test]
+fn unused_resolves_member_keys_from_imported_enum_value_constants() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("users.user-types.ADMIN", "Admin"),
+            ("users.user-types.PROJECT_MANAGER", "Project manager"),
+            ("users.user-types.EXTENDED_USER", "Extended user"),
+            ("users.user-types.USER", "User"),
+            ("users.user-types.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("users-presenter.ts"),
+        "import {TenantUserType} from '@digitech/db/types';\nexport const TENANT_USER_TYPE_VALUES = [\n  TenantUserType.ADMIN,\n  TenantUserType.PROJECT_MANAGER,\n  TenantUserType.EXTENDED_USER,\n  TenantUserType.USER,\n] as const;\n",
+    )
+    .expect("write values");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {TENANT_USER_TYPE_VALUES} from './users-presenter';\nconst tUsers = useTranslations('users');\ntUsers(`user-types.${row.original.userType}`);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("users.user-types.unused\n");
+}
+
+#[test]
 fn unused_resolves_export_specifier_finite_iterable_keys() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(

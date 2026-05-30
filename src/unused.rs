@@ -1049,6 +1049,61 @@ fn is_identifier_expression(expression: &Expression<'_>, expected: &str) -> bool
         .is_some_and(|identifier| identifier.name == expected)
 }
 
+fn singularize_constant_word(word: &str) -> String {
+    if word.ends_with("ies") && word.len() > 3 {
+        format!("{}y", &word[..word.len() - 3])
+    } else if word.ends_with("ses") && word.len() > 3 {
+        word[..word.len() - 2].to_string()
+    } else if word.ends_with('s') && word.len() > 1 {
+        word[..word.len() - 1].to_string()
+    } else {
+        word.to_string()
+    }
+}
+
+fn lower_camel(words: &[String]) -> String {
+    let Some((first, rest)) = words.split_first() else {
+        return String::new();
+    };
+    let mut value = first.clone();
+    for word in rest {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            value.push(first.to_ascii_uppercase());
+            value.extend(chars);
+        }
+    }
+    value
+}
+
+fn property_names_from_value_constant_name(name: &str) -> BTreeSet<String> {
+    let mut words: Vec<String> = name
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_ascii_lowercase())
+        .collect();
+    if words.is_empty() {
+        return BTreeSet::new();
+    }
+
+    if matches!(
+        words.last().map(String::as_str),
+        Some("values" | "options" | "items")
+    ) {
+        words.pop();
+    }
+
+    let words: Vec<String> = words
+        .into_iter()
+        .map(|word| singularize_constant_word(&word))
+        .collect();
+    let mut properties = BTreeSet::new();
+    for start in 0..words.len() {
+        properties.insert(lower_camel(&words[start..]));
+    }
+    properties
+}
+
 fn finite_strings_from_ts_type(
     ty: &TSType<'_>,
     type_domains: &TypeDomains,
@@ -3654,6 +3709,30 @@ impl SourceUsageCollector {
             .finite_iterable_for_import(&self.path, target)
     }
 
+    fn finite_strings_for_property_name(&self, property: &str) -> Option<FiniteStrings> {
+        let mut values = BTreeSet::new();
+        for (name, domain) in &self.finite_iterables {
+            if property_names_from_value_constant_name(name).contains(property) {
+                values.extend(domain.iter().cloned());
+            }
+        }
+        if let (Some(file_index), Some(project)) = (&self.file_index, &self.project) {
+            for (name, target) in &file_index.imports {
+                if !property_names_from_value_constant_name(name).contains(property) {
+                    continue;
+                }
+                if let Some(domain) = project.finite_iterable_for_import(&self.path, target) {
+                    values.extend(domain);
+                }
+            }
+        }
+        if values.is_empty() || values.len() > MAX_FINITE_STRINGS {
+            None
+        } else {
+            Some(values)
+        }
+    }
+
     fn finite_record_iterable_from_expression(
         &self,
         expression: &Expression<'_>,
@@ -3927,8 +4006,10 @@ impl SourceUsageCollector {
     fn finite_strings_from_argument(&self, argument: &Argument<'_>) -> Option<FiniteStrings> {
         match argument {
             Argument::CallExpression(call) => self.finite_strings_from_call(call),
+            Argument::TemplateLiteral(literal) => self.finite_strings_from_template(literal),
             Argument::StaticMemberExpression(member) => self
                 .finite_strings_from_record_member(&member.object, member.property.name.as_str())
+                .or_else(|| self.finite_strings_for_property_name(member.property.name.as_str()))
                 .or_else(|| {
                     finite_strings_from_argument(
                         argument,
@@ -3949,8 +4030,10 @@ impl SourceUsageCollector {
     fn finite_strings_from_expression(&self, expression: &Expression<'_>) -> Option<FiniteStrings> {
         match expression.get_inner_expression() {
             Expression::CallExpression(call) => self.finite_strings_from_call(call),
+            Expression::TemplateLiteral(literal) => self.finite_strings_from_template(literal),
             Expression::StaticMemberExpression(member) => self
                 .finite_strings_from_record_member(&member.object, member.property.name.as_str())
+                .or_else(|| self.finite_strings_for_property_name(member.property.name.as_str()))
                 .or_else(|| {
                     finite_strings_from_expression(
                         expression,
@@ -3966,6 +4049,20 @@ impl SourceUsageCollector {
                 &self.enum_member_domains,
             ),
         }
+    }
+
+    fn finite_strings_from_template(&self, literal: &TemplateLiteral<'_>) -> Option<FiniteStrings> {
+        let mut values = finite_string("");
+        for (index, quasi) in literal.quasis.iter().enumerate() {
+            let cooked = quasi.value.cooked.as_ref()?;
+            values = append_finite_strings(values, &finite_string(cooked.to_string()))?;
+
+            if let Some(expression) = literal.expressions.get(index) {
+                let expression_values = self.finite_strings_from_expression(expression)?;
+                values = append_finite_strings(values, &expression_values)?;
+            }
+        }
+        Some(values)
     }
 
     fn finite_strings_from_record_member(
@@ -4643,6 +4740,21 @@ mod tests {
         );
         assert!(scan.used_ids.contains("users.user-types.ADMIN"));
         assert!(scan.used_ids.contains("users.user-types.USER"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_property_values_from_matching_finite_value_constants() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const VARIABLE_TYPES = ['NUMBER', 'TEXT'] as const;
+            const t = useTranslations('template');
+            t(`variables.types.${variable.type.toLowerCase()}`);
+            "#,
+        );
+        assert!(scan.used_ids.contains("template.variables.types.number"));
+        assert!(scan.used_ids.contains("template.variables.types.text"));
         assert!(scan.dynamic_usages.is_empty());
     }
 
