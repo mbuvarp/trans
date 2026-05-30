@@ -555,25 +555,7 @@ fn collect_usage_from_files(root: &Path, paths: &[PathBuf]) -> Result<UsageScan>
 }
 
 fn apply_ts_checker_fallback(root: &Path, scan: &mut UsageScan) {
-    let queries: Vec<TsCheckerQuery> = scan
-        .dynamic_usages
-        .iter()
-        .enumerate()
-        .filter_map(|(index, usage)| {
-            let start = usage.key_start?;
-            let end = usage.key_end?;
-            if usage.namespace.is_empty() {
-                return None;
-            }
-            Some(TsCheckerQuery {
-                index,
-                file: usage.path.to_string_lossy().to_string(),
-                start,
-                end,
-                namespace: usage.namespace.clone(),
-            })
-        })
-        .collect();
+    let queries = ts_checker_queries(&scan.dynamic_usages);
     if queries.is_empty() {
         return;
     }
@@ -621,14 +603,12 @@ fn apply_ts_checker_fallback(root: &Path, scan: &mut UsageScan) {
         let Some(usage) = scan.dynamic_usages.get(result.index) else {
             continue;
         };
-        if usage.namespace.is_empty() || result.keys.is_empty() || result.keys.len() > 128 {
+        if result.keys.is_empty() || result.keys.len() > 128 {
             continue;
         }
         for key in &result.keys {
-            let id = if key.is_empty() {
-                usage.namespace.clone()
-            } else {
-                format!("{}.{}", usage.namespace, key)
+            let Some(id) = resolved_translation_id(&usage.namespace, key) else {
+                continue;
             };
             scan.used_ids.insert(id);
         }
@@ -642,6 +622,33 @@ fn apply_ts_checker_fallback(root: &Path, scan: &mut UsageScan) {
             index += 1;
             keep
         });
+    }
+}
+
+fn ts_checker_queries(dynamic_usages: &[DynamicUsage]) -> Vec<TsCheckerQuery> {
+    dynamic_usages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, usage)| {
+            let start = usage.key_start?;
+            let end = usage.key_end?;
+            Some(TsCheckerQuery {
+                index,
+                file: usage.path.to_string_lossy().to_string(),
+                start,
+                end,
+                namespace: usage.namespace.clone(),
+            })
+        })
+        .collect()
+}
+
+fn resolved_translation_id(namespace: &str, key: &str) -> Option<String> {
+    match (namespace.is_empty(), key.is_empty()) {
+        (true, true) => None,
+        (true, false) => Some(key.to_string()),
+        (false, true) => Some(namespace.to_string()),
+        (false, false) => Some(format!("{namespace}.{key}")),
     }
 }
 
@@ -4949,6 +4956,39 @@ mod tests {
             "#,
         );
         assert!(scan.used_ids.contains("common.save"));
+    }
+
+    #[test]
+    fn ts_checker_queries_include_unscoped_dynamic_key_usage() {
+        let queries = ts_checker_queries(&[DynamicUsage {
+            namespace: String::new(),
+            path: PathBuf::from("/tmp/sample.tsx"),
+            line: 1,
+            key_start: Some(10),
+            key_end: Some(20),
+        }]);
+
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].namespace, "");
+        assert_eq!(queries[0].start, 10);
+        assert_eq!(queries[0].end, 20);
+    }
+
+    #[test]
+    fn resolved_translation_id_handles_scoped_and_unscoped_keys() {
+        assert_eq!(
+            resolved_translation_id("", "common.save"),
+            Some("common.save".to_string())
+        );
+        assert_eq!(
+            resolved_translation_id("common", "save"),
+            Some("common.save".to_string())
+        );
+        assert_eq!(
+            resolved_translation_id("common", ""),
+            Some("common".to_string())
+        );
+        assert_eq!(resolved_translation_id("", ""), None);
     }
 
     #[test]
