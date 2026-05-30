@@ -9,7 +9,8 @@ use oxc_ast::ast::{
     ConditionalExpression, Declaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
     ExportNamedDeclaration, Expression, ForOfStatement, ForStatementLeft, Function, FunctionBody,
     ImportDeclaration, ImportDeclarationSpecifier, ModuleExportName, ObjectPropertyKind,
-    TemplateLiteral, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    ReturnStatement, Statement, TemplateLiteral, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -85,8 +86,11 @@ struct ProjectIndex {
 struct SourceFileIndex {
     imports: BTreeMap<String, ImportTarget>,
     helpers: BTreeMap<String, HelperSummary>,
+    return_helpers: BTreeMap<String, FiniteStrings>,
     named_exports: BTreeMap<String, HelperSummary>,
+    named_return_exports: BTreeMap<String, FiniteStrings>,
     default_export: Option<HelperSummary>,
+    default_return_export: Option<FiniteStrings>,
 }
 
 #[derive(Debug, Clone)]
@@ -478,6 +482,19 @@ impl ProjectIndex {
         }
     }
 
+    fn return_helper_for_import(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+    ) -> Option<FiniteStrings> {
+        let path = self.resolve_module(from, &target.source)?;
+        let file = self.files.get(&path)?;
+        match &target.imported {
+            ImportedName::Named(name) => file.named_return_exports.get(name).cloned(),
+            ImportedName::Default => file.default_return_export.clone(),
+        }
+    }
+
     fn resolve_module(&self, from: &Path, source: &str) -> Option<PathBuf> {
         if source.starts_with('.') {
             let base = from.parent()?.join(source);
@@ -505,6 +522,10 @@ impl ProjectIndex {
 impl SourceFileIndex {
     fn helper_for_local(&self, name: &str) -> Option<HelperSummary> {
         self.helpers.get(name).cloned()
+    }
+
+    fn return_helper_for_local(&self, name: &str) -> Option<FiniteStrings> {
+        self.return_helpers.get(name).cloned()
     }
 }
 
@@ -737,6 +758,45 @@ fn helper_summary_from_body(
 
     HelperSummary {
         param_usages: collector.usages,
+    }
+}
+
+fn finite_return_summary_from_expression(expression: &Expression<'_>) -> Option<FiniteStrings> {
+    match expression.get_inner_expression() {
+        Expression::ArrowFunctionExpression(arrow) => finite_return_summary_from_arrow(arrow),
+        Expression::FunctionExpression(function) => finite_return_summary_from_function(function),
+        _ => None,
+    }
+}
+
+fn finite_return_summary_from_arrow(arrow: &ArrowFunctionExpression<'_>) -> Option<FiniteStrings> {
+    if arrow.expression {
+        if let Some(Statement::ExpressionStatement(statement)) = arrow.body.statements.first() {
+            return finite_strings_from_expression(&statement.expression, &BTreeMap::new());
+        }
+    }
+    finite_return_summary_from_body(&arrow.body)
+}
+
+fn finite_return_summary_from_function(function: &Function<'_>) -> Option<FiniteStrings> {
+    let body = function.body.as_ref()?;
+    finite_return_summary_from_body(body)
+}
+
+fn finite_return_summary_from_body(body: &FunctionBody<'_>) -> Option<FiniteStrings> {
+    let mut collector = ReturnValueCollector {
+        finite_constants: BTreeMap::new(),
+        finite_iterables: BTreeMap::new(),
+        return_values: BTreeSet::new(),
+        unknown_return: false,
+    };
+    for statement in &body.statements {
+        collector.visit_statement(statement);
+    }
+    if collector.unknown_return || collector.return_values.is_empty() {
+        None
+    } else {
+        Some(collector.return_values)
     }
 }
 
@@ -1146,39 +1206,114 @@ impl<'a> Visit<'a> for HelperBodyCollector {
     }
 }
 
+struct ReturnValueCollector {
+    finite_constants: BTreeMap<String, FiniteStrings>,
+    finite_iterables: BTreeMap<String, FiniteStrings>,
+    return_values: FiniteStrings,
+    unknown_return: bool,
+}
+
+impl ReturnValueCollector {
+    fn finite_iterable_from_expression(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<FiniteStrings> {
+        finite_iterable_from_expression(expression, &self.finite_constants, &self.finite_iterables)
+    }
+}
+
+impl<'a> Visit<'a> for ReturnValueCollector {
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if declarator.kind == VariableDeclarationKind::Const {
+            if let Some(name) = binding_identifier_name(&declarator.id) {
+                if let Some(init) = &declarator.init {
+                    if let Some(values) =
+                        finite_strings_from_expression(init, &self.finite_constants)
+                    {
+                        self.finite_constants.insert(name.to_string(), values);
+                    }
+                    if let Some(values) = self.finite_iterable_from_expression(init) {
+                        self.finite_iterables.insert(name.to_string(), values);
+                    }
+                }
+            }
+        }
+        walk::walk_variable_declarator(self, declarator);
+    }
+
+    fn visit_return_statement(&mut self, statement: &ReturnStatement<'a>) {
+        let Some(argument) = &statement.argument else {
+            self.unknown_return = true;
+            return;
+        };
+        let Some(values) = finite_strings_from_expression(argument, &self.finite_constants) else {
+            self.unknown_return = true;
+            return;
+        };
+        self.return_values.extend(values);
+        if self.return_values.len() > MAX_FINITE_STRINGS {
+            self.unknown_return = true;
+        }
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+
+    fn visit_arrow_function_expression(&mut self, _arrow: &ArrowFunctionExpression<'a>) {}
+}
+
 #[derive(Default)]
 struct SourceIndexCollector {
     imports: BTreeMap<String, ImportTarget>,
     helpers: BTreeMap<String, HelperSummary>,
+    return_helpers: BTreeMap<String, FiniteStrings>,
     export_locals: BTreeMap<String, String>,
     default_local: Option<String>,
     default_summary: Option<HelperSummary>,
+    default_return_summary: Option<FiniteStrings>,
 }
 
 impl SourceIndexCollector {
     fn finish(self) -> SourceFileIndex {
         let mut named_exports = BTreeMap::new();
+        let mut named_return_exports = BTreeMap::new();
         for (exported, local) in self.export_locals {
             if let Some(summary) = self.helpers.get(&local) {
-                named_exports.insert(exported, summary.clone());
+                named_exports.insert(exported.clone(), summary.clone());
+            }
+            if let Some(summary) = self.return_helpers.get(&local) {
+                named_return_exports.insert(exported, summary.clone());
             }
         }
 
+        let default_local = self.default_local;
         let default_export = self.default_summary.or_else(|| {
-            self.default_local
-                .and_then(|name| self.helpers.get(&name).cloned())
+            default_local
+                .as_ref()
+                .and_then(|name| self.helpers.get(name).cloned())
+        });
+        let default_return_export = self.default_return_summary.or_else(|| {
+            default_local
+                .as_ref()
+                .and_then(|name| self.return_helpers.get(name).cloned())
         });
 
         SourceFileIndex {
             imports: self.imports,
             helpers: self.helpers,
+            return_helpers: self.return_helpers,
             named_exports,
+            named_return_exports,
             default_export,
+            default_return_export,
         }
     }
 
     fn record_helper(&mut self, name: &str, summary: HelperSummary) {
         self.helpers.insert(name.to_string(), summary);
+    }
+
+    fn record_return_helper(&mut self, name: &str, summary: FiniteStrings) {
+        self.return_helpers.insert(name.to_string(), summary);
     }
 
     fn record_variable_helpers(&mut self, declaration: &VariableDeclaration<'_>) {
@@ -1191,6 +1326,9 @@ impl SourceIndexCollector {
             };
             if let Some(summary) = helper_summary_from_expression(init) {
                 self.record_helper(name, summary);
+            }
+            if let Some(summary) = finite_return_summary_from_expression(init) {
+                self.record_return_helper(name, summary);
             }
         }
     }
@@ -1237,11 +1375,17 @@ impl SourceIndexCollector {
                 if let Some(summary) = helper_summary_from_function(function) {
                     self.default_summary = Some(summary);
                 }
+                if let Some(summary) = finite_return_summary_from_function(function) {
+                    self.default_return_summary = Some(summary);
+                }
                 if let Some(id) = &function.id {
                     self.record_helper(
                         id.name.as_str(),
                         self.default_summary.clone().unwrap_or_default(),
                     );
+                    if let Some(summary) = self.default_return_summary.clone() {
+                        self.record_return_helper(id.name.as_str(), summary);
+                    }
                 }
             }
             ExportDefaultDeclarationKind::Identifier(identifier) => {
@@ -1249,9 +1393,11 @@ impl SourceIndexCollector {
             }
             ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
                 self.default_summary = Some(helper_summary_from_arrow(arrow));
+                self.default_return_summary = finite_return_summary_from_arrow(arrow);
             }
             ExportDefaultDeclarationKind::FunctionExpression(function) => {
                 self.default_summary = helper_summary_from_function(function);
+                self.default_return_summary = finite_return_summary_from_function(function);
             }
             _ => {}
         }
@@ -1299,6 +1445,9 @@ impl<'a> Visit<'a> for SourceIndexCollector {
             if let Some(summary) = helper_summary_from_function(function) {
                 self.record_helper(id.name.as_str(), summary);
             }
+            if let Some(summary) = finite_return_summary_from_function(function) {
+                self.record_return_helper(id.name.as_str(), summary);
+            }
         }
         walk::walk_function(self, function, flags);
     }
@@ -1308,6 +1457,9 @@ impl<'a> Visit<'a> for SourceIndexCollector {
             if let Some(init) = &declarator.init {
                 if let Some(summary) = helper_summary_from_expression(init) {
                     self.record_helper(name, summary);
+                }
+                if let Some(summary) = finite_return_summary_from_expression(init) {
+                    self.record_return_helper(name, summary);
                 }
             }
         }
@@ -1436,12 +1588,12 @@ impl SourceUsageCollector {
     }
 
     fn string_from_argument(&self, argument: &Argument<'_>) -> Option<String> {
-        finite_strings_from_argument(argument, &self.finite_constants)
+        self.finite_strings_from_argument(argument)
             .and_then(|values| single_finite_string(&values))
     }
 
     fn string_from_expression(&self, expression: &Expression<'_>) -> Option<String> {
-        finite_strings_from_expression(expression, &self.finite_constants)
+        self.finite_strings_from_expression(expression)
             .and_then(|values| single_finite_string(&values))
     }
 
@@ -1533,6 +1685,21 @@ impl SourceUsageCollector {
             return false;
         };
         self.use_extracted.contains(callee) || self.get_extracted.contains(callee)
+    }
+
+    fn return_helper_for_callee(&self, expression: &Expression<'_>) -> Option<FiniteStrings> {
+        let callee = self.callee_identifier(expression)?;
+        if let Some(file_index) = &self.file_index {
+            if let Some(summary) = file_index.return_helper_for_local(callee) {
+                return Some(summary);
+            }
+            if let Some(target) = file_index.imports.get(callee) {
+                if let Some(project) = &self.project {
+                    return project.return_helper_for_import(&self.path, target);
+                }
+            }
+        }
+        None
     }
 
     fn helper_summary_for_callee(&self, expression: &Expression<'_>) -> Option<HelperSummary> {
@@ -1630,6 +1797,25 @@ impl SourceUsageCollector {
                 self.record_dynamic_usage(binding.namespace.as_deref(), call.span.start);
             }
         }
+    }
+
+    fn finite_strings_from_argument(&self, argument: &Argument<'_>) -> Option<FiniteStrings> {
+        match argument {
+            Argument::CallExpression(call) => self.finite_strings_from_call(call),
+            _ => finite_strings_from_argument(argument, &self.finite_constants),
+        }
+    }
+
+    fn finite_strings_from_expression(&self, expression: &Expression<'_>) -> Option<FiniteStrings> {
+        match expression.get_inner_expression() {
+            Expression::CallExpression(call) => self.finite_strings_from_call(call),
+            _ => finite_strings_from_expression(expression, &self.finite_constants),
+        }
+    }
+
+    fn finite_strings_from_call(&self, call: &CallExpression<'_>) -> Option<FiniteStrings> {
+        self.return_helper_for_callee(&call.callee)
+            .or_else(|| finite_strings_from_call(call, &self.finite_constants))
     }
 
     fn with_finite_constant(
@@ -1751,9 +1937,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             let name = identifier.name.as_str();
             if declarator.kind == VariableDeclarationKind::Const {
                 if let Some(init) = &declarator.init {
-                    if let Some(values) =
-                        finite_strings_from_expression(init, &self.finite_constants)
-                    {
+                    if let Some(values) = self.finite_strings_from_expression(init) {
                         self.finite_constants.insert(name.to_string(), values);
                     }
                     if let Some(values) = self.finite_iterable_from_expression(init) {
@@ -1784,9 +1968,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         }
 
         if let Some(binding) = self.maybe_translator_call(&call.callee) {
-            let keys = call.arguments.first().and_then(|argument| {
-                finite_strings_from_argument(argument, &self.finite_constants)
-            });
+            let keys = call
+                .arguments
+                .first()
+                .and_then(|argument| self.finite_strings_from_argument(argument));
             match keys {
                 Some(keys) if !binding.dynamic_namespace => {
                     for key in keys {
@@ -1973,6 +2158,63 @@ mod tests {
         assert!(scan.used_ids.contains("template.variables.types.number"));
         assert!(scan.used_ids.contains("template.variables.types.text"));
         assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_same_file_finite_return_helper_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function getPriorityLabelKey(priority) {
+              switch (priority) {
+                case 'LOW':
+                  return 'priority-low';
+                case 'HIGH':
+                  return 'priority-high';
+              }
+            }
+            const t = useTranslations('deviations');
+            t(getPriorityLabelKey(priority));
+            "#,
+        );
+        assert!(scan.used_ids.contains("deviations.priority-low"));
+        assert!(scan.used_ids.contains("deviations.priority-high"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_expression_arrow_finite_return_helper_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const getKey = () => 'title';
+            const t = useTranslations('settings');
+            t(getKey());
+            "#,
+        );
+        assert!(scan.used_ids.contains("settings.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn unknown_return_helper_stays_dynamic() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function getKey(value) {
+              if (value) return 'known';
+              return value;
+            }
+            const t = useTranslations('settings');
+            t(getKey(value));
+            "#,
+        );
+        assert!(!scan.used_ids.contains("settings.known"));
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "settings")
+        );
     }
 
     #[test]

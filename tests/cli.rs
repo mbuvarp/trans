@@ -1018,6 +1018,37 @@ fn unused_resolves_finite_iterated_string_transforms() {
 }
 
 #[test]
+fn unused_resolves_imported_finite_return_helper_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("common.customers", "Customers"),
+            ("common.projects", "Projects"),
+            ("common.my-page", "My page"),
+            ("common.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("top-bar-state.ts"),
+        "export function resolveTitleKey(section) {\n  switch (section) {\n    case 'customers':\n      return 'customers';\n    case 'projects':\n      return 'projects';\n    default:\n      return 'my-page';\n  }\n}\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {resolveTitleKey} from './top-bar-state';\nconst t = useTranslations('common');\nt(resolveTitleKey(section));\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("common.unused\n");
+}
+
+#[test]
 fn unused_traces_named_helper_import_from_relative_file() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(
