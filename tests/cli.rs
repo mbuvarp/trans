@@ -1268,6 +1268,67 @@ fn unused_resolves_imported_finite_record_return_helper_keys() {
 }
 
 #[test]
+fn unused_resolves_imported_filtered_record_iterable_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("common.home", "Home"),
+            ("common.offers", "Offers"),
+            ("common.projects", "Projects"),
+            ("common.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("footer-navigation.ts"),
+        "export const FOOTER_NAV_ITEMS: {id: string; labelKey: string}[] = [\n  {id: 'home', labelKey: 'common.home'},\n  {id: 'offers', labelKey: 'common.offers'},\n  {id: 'projects', labelKey: 'common.projects'},\n];\n",
+    )
+    .expect("write nav items");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {FOOTER_NAV_ITEMS} from './footer-navigation';\nconst t = useTranslations();\nFOOTER_NAV_ITEMS.filter(item => item.id !== 'home').map(item => t(item.labelKey));\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("common.unused\n");
+}
+
+#[test]
+fn unused_resolves_imported_record_indexed_return_helper_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("offers.history.event-created", "Created"),
+            ("offers.history.event-sent", "Sent"),
+            ("offers.history.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("event-config.ts"),
+        "const EVENT_TYPE_CONFIG: Record<string, {titleKey: string}> = {\n  CREATED: {titleKey: 'offers.history.event-created'},\n  SENT: {titleKey: 'offers.history.event-sent'},\n};\nexport function getEventConfig(eventType: string) {\n  return EVENT_TYPE_CONFIG[eventType];\n}\n",
+    )
+    .expect("write event config");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getEventConfig} from './event-config';\nconst t = useTranslations();\nconst config = getEventConfig(eventType);\nt(config.titleKey);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("offers.history.unused\n");
+}
+
+#[test]
 fn unused_resolves_imported_finite_record_map_get_helper_keys() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(

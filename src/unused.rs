@@ -2045,6 +2045,37 @@ fn finite_record_property_iterable(
     }
 }
 
+fn finite_records_from_object_values(
+    object: &ObjectExpression<'_>,
+    constants: &BTreeMap<String, FiniteStrings>,
+    object_maps: &FiniteObjectMaps,
+    enum_member_domains: &TypeDomains,
+    record_iterables: &FiniteRecordBindings,
+    record_maps: &FiniteRecordMaps,
+) -> Option<FiniteRecords> {
+    let mut records = Vec::new();
+    for property in &object.properties {
+        let ObjectPropertyKind::ObjectProperty(property) = property else {
+            return None;
+        };
+        if property.kind != PropertyKind::Init || property.method || property.shorthand {
+            return None;
+        }
+        records.extend(finite_record_from_expression(
+            &property.value,
+            constants,
+            object_maps,
+            enum_member_domains,
+            record_iterables,
+            record_maps,
+        )?);
+        if records.len() > MAX_FINITE_STRINGS {
+            return None;
+        }
+    }
+    Some(records).filter(|records| !records.is_empty())
+}
+
 fn merge_finite_records(mut left: FiniteRecords, right: FiniteRecords) -> Option<FiniteRecords> {
     left.extend(right);
     if left.len() > MAX_FINITE_STRINGS {
@@ -2171,6 +2202,14 @@ fn finite_record_iterable_from_expression(
             record_iterables,
             record_maps,
         ),
+        Expression::ObjectExpression(object) => finite_records_from_object_values(
+            object,
+            constants,
+            object_maps,
+            enum_member_domains,
+            record_iterables,
+            record_maps,
+        ),
         Expression::Identifier(identifier) => {
             record_iterables.get(identifier.name.as_str()).cloned()
         }
@@ -2191,6 +2230,7 @@ fn finite_record_iterable_from_expression(
                 record_maps,
             )?;
             match method.as_ref() {
+                "filter" => Some(records),
                 "slice" => {
                     let start = call.arguments.first().and_then(argument_usize).unwrap_or(0);
                     let end = call
@@ -2312,6 +2352,10 @@ fn finite_record_from_expression(
         )?]),
         Expression::Identifier(identifier) => {
             record_iterables.get(identifier.name.as_str()).cloned()
+        }
+        Expression::ComputedMemberExpression(member) => {
+            let object = member.object.get_identifier_reference()?;
+            record_iterables.get(object.name.as_str()).cloned()
         }
         Expression::CallExpression(call) => {
             let member = call.callee.get_member_expr()?;
@@ -4088,18 +4132,49 @@ impl SourceUsageCollector {
                 let records = self.finite_record_constants.get(object.name.as_str())?;
                 finite_record_property_iterable(records, member.property.name.as_str())
             }
-            Expression::CallExpression(call) => self
-                .return_record_helper_for_callee(&call.callee)
-                .or_else(|| {
-                    finite_record_iterable_from_expression(
-                        expression,
-                        &self.finite_constants,
-                        &self.finite_object_maps,
-                        &self.enum_member_domains,
-                        &self.finite_record_iterables,
-                        &self.finite_record_maps,
-                    )
-                }),
+            Expression::CallExpression(call) => {
+                if let Some(member) = call.callee.get_member_expr() {
+                    if let Some(method) = member.static_property_name() {
+                        let records = self.finite_record_iterable_from_expression(member.object());
+                        if let Some(records) = records {
+                            return match method.as_ref() {
+                                "filter" => Some(records),
+                                "slice" => {
+                                    let start = call
+                                        .arguments
+                                        .first()
+                                        .and_then(argument_usize)
+                                        .unwrap_or(0);
+                                    let end = call
+                                        .arguments
+                                        .get(1)
+                                        .and_then(argument_usize)
+                                        .unwrap_or(records.len());
+                                    Some(
+                                        records
+                                            .into_iter()
+                                            .skip(start)
+                                            .take(end.saturating_sub(start))
+                                            .collect(),
+                                    )
+                                }
+                                _ => None,
+                            };
+                        }
+                    }
+                }
+                self.return_record_helper_for_callee(&call.callee)
+                    .or_else(|| {
+                        finite_record_iterable_from_expression(
+                            expression,
+                            &self.finite_constants,
+                            &self.finite_object_maps,
+                            &self.enum_member_domains,
+                            &self.finite_record_iterables,
+                            &self.finite_record_maps,
+                        )
+                    })
+            }
             _ => finite_record_iterable_from_expression(
                 expression,
                 &self.finite_constants,
@@ -5695,6 +5770,47 @@ mod tests {
         assert!(scan.used_ids.contains("settings.navigation.profile"));
         assert!(scan.used_ids.contains("settings.navigation.members"));
         assert!(scan.used_ids.contains("settings.navigation.auditLog"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_filtered_finite_record_iterable_properties() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            type Option = {value: string; labelKey: string};
+            const OPTIONS: Option[] = [
+              {value: 'all', labelKey: 'filters.all'},
+              {value: 'mine', labelKey: 'filters.mine'},
+            ];
+            const t = useTranslations();
+            OPTIONS.filter(option => option.value !== 'all').map(option => t(option.labelKey));
+            "#,
+        );
+        assert!(scan.used_ids.contains("filters.all"));
+        assert!(scan.used_ids.contains("filters.mine"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_record_indexed_return_helper_properties() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const EVENT_TYPE_CONFIG = {
+              CREATED: {titleKey: 'offers.history.event-created'},
+              SENT: {titleKey: 'offers.history.event-sent'},
+            };
+            function getEventConfig(eventType) {
+              return EVENT_TYPE_CONFIG[eventType];
+            }
+            const t = useTranslations();
+            const config = getEventConfig(eventType);
+            t(config.titleKey);
+            "#,
+        );
+        assert!(scan.used_ids.contains("offers.history.event-created"));
+        assert!(scan.used_ids.contains("offers.history.event-sent"));
         assert!(scan.dynamic_usages.is_empty());
     }
 
