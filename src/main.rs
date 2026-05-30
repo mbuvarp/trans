@@ -482,7 +482,12 @@ fn run() -> Result<()> {
                             &config,
                             use_ts_checker,
                         )?;
-                        println!("Unused keys: {}", style(report.unused_ids.len()).bold());
+                        println!(
+                            "Unused keys: {} / {} ({}%)",
+                            style(report.unused_ids.len()).bold(),
+                            report.total_ids,
+                            percentage(report.unused_ids.len(), report.total_ids)
+                        );
                         if !report.dynamic_usage_locations.is_empty() {
                             println!();
                             println!(
@@ -606,6 +611,14 @@ fn format_terminal_link(display: &str, url: &str) -> String {
         format!("\x1b]8;;{url}\x1b\\{display}\x1b]8;;\x1b\\")
     } else {
         display.to_string()
+    }
+}
+
+fn percentage(part: usize, total: usize) -> usize {
+    if total == 0 {
+        0
+    } else {
+        (part * 100 + total / 2) / total
     }
 }
 

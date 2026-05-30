@@ -53,6 +53,7 @@ struct FiniteRecord {
 #[derive(Debug, Clone, Default)]
 pub struct UnusedReport {
     pub unused_ids: Vec<String>,
+    pub total_ids: usize,
     pub warnings: Vec<String>,
     pub dynamic_usage_locations: Vec<UsageLocation>,
     pub dynamic_usage_detected: bool,
@@ -482,6 +483,7 @@ fn find_unused_with_options(
 
     Ok(UnusedReport {
         unused_ids,
+        total_ids: primary.len(),
         warnings,
         dynamic_usage_locations,
         dynamic_usage_detected: !scan.dynamic_usages.is_empty(),

@@ -856,7 +856,7 @@ fn unused_lists_unused_next_intl_keys() {
         .arg("unused")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Unused keys: 1"))
+        .stdout(predicate::str::contains("Unused keys: 1 / 2 (50%)"))
         .stdout(predicate::str::contains("app.unused").not())
         .stdout(predicate::str::contains("app.title").not());
 }
@@ -904,7 +904,7 @@ fn unused_respects_gitignored_files() {
         .arg("unused")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Unused keys: 1"));
+        .stdout(predicate::str::contains("Unused keys: 1 / 1 (100%)"));
 }
 
 #[test]
@@ -923,7 +923,7 @@ fn unused_fallback_scanner_excludes_generated_directories() {
         .arg("unused")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Unused keys: 1"));
+        .stdout(predicate::str::contains("Unused keys: 1 / 1 (100%)"));
 }
 
 #[test]
@@ -944,7 +944,7 @@ fn unused_reports_dynamic_usage_locations() {
         .arg("unused")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Unused keys: 1"))
+        .stdout(predicate::str::contains("Unused keys: 1 / 2 (50%)"))
         .stdout(predicate::str::contains(
             "Warning: dynamic translation key usage detected in 1 place(s):",
         ))
@@ -1608,7 +1608,7 @@ fn unused_unresolved_import_with_translator_argument_is_dynamic() {
         .arg("unused")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Unused keys: 0"))
+        .stdout(predicate::str::contains("Unused keys: 0 / 1 (0%)"))
         .stdout(predicate::str::contains(
             "Warning: dynamic translation key usage detected in 1 place(s):",
         ));
