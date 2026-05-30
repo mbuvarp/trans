@@ -10,8 +10,9 @@ use oxc_ast::ast::{
     ExportDefaultDeclarationKind, ExportNamedDeclaration, Expression, ForOfStatement,
     ForStatementLeft, Function, FunctionBody, ImportDeclaration, ImportDeclarationSpecifier,
     ModuleExportName, ObjectExpression, ObjectPropertyKind, PropertyKind, ReturnStatement,
-    Statement, StaticMemberExpression, TemplateLiteral, VariableDeclaration,
-    VariableDeclarationKind, VariableDeclarator,
+    Statement, StaticMemberExpression, TSInterfaceDeclaration, TSLiteral, TSSignature, TSType,
+    TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator, TemplateLiteral,
+    VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -35,6 +36,8 @@ const MAX_FINITE_STRINGS: usize = 128;
 type FiniteStrings = BTreeSet<String>;
 type FiniteObjectMap = BTreeMap<String, FiniteStrings>;
 type FiniteObjectMaps = BTreeMap<String, FiniteObjectMap>;
+type TypeDomains = BTreeMap<String, FiniteStrings>;
+type TypePropertyDomains = BTreeMap<String, BTreeMap<String, FiniteStrings>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct UnusedReport {
@@ -733,6 +736,10 @@ struct SourceUsageCollector {
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
     finite_object_maps: FiniteObjectMaps,
+    typed_object_property_domains: TypePropertyDomains,
+    type_domains: TypeDomains,
+    type_property_domains: TypePropertyDomains,
+    enum_member_domains: TypeDomains,
     translators: BTreeMap<String, TranslatorBinding>,
     scan: UsageScan,
 }
@@ -770,6 +777,7 @@ fn helper_summary_from_body(
         finite_constants: BTreeMap::new(),
         finite_iterables: BTreeMap::new(),
         finite_object_maps: BTreeMap::new(),
+        enum_member_domains: BTreeMap::new(),
         usages: Vec::new(),
     };
     for statement in &body.statements {
@@ -796,6 +804,7 @@ fn finite_return_summary_from_arrow(arrow: &ArrowFunctionExpression<'_>) -> Opti
                 &statement.expression,
                 &BTreeMap::new(),
                 &BTreeMap::new(),
+                &BTreeMap::new(),
             );
         }
     }
@@ -812,6 +821,7 @@ fn finite_return_summary_from_body(body: &FunctionBody<'_>) -> Option<FiniteStri
         finite_constants: BTreeMap::new(),
         finite_iterables: BTreeMap::new(),
         finite_object_maps: BTreeMap::new(),
+        enum_member_domains: BTreeMap::new(),
         return_values: BTreeSet::new(),
         unknown_return: false,
     };
@@ -839,6 +849,217 @@ fn module_export_name<'a>(name: &'a ModuleExportName<'a>) -> Option<&'a str> {
         ModuleExportName::IdentifierReference(identifier) => Some(identifier.name.as_str()),
         ModuleExportName::StringLiteral(literal) => Some(literal.value.as_str()),
     }
+}
+
+fn ts_type_name_identifier<'a>(name: &'a TSTypeName<'a>) -> Option<&'a str> {
+    match name {
+        TSTypeName::IdentifierReference(identifier) => Some(identifier.name.as_str()),
+        _ => None,
+    }
+}
+
+fn finite_strings_from_ts_type(
+    ty: &TSType<'_>,
+    type_domains: &TypeDomains,
+    enum_member_domains: &TypeDomains,
+) -> Option<FiniteStrings> {
+    match ty {
+        TSType::TSLiteralType(literal_type) => match &literal_type.literal {
+            TSLiteral::StringLiteral(literal) => Some(finite_string(literal.value.to_string())),
+            TSLiteral::TemplateLiteral(literal) if literal.quasis.len() == 1 => literal.quasis[0]
+                .value
+                .cooked
+                .map(|value| finite_string(value.to_string())),
+            _ => None,
+        },
+        TSType::TSUnionType(union) => {
+            let mut values = BTreeSet::new();
+            for ty in &union.types {
+                values.extend(finite_strings_from_ts_type(
+                    ty,
+                    type_domains,
+                    enum_member_domains,
+                )?);
+                if values.len() > MAX_FINITE_STRINGS {
+                    return None;
+                }
+            }
+            Some(values)
+        }
+        TSType::TSParenthesizedType(parenthesized) => finite_strings_from_ts_type(
+            &parenthesized.type_annotation,
+            type_domains,
+            enum_member_domains,
+        ),
+        TSType::TSTypeReference(reference) => {
+            let name = ts_type_name_identifier(&reference.type_name)?;
+            type_domains
+                .get(name)
+                .cloned()
+                .or_else(|| enum_member_domains.get(name).cloned())
+        }
+        TSType::TSTypeOperatorType(operator)
+            if operator.operator == TSTypeOperatorOperator::Readonly =>
+        {
+            finite_strings_from_ts_type(
+                &operator.type_annotation,
+                type_domains,
+                enum_member_domains,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn finite_iterable_from_ts_type(
+    ty: &TSType<'_>,
+    type_domains: &TypeDomains,
+    enum_member_domains: &TypeDomains,
+) -> Option<FiniteStrings> {
+    match ty {
+        TSType::TSArrayType(array) => {
+            finite_strings_from_ts_type(&array.element_type, type_domains, enum_member_domains)
+        }
+        TSType::TSTypeOperatorType(operator)
+            if operator.operator == TSTypeOperatorOperator::Readonly =>
+        {
+            finite_iterable_from_ts_type(
+                &operator.type_annotation,
+                type_domains,
+                enum_member_domains,
+            )
+            .or_else(|| {
+                finite_strings_from_ts_type(
+                    &operator.type_annotation,
+                    type_domains,
+                    enum_member_domains,
+                )
+            })
+        }
+        TSType::TSTypeReference(reference) => {
+            let name = ts_type_name_identifier(&reference.type_name)?;
+            if matches!(name, "Array" | "ReadonlyArray" | "Readonly") {
+                let first = reference.type_arguments.as_ref()?.params.first()?;
+                finite_strings_from_ts_type(first, type_domains, enum_member_domains).or_else(
+                    || finite_iterable_from_ts_type(first, type_domains, enum_member_domains),
+                )
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn property_domains_from_type_literal(
+    members: &[TSSignature<'_>],
+    type_domains: &TypeDomains,
+    enum_member_domains: &TypeDomains,
+) -> BTreeMap<String, FiniteStrings> {
+    let mut properties = BTreeMap::new();
+    for member in members {
+        let TSSignature::TSPropertySignature(property) = member else {
+            continue;
+        };
+        if property.computed {
+            continue;
+        }
+        let Some(name) = property.key.static_name() else {
+            continue;
+        };
+        let Some(annotation) = &property.type_annotation else {
+            continue;
+        };
+        if let Some(values) = finite_iterable_from_ts_type(
+            &annotation.type_annotation,
+            type_domains,
+            enum_member_domains,
+        )
+        .or_else(|| {
+            finite_strings_from_ts_type(
+                &annotation.type_annotation,
+                type_domains,
+                enum_member_domains,
+            )
+        }) {
+            properties.insert(name.to_string(), values);
+        }
+    }
+    properties
+}
+
+fn property_domains_from_ts_type(
+    ty: &TSType<'_>,
+    type_property_domains: &TypePropertyDomains,
+    type_domains: &TypeDomains,
+    enum_member_domains: &TypeDomains,
+) -> Option<BTreeMap<String, FiniteStrings>> {
+    match ty {
+        TSType::TSTypeLiteral(literal) => Some(property_domains_from_type_literal(
+            &literal.members,
+            type_domains,
+            enum_member_domains,
+        ))
+        .filter(|properties| !properties.is_empty()),
+        TSType::TSTypeReference(reference) => {
+            let name = ts_type_name_identifier(&reference.type_name)?;
+            type_property_domains.get(name).cloned()
+        }
+        TSType::TSTypeOperatorType(operator)
+            if operator.operator == TSTypeOperatorOperator::Readonly =>
+        {
+            property_domains_from_ts_type(
+                &operator.type_annotation,
+                type_property_domains,
+                type_domains,
+                enum_member_domains,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn record_enum_member_domain(
+    enum_member_domains: &mut TypeDomains,
+    object: &Expression<'_>,
+    property: &str,
+) {
+    let Some(object) = object.get_inner_expression().get_identifier_reference() else {
+        return;
+    };
+    if !object
+        .name
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase())
+    {
+        return;
+    }
+    enum_member_domains
+        .entry(object.name.to_string())
+        .or_default()
+        .insert(property.to_string());
+}
+
+struct EnumMemberDomainCollector<'m> {
+    domains: &'m mut TypeDomains,
+}
+
+impl<'a> Visit<'a> for EnumMemberDomainCollector<'_> {
+    fn visit_static_member_expression(&mut self, member: &StaticMemberExpression<'a>) {
+        record_enum_member_domain(self.domains, &member.object, member.property.name.as_str());
+        walk::walk_static_member_expression(self, member);
+    }
+}
+
+fn record_enum_member_domains_from_expression(
+    expression: &Expression<'_>,
+    enum_member_domains: &mut TypeDomains,
+) {
+    let mut collector = EnumMemberDomainCollector {
+        domains: enum_member_domains,
+    };
+    collector.visit_expression(expression);
 }
 
 fn finite_string(value: impl Into<String>) -> FiniteStrings {
@@ -883,41 +1104,65 @@ fn finite_strings_from_argument(
     argument: &Argument<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
     object_maps: &FiniteObjectMaps,
+    enum_member_domains: &TypeDomains,
 ) -> Option<FiniteStrings> {
     match argument {
         Argument::StringLiteral(literal) => Some(finite_string(literal.value.to_string())),
         Argument::TemplateLiteral(literal) => {
-            finite_strings_from_template(literal, constants, object_maps)
+            finite_strings_from_template(literal, constants, object_maps, enum_member_domains)
         }
         Argument::Identifier(identifier) => constants.get(identifier.name.as_str()).cloned(),
-        Argument::CallExpression(call) => finite_strings_from_call(call, constants, object_maps),
+        Argument::CallExpression(call) => {
+            finite_strings_from_call(call, constants, object_maps, enum_member_domains)
+        }
         Argument::ComputedMemberExpression(member) => {
-            finite_strings_from_computed_member(member, constants, object_maps)
+            finite_strings_from_computed_member(member, constants, object_maps, enum_member_domains)
         }
         Argument::StaticMemberExpression(member) => {
-            finite_strings_from_static_member(member, object_maps)
+            finite_strings_from_static_member(member, object_maps, enum_member_domains)
         }
-        Argument::ConditionalExpression(conditional) => {
-            finite_strings_from_conditional(conditional, constants, object_maps)
-        }
-        Argument::ParenthesizedExpression(parenthesized) => {
-            finite_strings_from_expression(&parenthesized.expression, constants, object_maps)
-        }
-        Argument::TSAsExpression(expression) => {
-            finite_strings_from_expression(&expression.expression, constants, object_maps)
-        }
-        Argument::TSSatisfiesExpression(expression) => {
-            finite_strings_from_expression(&expression.expression, constants, object_maps)
-        }
-        Argument::TSNonNullExpression(expression) => {
-            finite_strings_from_expression(&expression.expression, constants, object_maps)
-        }
-        Argument::TSInstantiationExpression(expression) => {
-            finite_strings_from_expression(&expression.expression, constants, object_maps)
-        }
-        Argument::TSTypeAssertion(expression) => {
-            finite_strings_from_expression(&expression.expression, constants, object_maps)
-        }
+        Argument::ConditionalExpression(conditional) => finite_strings_from_conditional(
+            conditional,
+            constants,
+            object_maps,
+            enum_member_domains,
+        ),
+        Argument::ParenthesizedExpression(parenthesized) => finite_strings_from_expression(
+            &parenthesized.expression,
+            constants,
+            object_maps,
+            enum_member_domains,
+        ),
+        Argument::TSAsExpression(expression) => finite_strings_from_expression(
+            &expression.expression,
+            constants,
+            object_maps,
+            enum_member_domains,
+        ),
+        Argument::TSSatisfiesExpression(expression) => finite_strings_from_expression(
+            &expression.expression,
+            constants,
+            object_maps,
+            enum_member_domains,
+        ),
+        Argument::TSNonNullExpression(expression) => finite_strings_from_expression(
+            &expression.expression,
+            constants,
+            object_maps,
+            enum_member_domains,
+        ),
+        Argument::TSInstantiationExpression(expression) => finite_strings_from_expression(
+            &expression.expression,
+            constants,
+            object_maps,
+            enum_member_domains,
+        ),
+        Argument::TSTypeAssertion(expression) => finite_strings_from_expression(
+            &expression.expression,
+            constants,
+            object_maps,
+            enum_member_domains,
+        ),
         _ => None,
     }
 }
@@ -926,23 +1171,29 @@ fn finite_strings_from_expression(
     expression: &Expression<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
     object_maps: &FiniteObjectMaps,
+    enum_member_domains: &TypeDomains,
 ) -> Option<FiniteStrings> {
     match expression.get_inner_expression() {
         Expression::StringLiteral(literal) => Some(finite_string(literal.value.to_string())),
         Expression::TemplateLiteral(literal) => {
-            finite_strings_from_template(literal, constants, object_maps)
+            finite_strings_from_template(literal, constants, object_maps, enum_member_domains)
         }
         Expression::Identifier(identifier) => constants.get(identifier.name.as_str()).cloned(),
-        Expression::CallExpression(call) => finite_strings_from_call(call, constants, object_maps),
+        Expression::CallExpression(call) => {
+            finite_strings_from_call(call, constants, object_maps, enum_member_domains)
+        }
         Expression::ComputedMemberExpression(member) => {
-            finite_strings_from_computed_member(member, constants, object_maps)
+            finite_strings_from_computed_member(member, constants, object_maps, enum_member_domains)
         }
         Expression::StaticMemberExpression(member) => {
-            finite_strings_from_static_member(member, object_maps)
+            finite_strings_from_static_member(member, object_maps, enum_member_domains)
         }
-        Expression::ConditionalExpression(conditional) => {
-            finite_strings_from_conditional(conditional, constants, object_maps)
-        }
+        Expression::ConditionalExpression(conditional) => finite_strings_from_conditional(
+            conditional,
+            constants,
+            object_maps,
+            enum_member_domains,
+        ),
         _ => None,
     }
 }
@@ -952,6 +1203,7 @@ fn finite_iterable_from_expression(
     constants: &BTreeMap<String, FiniteStrings>,
     iterables: &BTreeMap<String, FiniteStrings>,
     object_maps: &FiniteObjectMaps,
+    enum_member_domains: &TypeDomains,
 ) -> Option<FiniteStrings> {
     match expression.get_inner_expression() {
         Expression::ArrayExpression(array) => finite_iterable_from_array_elements(
@@ -959,6 +1211,7 @@ fn finite_iterable_from_expression(
             constants,
             iterables,
             object_maps,
+            enum_member_domains,
         ),
         Expression::Identifier(identifier) => iterables.get(identifier.name.as_str()).cloned(),
         _ => None,
@@ -970,11 +1223,17 @@ fn finite_iterable_from_array_elements<'a>(
     constants: &BTreeMap<String, FiniteStrings>,
     iterables: &BTreeMap<String, FiniteStrings>,
     object_maps: &FiniteObjectMaps,
+    enum_member_domains: &TypeDomains,
 ) -> Option<FiniteStrings> {
     let mut values = BTreeSet::new();
     for element in elements {
-        let element_values =
-            finite_strings_from_array_element(element, constants, iterables, object_maps)?;
+        let element_values = finite_strings_from_array_element(
+            element,
+            constants,
+            iterables,
+            object_maps,
+            enum_member_domains,
+        )?;
         values.extend(element_values);
         if values.len() > MAX_FINITE_STRINGS {
             return None;
@@ -987,10 +1246,11 @@ fn finite_object_map_from_expression(
     expression: &Expression<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
     object_maps: &FiniteObjectMaps,
+    enum_member_domains: &TypeDomains,
 ) -> Option<FiniteObjectMap> {
     match expression.get_inner_expression() {
         Expression::ObjectExpression(object) => {
-            finite_object_map_from_object(object, constants, object_maps)
+            finite_object_map_from_object(object, constants, object_maps, enum_member_domains)
         }
         _ => None,
     }
@@ -1000,6 +1260,7 @@ fn finite_object_map_from_object(
     object: &ObjectExpression<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
     object_maps: &FiniteObjectMaps,
+    enum_member_domains: &TypeDomains,
 ) -> Option<FiniteObjectMap> {
     let mut map = BTreeMap::new();
     for property in &object.properties {
@@ -1010,7 +1271,12 @@ fn finite_object_map_from_object(
             return None;
         }
         let key = property.key.static_name()?.to_string();
-        let values = finite_strings_from_expression(&property.value, constants, object_maps)?;
+        let values = finite_strings_from_expression(
+            &property.value,
+            constants,
+            object_maps,
+            enum_member_domains,
+        )?;
         map.insert(key, values);
         if map.len() > MAX_FINITE_STRINGS {
             return None;
@@ -1026,6 +1292,7 @@ fn finite_strings_from_computed_member(
     member: &ComputedMemberExpression<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
     object_maps: &FiniteObjectMaps,
+    enum_member_domains: &TypeDomains,
 ) -> Option<FiniteStrings> {
     let object_name = member
         .object
@@ -1034,7 +1301,12 @@ fn finite_strings_from_computed_member(
         .name
         .as_str();
     let map = object_maps.get(object_name)?;
-    if let Some(keys) = finite_strings_from_expression(&member.expression, constants, object_maps) {
+    if let Some(keys) = finite_strings_from_expression(
+        &member.expression,
+        constants,
+        object_maps,
+        enum_member_domains,
+    ) {
         return finite_object_map_values_for_keys(map, keys);
     }
     finite_object_map_all_values(map)
@@ -1043,6 +1315,7 @@ fn finite_strings_from_computed_member(
 fn finite_strings_from_static_member(
     member: &StaticMemberExpression<'_>,
     object_maps: &FiniteObjectMaps,
+    enum_member_domains: &TypeDomains,
 ) -> Option<FiniteStrings> {
     let object_name = member
         .object
@@ -1051,9 +1324,14 @@ fn finite_strings_from_static_member(
         .name
         .as_str();
     object_maps
-        .get(object_name)?
-        .get(member.property.name.as_str())
-        .cloned()
+        .get(object_name)
+        .and_then(|map| map.get(member.property.name.as_str()).cloned())
+        .or_else(|| {
+            enum_member_domains
+                .get(object_name)
+                .filter(|values| values.contains(member.property.name.as_str()))
+                .map(|_| finite_string(member.property.name.to_string()))
+        })
 }
 
 fn finite_object_map_values_for_keys(
@@ -1086,48 +1364,73 @@ fn finite_strings_from_array_element(
     constants: &BTreeMap<String, FiniteStrings>,
     iterables: &BTreeMap<String, FiniteStrings>,
     object_maps: &FiniteObjectMaps,
+    enum_member_domains: &TypeDomains,
 ) -> Option<FiniteStrings> {
     match element {
         ArrayExpressionElement::StringLiteral(literal) => {
             Some(finite_string(literal.value.to_string()))
         }
         ArrayExpressionElement::TemplateLiteral(literal) => {
-            finite_strings_from_template(literal, constants, object_maps)
+            finite_strings_from_template(literal, constants, object_maps, enum_member_domains)
         }
         ArrayExpressionElement::Identifier(identifier) => {
             constants.get(identifier.name.as_str()).cloned()
         }
         ArrayExpressionElement::CallExpression(call) => {
-            finite_strings_from_call(call, constants, object_maps)
+            finite_strings_from_call(call, constants, object_maps, enum_member_domains)
         }
         ArrayExpressionElement::ComputedMemberExpression(member) => {
-            finite_strings_from_computed_member(member, constants, object_maps)
+            finite_strings_from_computed_member(member, constants, object_maps, enum_member_domains)
         }
         ArrayExpressionElement::StaticMemberExpression(member) => {
-            finite_strings_from_static_member(member, object_maps)
+            finite_strings_from_static_member(member, object_maps, enum_member_domains)
         }
         ArrayExpressionElement::ConditionalExpression(conditional) => {
-            finite_strings_from_conditional(conditional, constants, object_maps)
+            finite_strings_from_conditional(
+                conditional,
+                constants,
+                object_maps,
+                enum_member_domains,
+            )
         }
         ArrayExpressionElement::ParenthesizedExpression(parenthesized) => {
-            finite_strings_from_expression(&parenthesized.expression, constants, object_maps)
+            finite_strings_from_expression(
+                &parenthesized.expression,
+                constants,
+                object_maps,
+                enum_member_domains,
+            )
         }
         ArrayExpressionElement::TSAsExpression(expression) => finite_iterable_from_expression(
             &expression.expression,
             constants,
             iterables,
             object_maps,
+            enum_member_domains,
         )
-        .or_else(|| finite_strings_from_expression(&expression.expression, constants, object_maps)),
+        .or_else(|| {
+            finite_strings_from_expression(
+                &expression.expression,
+                constants,
+                object_maps,
+                enum_member_domains,
+            )
+        }),
         ArrayExpressionElement::TSSatisfiesExpression(expression) => {
             finite_iterable_from_expression(
                 &expression.expression,
                 constants,
                 iterables,
                 object_maps,
+                enum_member_domains,
             )
             .or_else(|| {
-                finite_strings_from_expression(&expression.expression, constants, object_maps)
+                finite_strings_from_expression(
+                    &expression.expression,
+                    constants,
+                    object_maps,
+                    enum_member_domains,
+                )
             })
         }
         ArrayExpressionElement::TSNonNullExpression(expression) => finite_iterable_from_expression(
@@ -1135,17 +1438,31 @@ fn finite_strings_from_array_element(
             constants,
             iterables,
             object_maps,
+            enum_member_domains,
         )
-        .or_else(|| finite_strings_from_expression(&expression.expression, constants, object_maps)),
+        .or_else(|| {
+            finite_strings_from_expression(
+                &expression.expression,
+                constants,
+                object_maps,
+                enum_member_domains,
+            )
+        }),
         ArrayExpressionElement::TSInstantiationExpression(expression) => {
             finite_iterable_from_expression(
                 &expression.expression,
                 constants,
                 iterables,
                 object_maps,
+                enum_member_domains,
             )
             .or_else(|| {
-                finite_strings_from_expression(&expression.expression, constants, object_maps)
+                finite_strings_from_expression(
+                    &expression.expression,
+                    constants,
+                    object_maps,
+                    enum_member_domains,
+                )
             })
         }
         ArrayExpressionElement::TSTypeAssertion(expression) => finite_iterable_from_expression(
@@ -1153,8 +1470,16 @@ fn finite_strings_from_array_element(
             constants,
             iterables,
             object_maps,
+            enum_member_domains,
         )
-        .or_else(|| finite_strings_from_expression(&expression.expression, constants, object_maps)),
+        .or_else(|| {
+            finite_strings_from_expression(
+                &expression.expression,
+                constants,
+                object_maps,
+                enum_member_domains,
+            )
+        }),
         _ => None,
     }
 }
@@ -1163,6 +1488,7 @@ fn finite_strings_from_call(
     call: &CallExpression<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
     object_maps: &FiniteObjectMaps,
+    enum_member_domains: &TypeDomains,
 ) -> Option<FiniteStrings> {
     if !call.arguments.is_empty() {
         return None;
@@ -1170,7 +1496,12 @@ fn finite_strings_from_call(
 
     let member = call.callee.get_member_expr()?;
     let method = member.static_property_name()?;
-    let values = finite_strings_from_expression(member.object(), constants, object_maps)?;
+    let values = finite_strings_from_expression(
+        member.object(),
+        constants,
+        object_maps,
+        enum_member_domains,
+    )?;
 
     transform_finite_strings(values, &method)
 }
@@ -1194,10 +1525,20 @@ fn finite_strings_from_conditional(
     conditional: &ConditionalExpression<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
     object_maps: &FiniteObjectMaps,
+    enum_member_domains: &TypeDomains,
 ) -> Option<FiniteStrings> {
-    let consequent =
-        finite_strings_from_expression(&conditional.consequent, constants, object_maps)?;
-    let alternate = finite_strings_from_expression(&conditional.alternate, constants, object_maps)?;
+    let consequent = finite_strings_from_expression(
+        &conditional.consequent,
+        constants,
+        object_maps,
+        enum_member_domains,
+    )?;
+    let alternate = finite_strings_from_expression(
+        &conditional.alternate,
+        constants,
+        object_maps,
+        enum_member_domains,
+    )?;
     union_finite_strings(consequent, alternate)
 }
 
@@ -1205,6 +1546,7 @@ fn finite_strings_from_template(
     literal: &TemplateLiteral<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
     object_maps: &FiniteObjectMaps,
+    enum_member_domains: &TypeDomains,
 ) -> Option<FiniteStrings> {
     let mut values = finite_string("");
     for (index, quasi) in literal.quasis.iter().enumerate() {
@@ -1212,8 +1554,12 @@ fn finite_strings_from_template(
         values = append_finite_strings(values, &finite_string(cooked.to_string()))?;
 
         if let Some(expression) = literal.expressions.get(index) {
-            let expression_values =
-                finite_strings_from_expression(expression, constants, object_maps)?;
+            let expression_values = finite_strings_from_expression(
+                expression,
+                constants,
+                object_maps,
+                enum_member_domains,
+            )?;
             values = append_finite_strings(values, &expression_values)?;
         }
     }
@@ -1225,6 +1571,7 @@ struct HelperBodyCollector {
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
     finite_object_maps: FiniteObjectMaps,
+    enum_member_domains: TypeDomains,
     usages: Vec<HelperParamUsage>,
 }
 
@@ -1252,6 +1599,7 @@ impl HelperBodyCollector {
             &self.finite_constants,
             &self.finite_iterables,
             &self.finite_object_maps,
+            &self.enum_member_domains,
         )
     }
 
@@ -1349,10 +1697,12 @@ impl<'a> Visit<'a> for HelperBodyCollector {
         if declarator.kind == VariableDeclarationKind::Const {
             if let Some(name) = binding_identifier_name(&declarator.id) {
                 if let Some(init) = &declarator.init {
+                    record_enum_member_domains_from_expression(init, &mut self.enum_member_domains);
                     if let Some(values) = finite_strings_from_expression(
                         init,
                         &self.finite_constants,
                         &self.finite_object_maps,
+                        &self.enum_member_domains,
                     ) {
                         self.finite_constants.insert(name.to_string(), values);
                     }
@@ -1363,6 +1713,7 @@ impl<'a> Visit<'a> for HelperBodyCollector {
                         init,
                         &self.finite_constants,
                         &self.finite_object_maps,
+                        &self.enum_member_domains,
                     ) {
                         self.finite_object_maps.insert(name.to_string(), values);
                     }
@@ -1383,6 +1734,7 @@ impl<'a> Visit<'a> for HelperBodyCollector {
                     argument,
                     &self.finite_constants,
                     &self.finite_object_maps,
+                    &self.enum_member_domains,
                 )
             });
             self.usages.push(HelperParamUsage { param_index, keys });
@@ -1413,6 +1765,7 @@ struct ReturnValueCollector {
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
     finite_object_maps: FiniteObjectMaps,
+    enum_member_domains: TypeDomains,
     return_values: FiniteStrings,
     unknown_return: bool,
 }
@@ -1427,6 +1780,7 @@ impl ReturnValueCollector {
             &self.finite_constants,
             &self.finite_iterables,
             &self.finite_object_maps,
+            &self.enum_member_domains,
         )
     }
 }
@@ -1436,10 +1790,12 @@ impl<'a> Visit<'a> for ReturnValueCollector {
         if declarator.kind == VariableDeclarationKind::Const {
             if let Some(name) = binding_identifier_name(&declarator.id) {
                 if let Some(init) = &declarator.init {
+                    record_enum_member_domains_from_expression(init, &mut self.enum_member_domains);
                     if let Some(values) = finite_strings_from_expression(
                         init,
                         &self.finite_constants,
                         &self.finite_object_maps,
+                        &self.enum_member_domains,
                     ) {
                         self.finite_constants.insert(name.to_string(), values);
                     }
@@ -1450,6 +1806,7 @@ impl<'a> Visit<'a> for ReturnValueCollector {
                         init,
                         &self.finite_constants,
                         &self.finite_object_maps,
+                        &self.enum_member_domains,
                     ) {
                         self.finite_object_maps.insert(name.to_string(), values);
                     }
@@ -1468,6 +1825,7 @@ impl<'a> Visit<'a> for ReturnValueCollector {
             argument,
             &self.finite_constants,
             &self.finite_object_maps,
+            &self.enum_member_domains,
         ) else {
             self.unknown_return = true;
             return;
@@ -1491,6 +1849,7 @@ struct SourceIndexCollector {
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
     finite_object_maps: FiniteObjectMaps,
+    enum_member_domains: TypeDomains,
     export_locals: BTreeMap<String, String>,
     default_local: Option<String>,
     default_summary: Option<HelperSummary>,
@@ -1589,10 +1948,12 @@ impl SourceIndexCollector {
             let Some(init) = &declarator.init else {
                 continue;
             };
+            record_enum_member_domains_from_expression(init, &mut self.enum_member_domains);
             if let Some(values) = finite_strings_from_expression(
                 init,
                 &self.finite_constants,
                 &self.finite_object_maps,
+                &self.enum_member_domains,
             ) {
                 self.record_finite_constant(name, values);
             }
@@ -1601,6 +1962,7 @@ impl SourceIndexCollector {
                 &self.finite_constants,
                 &self.finite_iterables,
                 &self.finite_object_maps,
+                &self.enum_member_domains,
             ) {
                 self.record_finite_iterable(name, values);
             }
@@ -1608,6 +1970,7 @@ impl SourceIndexCollector {
                 init,
                 &self.finite_constants,
                 &self.finite_object_maps,
+                &self.enum_member_domains,
             ) {
                 self.finite_object_maps.insert(name.to_string(), values);
             }
@@ -1686,6 +2049,7 @@ impl SourceIndexCollector {
                     &self.finite_constants,
                     &self.finite_iterables,
                     &self.finite_object_maps,
+                    &self.enum_member_domains,
                 );
             }
             _ => {}
@@ -1745,10 +2109,12 @@ impl<'a> Visit<'a> for SourceIndexCollector {
         if let Some(name) = binding_identifier_name(&declarator.id) {
             if let Some(init) = &declarator.init {
                 if declarator.kind == VariableDeclarationKind::Const {
+                    record_enum_member_domains_from_expression(init, &mut self.enum_member_domains);
                     if let Some(values) = finite_strings_from_expression(
                         init,
                         &self.finite_constants,
                         &self.finite_object_maps,
+                        &self.enum_member_domains,
                     ) {
                         self.record_finite_constant(name, values);
                     }
@@ -1757,6 +2123,7 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                         &self.finite_constants,
                         &self.finite_iterables,
                         &self.finite_object_maps,
+                        &self.enum_member_domains,
                     ) {
                         self.record_finite_iterable(name, values);
                     }
@@ -1764,6 +2131,7 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                         init,
                         &self.finite_constants,
                         &self.finite_object_maps,
+                        &self.enum_member_domains,
                     ) {
                         self.finite_object_maps.insert(name.to_string(), values);
                     }
@@ -1815,6 +2183,10 @@ impl SourceUsageCollector {
             finite_constants: BTreeMap::new(),
             finite_iterables: BTreeMap::new(),
             finite_object_maps: BTreeMap::new(),
+            typed_object_property_domains: BTreeMap::new(),
+            type_domains: BTreeMap::new(),
+            type_property_domains: BTreeMap::new(),
+            enum_member_domains: BTreeMap::new(),
             translators: BTreeMap::new(),
             scan: UsageScan::default(),
         }
@@ -1839,6 +2211,100 @@ impl SourceUsageCollector {
                 self.get_extracted.insert(local.to_string());
             }
             _ => {}
+        }
+    }
+
+    fn record_ts_type_alias(&mut self, declaration: &TSTypeAliasDeclaration<'_>) {
+        let name = declaration.id.name.as_str();
+        if let Some(values) = finite_strings_from_ts_type(
+            &declaration.type_annotation,
+            &self.type_domains,
+            &self.enum_member_domains,
+        ) {
+            self.type_domains.insert(name.to_string(), values);
+        }
+        if let Some(properties) = property_domains_from_ts_type(
+            &declaration.type_annotation,
+            &self.type_property_domains,
+            &self.type_domains,
+            &self.enum_member_domains,
+        ) {
+            self.type_property_domains
+                .insert(name.to_string(), properties);
+        }
+    }
+
+    fn record_ts_interface(&mut self, declaration: &TSInterfaceDeclaration<'_>) {
+        let properties = property_domains_from_type_literal(
+            &declaration.body.body,
+            &self.type_domains,
+            &self.enum_member_domains,
+        );
+        if !properties.is_empty() {
+            self.type_property_domains
+                .insert(declaration.id.name.to_string(), properties);
+        }
+    }
+
+    fn bind_pattern_type_domains(
+        &mut self,
+        pattern: &BindingPattern<'_>,
+        type_annotation: &TSType<'_>,
+    ) {
+        if let Some(name) = binding_identifier_name(pattern) {
+            if let Some(values) = finite_strings_from_ts_type(
+                type_annotation,
+                &self.type_domains,
+                &self.enum_member_domains,
+            ) {
+                self.finite_constants.insert(name.to_string(), values);
+            }
+            if let Some(values) = finite_iterable_from_ts_type(
+                type_annotation,
+                &self.type_domains,
+                &self.enum_member_domains,
+            ) {
+                self.finite_iterables.insert(name.to_string(), values);
+            }
+            if let Some(properties) = property_domains_from_ts_type(
+                type_annotation,
+                &self.type_property_domains,
+                &self.type_domains,
+                &self.enum_member_domains,
+            ) {
+                self.typed_object_property_domains
+                    .insert(name.to_string(), properties);
+            }
+            return;
+        }
+
+        let BindingPattern::ObjectPattern(object) = pattern else {
+            return;
+        };
+        let Some(properties) = property_domains_from_ts_type(
+            type_annotation,
+            &self.type_property_domains,
+            &self.type_domains,
+            &self.enum_member_domains,
+        ) else {
+            return;
+        };
+        for property in &object.properties {
+            if property.computed {
+                continue;
+            }
+            let Some(property_name) = property.key.static_name() else {
+                continue;
+            };
+            let Some(values) = properties.get(property_name.as_ref()) else {
+                continue;
+            };
+            if let Some(binding_name) = binding_identifier_name(&property.value) {
+                self.finite_iterables
+                    .insert(binding_name.to_string(), values.clone());
+                self.finite_constants
+                    .insert(binding_name.to_string(), values.clone());
+            }
         }
     }
 
@@ -1927,6 +2393,7 @@ impl SourceUsageCollector {
                 &self.finite_constants,
                 &self.finite_iterables,
                 &self.finite_object_maps,
+                &self.enum_member_domains,
             ),
         }
     }
@@ -2140,6 +2607,7 @@ impl SourceUsageCollector {
                 argument,
                 &self.finite_constants,
                 &self.finite_object_maps,
+                &self.enum_member_domains,
             ),
         }
     }
@@ -2151,14 +2619,63 @@ impl SourceUsageCollector {
                 expression,
                 &self.finite_constants,
                 &self.finite_object_maps,
+                &self.enum_member_domains,
             ),
         }
     }
 
     fn finite_strings_from_call(&self, call: &CallExpression<'_>) -> Option<FiniteStrings> {
+        if let Some(values) = self.finite_strings_from_typed_property_call(call) {
+            return Some(values);
+        }
         self.return_helper_for_callee(&call.callee).or_else(|| {
-            finite_strings_from_call(call, &self.finite_constants, &self.finite_object_maps)
+            finite_strings_from_call(
+                call,
+                &self.finite_constants,
+                &self.finite_object_maps,
+                &self.enum_member_domains,
+            )
         })
+    }
+
+    fn finite_strings_from_typed_property_call(
+        &self,
+        call: &CallExpression<'_>,
+    ) -> Option<FiniteStrings> {
+        let member = call.callee.get_member_expr()?;
+        if member.static_property_name()? != "watch" {
+            return None;
+        }
+        let object = member.object().get_identifier_reference()?;
+        let properties = self
+            .typed_object_property_domains
+            .get(object.name.as_str())?;
+        let property = call.arguments.first().and_then(|argument| {
+            finite_strings_from_argument(
+                argument,
+                &self.finite_constants,
+                &self.finite_object_maps,
+                &self.enum_member_domains,
+            )
+            .and_then(|values| single_finite_string(&values))
+        })?;
+        properties.get(&property).cloned()
+    }
+
+    fn property_domains_from_call_type_arguments(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<BTreeMap<String, FiniteStrings>> {
+        let Expression::CallExpression(call) = expression.get_inner_expression() else {
+            return None;
+        };
+        let first_type_argument = call.type_arguments.as_ref()?.params.first()?;
+        property_domains_from_ts_type(
+            first_type_argument,
+            &self.type_property_domains,
+            &self.type_domains,
+            &self.enum_member_domains,
+        )
     }
 
     fn with_finite_constant(
@@ -2251,6 +2768,23 @@ impl SourceUsageCollector {
 }
 
 impl<'a> Visit<'a> for SourceUsageCollector {
+    fn visit_ts_type_alias_declaration(&mut self, declaration: &TSTypeAliasDeclaration<'a>) {
+        self.record_ts_type_alias(declaration);
+        walk::walk_ts_type_alias_declaration(self, declaration);
+    }
+
+    fn visit_ts_interface_declaration(&mut self, declaration: &TSInterfaceDeclaration<'a>) {
+        self.record_ts_interface(declaration);
+        walk::walk_ts_interface_declaration(self, declaration);
+    }
+
+    fn visit_formal_parameter(&mut self, parameter: &oxc_ast::ast::FormalParameter<'a>) {
+        if let Some(annotation) = &parameter.type_annotation {
+            self.bind_pattern_type_domains(&parameter.pattern, &annotation.type_annotation);
+        }
+        walk::walk_formal_parameter(self, parameter);
+    }
+
     fn visit_import_declaration(&mut self, declaration: &ImportDeclaration<'a>) {
         let source = declaration.source.value.as_str();
         if source == "next-intl" || source == "next-intl/server" {
@@ -2280,6 +2814,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             let name = identifier.name.as_str();
             if declarator.kind == VariableDeclarationKind::Const {
                 if let Some(init) = &declarator.init {
+                    record_enum_member_domains_from_expression(init, &mut self.enum_member_domains);
+                    if let Some(annotation) = &declarator.type_annotation {
+                        self.bind_pattern_type_domains(&declarator.id, &annotation.type_annotation);
+                    }
                     if let Some(values) = self.finite_strings_from_expression(init) {
                         self.finite_constants.insert(name.to_string(), values);
                     }
@@ -2290,10 +2828,17 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                         init,
                         &self.finite_constants,
                         &self.finite_object_maps,
+                        &self.enum_member_domains,
                     ) {
                         self.finite_object_maps.insert(name.to_string(), values);
                     }
+                    if let Some(properties) = self.property_domains_from_call_type_arguments(init) {
+                        self.typed_object_property_domains
+                            .insert(name.to_string(), properties);
+                    }
                 }
+            } else if let Some(annotation) = &declarator.type_annotation {
+                self.bind_pattern_type_domains(&declarator.id, &annotation.type_annotation);
             }
 
             if let Some(init) = &declarator.init {
@@ -2492,6 +3037,94 @@ mod tests {
         );
         assert!(scan.used_ids.contains("template.variables.types.number"));
         assert!(scan.used_ids.contains("template.variables.types.text"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_typed_finite_union_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            type Category = 'REGULAR' | 'ABSENCE';
+            const t = useTranslations('settings');
+            const category: Category = getCategory();
+            t(`timeTypes.categories.${category}`);
+            "#,
+        );
+        assert!(
+            scan.used_ids
+                .contains("settings.timeTypes.categories.REGULAR")
+        );
+        assert!(
+            scan.used_ids
+                .contains("settings.timeTypes.categories.ABSENCE")
+        );
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_enum_like_member_iterable_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const TenantUserType = {
+              ADMIN: 'ADMIN',
+              USER: 'USER',
+            };
+            const USER_TYPES = [TenantUserType.ADMIN, TenantUserType.USER] as const;
+            const t = useTranslations('users');
+            USER_TYPES.map(userType => t(`user-types.${userType}`));
+            "#,
+        );
+        assert!(scan.used_ids.contains("users.user-types.ADMIN"));
+        assert!(scan.used_ids.contains("users.user-types.USER"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_typed_use_form_watch_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            import {useForm} from 'react-hook-form';
+            type Category = 'REGULAR' | 'ABSENCE';
+            type TimeTypeFormValues = {
+              category: Category;
+            };
+            const t = useTranslations('settings');
+            const form = useForm<TimeTypeFormValues>();
+            const category = form.watch('category');
+            t(`timeTypes.categories.${category}`);
+            "#,
+        );
+        assert!(
+            scan.used_ids
+                .contains("settings.timeTypes.categories.REGULAR")
+        );
+        assert!(
+            scan.used_ids
+                .contains("settings.timeTypes.categories.ABSENCE")
+        );
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_destructured_typed_iterable_props() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const Schema = z.enum([TenantUserType.ADMIN, TenantUserType.USER]);
+            interface Props {
+              allowedUserTypes: readonly TenantUserType[];
+            }
+            function Component({allowedUserTypes}: Props) {
+              const t = useTranslations('users');
+              return allowedUserTypes.map(userType => t(`user-types.${userType}`));
+            }
+            "#,
+        );
+        assert!(scan.used_ids.contains("users.user-types.ADMIN"));
+        assert!(scan.used_ids.contains("users.user-types.USER"));
         assert!(scan.dynamic_usages.is_empty());
     }
 

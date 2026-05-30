@@ -998,6 +998,31 @@ fn unused_resolves_finite_object_map_lookup_keys() {
 }
 
 #[test]
+fn unused_resolves_typed_finite_domain_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("settings.timeTypes.categories.REGULAR", "Regular"),
+            ("settings.timeTypes.categories.ABSENCE", "Absence"),
+            ("settings.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\ntype Category = 'REGULAR' | 'ABSENCE';\ntype FormValues = { category: Category };\nconst t = useTranslations('settings');\nconst form = useForm<FormValues>();\nconst category = form.watch('category');\nt(`timeTypes.categories.${category}`);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
 fn unused_resolves_finite_map_callback_keys() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(
