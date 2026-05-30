@@ -1292,6 +1292,35 @@ fn unused_resolves_module_scope_helper_lookup_keys() {
 }
 
 #[test]
+fn unused_resolves_nested_helpers_chained_receivers_and_label_wrappers() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("checklists.create-menu-label", "Checklist"),
+            ("checklists.preview.date-created", "Date created"),
+            ("common.item", "Item"),
+            ("common.time-entry", "Time entry"),
+            ("timesheets.hours-ordinary", "Hours"),
+            ("timesheets.stopwatch", "Stopwatch"),
+            ("common.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nfunction getTypeLabel(item, translate) {\n  return item.type === 'STOPWATCH' ? translate('timesheets.stopwatch') : translate('timesheets.hours-ordinary');\n}\nfunction getContextLabel(item, translate) {\n  return getTypeLabel(item, translate);\n}\nconst getOptions = translate => [\n  {label: translate('common.time-entry')},\n  {label: translate('checklists.create-menu-label')},\n];\nfunction getMessage(messages, key) { return messages[key]; }\nconst label = key => {\n  const value = getMessage(messages, key);\n  return typeof value === 'string' ? value : key;\n};\nconst t = useTranslations();\ngetContextLabel(item, t);\ngetOptions(t).map(option => option.label);\nlabel('checklists.preview.date-created');\nlabel('common.item');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("common.unused\n");
+}
+
+#[test]
 fn unused_resolves_imported_finite_record_return_helper_keys() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(

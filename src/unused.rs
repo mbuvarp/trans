@@ -1107,11 +1107,13 @@ struct SourceUsageCollector {
     zod_schema_property_domains: TypePropertyDomains,
     enum_member_domains: TypeDomains,
     translators: BTreeMap<String, TranslatorBinding>,
+    message_key_helpers: BTreeMap<String, usize>,
     scan: UsageScan,
 }
 
 fn helper_summary_from_expression_with_context(
     expression: &Expression<'_>,
+    helpers: &BTreeMap<String, HelperSummary>,
     finite_constants: &BTreeMap<String, FiniteStrings>,
     finite_iterables: &BTreeMap<String, FiniteStrings>,
     finite_object_maps: &FiniteObjectMaps,
@@ -1123,6 +1125,7 @@ fn helper_summary_from_expression_with_context(
     match expression.get_inner_expression() {
         Expression::ArrowFunctionExpression(arrow) => Some(helper_summary_from_arrow_with_context(
             arrow,
+            helpers,
             finite_constants,
             finite_iterables,
             finite_object_maps,
@@ -1133,6 +1136,7 @@ fn helper_summary_from_expression_with_context(
         )),
         Expression::FunctionExpression(function) => helper_summary_from_function_with_context(
             function,
+            helpers,
             finite_constants,
             finite_iterables,
             finite_object_maps,
@@ -1147,6 +1151,7 @@ fn helper_summary_from_expression_with_context(
 
 fn helper_summary_from_arrow_with_context(
     arrow: &ArrowFunctionExpression<'_>,
+    helpers: &BTreeMap<String, HelperSummary>,
     finite_constants: &BTreeMap<String, FiniteStrings>,
     finite_iterables: &BTreeMap<String, FiniteStrings>,
     finite_object_maps: &FiniteObjectMaps,
@@ -1158,6 +1163,7 @@ fn helper_summary_from_arrow_with_context(
     helper_summary_from_body_with_context(
         &arrow.params,
         &arrow.body,
+        helpers,
         finite_constants,
         finite_iterables,
         finite_object_maps,
@@ -1170,6 +1176,7 @@ fn helper_summary_from_arrow_with_context(
 
 fn helper_summary_from_function_with_context(
     function: &Function<'_>,
+    helpers: &BTreeMap<String, HelperSummary>,
     finite_constants: &BTreeMap<String, FiniteStrings>,
     finite_iterables: &BTreeMap<String, FiniteStrings>,
     finite_object_maps: &FiniteObjectMaps,
@@ -1182,6 +1189,7 @@ fn helper_summary_from_function_with_context(
     Some(helper_summary_from_body_with_context(
         &function.params,
         body,
+        helpers,
         finite_constants,
         finite_iterables,
         finite_object_maps,
@@ -1195,6 +1203,7 @@ fn helper_summary_from_function_with_context(
 fn helper_summary_from_body_with_context(
     params: &oxc_ast::ast::FormalParameters<'_>,
     body: &FunctionBody<'_>,
+    helpers: &BTreeMap<String, HelperSummary>,
     finite_constants: &BTreeMap<String, FiniteStrings>,
     finite_iterables: &BTreeMap<String, FiniteStrings>,
     finite_object_maps: &FiniteObjectMaps,
@@ -1212,6 +1221,7 @@ fn helper_summary_from_body_with_context(
 
     let mut collector = HelperBodyCollector {
         param_names,
+        helpers: helpers.clone(),
         finite_constants: finite_constants.clone(),
         finite_iterables: finite_iterables.clone(),
         finite_object_maps: finite_object_maps.clone(),
@@ -1228,6 +1238,42 @@ fn helper_summary_from_body_with_context(
     HelperSummary {
         param_usages: collector.usages,
     }
+}
+
+fn message_key_helper_from_expression(expression: &Expression<'_>) -> Option<usize> {
+    match expression.get_inner_expression() {
+        Expression::ArrowFunctionExpression(arrow) => {
+            Some(message_key_helper_from_body(&arrow.params, &arrow.body)?)
+        }
+        Expression::FunctionExpression(function) => message_key_helper_from_function(function),
+        _ => None,
+    }
+}
+
+fn message_key_helper_from_function(function: &Function<'_>) -> Option<usize> {
+    let body = function.body.as_ref()?;
+    Some(message_key_helper_from_body(&function.params, body)?)
+}
+
+fn message_key_helper_from_body(
+    params: &oxc_ast::ast::FormalParameters<'_>,
+    body: &FunctionBody<'_>,
+) -> Option<usize> {
+    let mut param_names = BTreeMap::new();
+    for (index, parameter) in params.items.iter().enumerate() {
+        if let Some(name) = binding_identifier_name(&parameter.pattern) {
+            param_names.insert(name.to_string(), index);
+        }
+    }
+
+    let mut collector = MessageKeyHelperCollector {
+        param_names,
+        param_indexes: BTreeSet::new(),
+    };
+    for statement in &body.statements {
+        collector.visit_statement(statement);
+    }
+    single_usize(&collector.param_indexes)
 }
 
 fn finite_return_summary_from_expression(expression: &Expression<'_>) -> Option<FiniteStrings> {
@@ -1835,6 +1881,14 @@ fn finite_string(value: impl Into<String>) -> FiniteStrings {
 fn single_finite_string(values: &FiniteStrings) -> Option<String> {
     if values.len() == 1 {
         values.first().cloned()
+    } else {
+        None
+    }
+}
+
+fn single_usize(values: &BTreeSet<usize>) -> Option<usize> {
+    if values.len() == 1 {
+        values.first().copied()
     } else {
         None
     }
@@ -2844,6 +2898,7 @@ fn finite_strings_from_template(
 
 struct HelperBodyCollector {
     param_names: BTreeMap<String, usize>,
+    helpers: BTreeMap<String, HelperSummary>,
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
     finite_object_maps: FiniteObjectMaps,
@@ -2852,6 +2907,37 @@ struct HelperBodyCollector {
     finite_record_maps: FiniteRecordMaps,
     enum_member_domains: TypeDomains,
     usages: Vec<HelperParamUsage>,
+}
+
+struct MessageKeyHelperCollector {
+    param_names: BTreeMap<String, usize>,
+    param_indexes: BTreeSet<usize>,
+}
+
+impl<'a> Visit<'a> for MessageKeyHelperCollector {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        let Some(callee) = call
+            .callee
+            .get_inner_expression()
+            .get_identifier_reference()
+            .map(|identifier| identifier.name.as_str())
+        else {
+            walk::walk_call_expression(self, call);
+            return;
+        };
+        if callee == "getMessage" {
+            if let Some(Argument::Identifier(identifier)) = call.arguments.get(1) {
+                if let Some(index) = self.param_names.get(identifier.name.as_str()) {
+                    self.param_indexes.insert(*index);
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+
+    fn visit_arrow_function_expression(&mut self, _arrow: &ArrowFunctionExpression<'a>) {}
 }
 
 impl HelperBodyCollector {
@@ -2867,6 +2953,36 @@ impl HelperBodyCollector {
         }
         let object = member.object().get_identifier_reference()?;
         self.param_names.get(object.name.as_str()).copied()
+    }
+
+    fn helper_summary_for_callee(&self, expression: &Expression<'_>) -> Option<HelperSummary> {
+        let callee = expression
+            .get_inner_expression()
+            .get_identifier_reference()
+            .map(|identifier| identifier.name.as_str())?;
+        self.helpers.get(callee).cloned()
+    }
+
+    fn param_index_from_argument(&self, argument: &Argument<'_>) -> Option<usize> {
+        let Argument::Identifier(identifier) = argument else {
+            return None;
+        };
+        self.param_names.get(identifier.name.as_str()).copied()
+    }
+
+    fn apply_helper_summary(&mut self, call: &CallExpression<'_>, summary: &HelperSummary) {
+        for usage in &summary.param_usages {
+            let Some(argument) = call.arguments.get(usage.param_index) else {
+                continue;
+            };
+            let Some(param_index) = self.param_index_from_argument(argument) else {
+                continue;
+            };
+            self.usages.push(HelperParamUsage {
+                param_index,
+                keys: usage.keys.clone(),
+            });
+        }
     }
 
     fn finite_iterable_from_expression(
@@ -3182,11 +3298,21 @@ impl<'a> Visit<'a> for HelperBodyCollector {
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if self.visit_finite_record_iteration_call(call) {
+            if let Some(member) = call.callee.get_member_expr() {
+                self.visit_expression(member.object());
+            }
             return;
         }
 
         if self.visit_finite_iteration_call(call) {
+            if let Some(member) = call.callee.get_member_expr() {
+                self.visit_expression(member.object());
+            }
             return;
+        }
+
+        if let Some(summary) = self.helper_summary_for_callee(&call.callee) {
+            self.apply_helper_summary(call, &summary);
         }
 
         if let Some(param_index) = self.callee_param_index(&call.callee) {
@@ -3604,6 +3730,7 @@ impl SourceIndexCollector {
             };
             if let Some(summary) = helper_summary_from_expression_with_context(
                 init,
+                &self.helpers,
                 &self.finite_constants,
                 &self.finite_iterables,
                 &self.finite_object_maps,
@@ -3734,6 +3861,7 @@ impl SourceIndexCollector {
             ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
                 if let Some(summary) = helper_summary_from_function_with_context(
                     function,
+                    &self.helpers,
                     &self.finite_constants,
                     &self.finite_iterables,
                     &self.finite_object_maps,
@@ -3778,6 +3906,7 @@ impl SourceIndexCollector {
             ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
                 self.default_summary = Some(helper_summary_from_arrow_with_context(
                     arrow,
+                    &self.helpers,
                     &self.finite_constants,
                     &self.finite_iterables,
                     &self.finite_object_maps,
@@ -3794,6 +3923,7 @@ impl SourceIndexCollector {
             ExportDefaultDeclarationKind::FunctionExpression(function) => {
                 self.default_summary = helper_summary_from_function_with_context(
                     function,
+                    &self.helpers,
                     &self.finite_constants,
                     &self.finite_iterables,
                     &self.finite_object_maps,
@@ -3869,6 +3999,7 @@ impl<'a> Visit<'a> for SourceIndexCollector {
         if let Some(id) = &function.id {
             if let Some(summary) = helper_summary_from_function_with_context(
                 function,
+                &self.helpers,
                 &self.finite_constants,
                 &self.finite_iterables,
                 &self.finite_object_maps,
@@ -3961,6 +4092,7 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                 }
                 if let Some(summary) = helper_summary_from_expression_with_context(
                     init,
+                    &self.helpers,
                     &self.finite_constants,
                     &self.finite_iterables,
                     &self.finite_object_maps,
@@ -4027,6 +4159,7 @@ impl SourceUsageCollector {
             zod_schema_property_domains: BTreeMap::new(),
             enum_member_domains: BTreeMap::new(),
             translators: BTreeMap::new(),
+            message_key_helpers: BTreeMap::new(),
             scan: UsageScan::default(),
         }
     }
@@ -4852,6 +4985,24 @@ impl SourceUsageCollector {
         self.scan.used_ids.insert(id);
     }
 
+    fn record_message_key_helper_call(&mut self, call: &CallExpression<'_>) -> bool {
+        let Some(callee) = self.callee_identifier(&call.callee) else {
+            return false;
+        };
+        let Some(param_index) = self.message_key_helpers.get(callee).copied() else {
+            return false;
+        };
+        let Some(argument) = call.arguments.get(param_index) else {
+            return true;
+        };
+        if let Some(keys) = self.finite_strings_from_argument(argument) {
+            self.scan.used_ids.extend(keys);
+        } else {
+            self.record_dynamic_key_usage(None, call.span.start, argument);
+        }
+        true
+    }
+
     fn record_dynamic_key_for_binding(
         &mut self,
         binding: &TranslatorBinding,
@@ -5352,6 +5503,16 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         walk::walk_import_declaration(self, declaration);
     }
 
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if let Some(id) = &function.id {
+            if let Some(param_index) = message_key_helper_from_function(function) {
+                self.message_key_helpers
+                    .insert(id.name.to_string(), param_index);
+            }
+        }
+        walk::walk_function(self, function, flags);
+    }
+
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
         if declarator.kind == VariableDeclarationKind::Const {
             if let Some(init) = &declarator.init {
@@ -5440,6 +5601,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 } else if self.maybe_translation_factory(init).unwrap_or(false) {
                     self.record_dynamic_usage(None, init.span().start);
                 }
+                if let Some(param_index) = message_key_helper_from_expression(init) {
+                    self.message_key_helpers
+                        .insert(name.to_string(), param_index);
+                }
             }
         }
 
@@ -5451,11 +5616,19 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             self.record_extraction_usage();
         }
 
+        self.record_message_key_helper_call(call);
+
         if self.visit_finite_record_iteration_call(call) {
+            if let Some(member) = call.callee.get_member_expr() {
+                self.visit_expression(member.object());
+            }
             return;
         }
 
         if self.visit_finite_iteration_call(call) {
+            if let Some(member) = call.callee.get_member_expr() {
+                self.visit_expression(member.object());
+            }
             return;
         }
 
@@ -6335,6 +6508,68 @@ mod tests {
         assert!(scan.used_ids.contains("projects.offers.status.declined"));
         assert!(scan.used_ids.contains("projects.offers.opened"));
         assert!(scan.used_ids.contains("projects.offers.status.draft"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn traces_nested_translator_helpers() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function getTypeLabel(item, translate) {
+              return item.type === 'STOPWATCH'
+                ? translate('timesheets.stopwatch')
+                : translate('timesheets.hours-ordinary');
+            }
+            function getContextLabel(item, translate) {
+              return getTypeLabel(item, translate);
+            }
+            const t = useTranslations();
+            getContextLabel(item, t);
+            "#,
+        );
+        assert!(scan.used_ids.contains("timesheets.stopwatch"));
+        assert!(scan.used_ids.contains("timesheets.hours-ordinary"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn traces_helper_calls_used_as_chained_receiver() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const getOptions = translate => [
+              {label: translate('common.time-entry')},
+              {label: translate('checklists.create-menu-label')},
+            ];
+            const t = useTranslations();
+            getOptions(t).map(option => option.label);
+            "#,
+        );
+        assert!(scan.used_ids.contains("common.time-entry"));
+        assert!(scan.used_ids.contains("checklists.create-menu-label"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn traces_local_get_message_label_helpers() {
+        let scan = scan(
+            r#"
+            function getMessage(messages, key) {
+              return messages[key];
+            }
+            const label = (key) => {
+              const value = getMessage(messages, key);
+              return typeof value === 'string' ? value : key;
+            };
+            const labels = {
+              dateCreated: label('checklists.preview.date-created'),
+              item: label('common.item'),
+            };
+            "#,
+        );
+        assert!(scan.used_ids.contains("checklists.preview.date-created"));
+        assert!(scan.used_ids.contains("common.item"));
         assert!(scan.dynamic_usages.is_empty());
     }
 
