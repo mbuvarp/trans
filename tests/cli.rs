@@ -554,6 +554,15 @@ fn find_searches_next_intl_nested_values() {
 }
 
 #[test]
+fn unused_help_documents_no_ts_checker_flag() {
+    trans_cmd()
+        .args(["unused", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-ts-checker"));
+}
+
+#[test]
 fn add_update_show_delete_flow() {
     let dir = tempdir().expect("tempdir");
     let config = setup_project(dir.path());

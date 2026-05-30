@@ -457,18 +457,31 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Some(Command::Unused { keys, command }) => {
+        Some(Command::Unused {
+            keys,
+            no_ts_checker,
+            command,
+        }) => {
             let root = config_root(&effective_cwd)?;
             let config = TransConfig::load_from_root(&root)?;
+            let use_ts_checker = !no_ts_checker;
             match command {
                 None => {
                     if keys {
-                        let ids = trans::unused::find_unused_keys(&root, &config)?;
+                        let ids = trans::unused::find_unused_keys_with_ts_checker(
+                            &root,
+                            &config,
+                            use_ts_checker,
+                        )?;
                         for id in &ids {
                             println!("{id}");
                         }
                     } else {
-                        let report = trans::unused::find_unused(&root, &config)?;
+                        let report = trans::unused::find_unused_with_ts_checker(
+                            &root,
+                            &config,
+                            use_ts_checker,
+                        )?;
                         println!("Unused keys: {}", style(report.unused_ids.len()).bold());
                         if !report.dynamic_usage_locations.is_empty() {
                             println!();
@@ -491,7 +504,12 @@ fn run() -> Result<()> {
                     Ok(())
                 }
                 Some(UnusedCommand::Remove { force }) => {
-                    let report = trans::unused::remove_unused(&root, &config, force)?;
+                    let report = trans::unused::remove_unused_with_ts_checker(
+                        &root,
+                        &config,
+                        force,
+                        use_ts_checker,
+                    )?;
                     for warning in &report.warnings {
                         eprintln!("Warning: {warning}");
                     }

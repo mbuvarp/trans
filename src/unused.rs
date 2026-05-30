@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -18,7 +19,7 @@ use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::{operator::LogicalOperator, scope::ScopeFlags};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigMode, TransConfig};
 use crate::error::{Result, TransError};
@@ -76,6 +77,8 @@ pub struct DynamicUsage {
     pub namespace: String,
     pub path: PathBuf,
     pub line: usize,
+    key_start: Option<usize>,
+    key_end: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -165,12 +168,211 @@ struct TsCompilerOptions {
     paths: Option<BTreeMap<String, Vec<String>>>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsCheckerRequest {
+    root: String,
+    queries: Vec<TsCheckerQuery>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsCheckerQuery {
+    index: usize,
+    file: String,
+    start: usize,
+    end: usize,
+    namespace: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TsCheckerResponse {
+    results: Vec<TsCheckerResult>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TsCheckerResult {
+    index: usize,
+    keys: Vec<String>,
+}
+
+const TS_CHECKER_SCRIPT: &str = r#"
+const fs = require('fs');
+
+function readStdin() {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', chunk => { data += chunk; });
+    process.stdin.on('end', () => resolve(data));
+    process.stdin.on('error', reject);
+  });
+}
+
+function findNode(sourceFile, start, end) {
+  let best = sourceFile;
+  function visit(node) {
+    const nodeStart = node.getStart(sourceFile, false);
+    const nodeEnd = node.getEnd();
+    if (start < nodeStart || end > nodeEnd) return;
+    best = node;
+    node.forEachChild(visit);
+  }
+  visit(sourceFile);
+  return best;
+}
+
+function unique(values) {
+  return [...new Set(values)].sort();
+}
+
+function finiteFromType(ts, checker, type) {
+  if (!type) return null;
+  if (type.isUnion && type.isUnion()) {
+    let values = [];
+    for (const part of type.types) {
+      const partValues = finiteFromType(ts, checker, part);
+      if (!partValues) return null;
+      values.push(...partValues);
+      if (values.length > 128) return null;
+    }
+    return unique(values);
+  }
+  if (type.isStringLiteral && type.isStringLiteral()) {
+    return [type.value];
+  }
+  if ((type.flags & ts.TypeFlags.StringLiteral) && typeof type.value === 'string') {
+    return [type.value];
+  }
+  if (type.isLiteral && type.isLiteral() && typeof type.value === 'string') {
+    return [type.value];
+  }
+  return null;
+}
+
+function appendFinite(left, right) {
+  const values = [];
+  for (const l of left) {
+    for (const r of right) {
+      values.push(`${l}${r}`);
+      if (values.length > 128) return null;
+    }
+  }
+  return unique(values);
+}
+
+function transform(values, method) {
+  if (method === 'toLowerCase') return values.map(value => value.toLowerCase());
+  if (method === 'toUpperCase') return values.map(value => value.toUpperCase());
+  return null;
+}
+
+function finiteFromExpression(ts, checker, node) {
+  if (!node) return null;
+
+  if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isSatisfiesExpression?.(node) || ts.isNonNullExpression(node) || ts.isTypeAssertionExpression(node)) {
+    return finiteFromExpression(ts, checker, node.expression);
+  }
+
+  if (ts.isStringLiteralLike(node)) return [node.text];
+
+  if (ts.isTemplateExpression(node)) {
+    let values = [node.head.text];
+    for (const span of node.templateSpans) {
+      const expressionValues = finiteFromExpression(ts, checker, span.expression);
+      if (!expressionValues) return null;
+      values = appendFinite(values, expressionValues);
+      if (!values) return null;
+      values = appendFinite(values, [span.literal.text]);
+      if (!values) return null;
+    }
+    return values;
+  }
+
+  if (ts.isNoSubstitutionTemplateLiteral(node)) return [node.text];
+
+  if (ts.isCallExpression(node) && node.arguments.length === 0 && ts.isPropertyAccessExpression(node.expression)) {
+    const method = node.expression.name.text;
+    const objectValues = finiteFromExpression(ts, checker, node.expression.expression);
+    if (!objectValues) return null;
+    return transform(objectValues, method);
+  }
+
+  if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) || ts.isIdentifier(node)) {
+    return finiteFromType(ts, checker, checker.getTypeAtLocation(node));
+  }
+
+  return finiteFromType(ts, checker, checker.getTypeAtLocation(node));
+}
+
+(async () => {
+  const input = JSON.parse(await readStdin());
+  const tsPath = require.resolve('typescript', { paths: [input.root] });
+  const ts = require(tsPath);
+  const configPath =
+    ts.findConfigFile(input.root, ts.sys.fileExists, 'tsconfig.json') ||
+    ts.findConfigFile(input.root, ts.sys.fileExists, 'jsconfig.json');
+  if (!configPath) {
+    console.log(JSON.stringify({ results: [] }));
+    return;
+  }
+  const config = ts.readConfigFile(configPath, ts.sys.readFile);
+  if (config.error) {
+    console.log(JSON.stringify({ results: [] }));
+    return;
+  }
+  const parsed = ts.parseJsonConfigFileContent(
+    config.config,
+    ts.sys,
+    require('path').dirname(configPath),
+    { noEmit: true, skipLibCheck: true },
+    configPath,
+  );
+  const program = ts.createProgram({
+    rootNames: parsed.fileNames,
+    options: parsed.options,
+  });
+  const checker = program.getTypeChecker();
+  const results = [];
+  for (const query of input.queries) {
+    const sourceFile = program.getSourceFile(query.file);
+    if (!sourceFile) continue;
+    const node = findNode(sourceFile, query.start, query.end);
+    const keys = finiteFromExpression(ts, checker, node);
+    if (keys && keys.length > 0 && keys.length <= 128) {
+      results.push({ index: query.index, keys });
+    }
+  }
+  console.log(JSON.stringify({ results }));
+})().catch(() => {
+  console.log(JSON.stringify({ results: [] }));
+});
+"#;
+
 pub fn find_unused(root: impl AsRef<Path>, config: &TransConfig) -> Result<UnusedReport> {
-    find_unused_with_options(root, config, true)
+    find_unused_with_options(root, config, true, true)
+}
+
+pub fn find_unused_with_ts_checker(
+    root: impl AsRef<Path>,
+    config: &TransConfig,
+    use_ts_checker: bool,
+) -> Result<UnusedReport> {
+    find_unused_with_options(root, config, true, use_ts_checker)
 }
 
 pub fn find_unused_keys(root: impl AsRef<Path>, config: &TransConfig) -> Result<Vec<String>> {
-    Ok(find_unused_with_options(root, config, false)?.unused_ids)
+    Ok(find_unused_with_options(root, config, false, true)?.unused_ids)
+}
+
+pub fn find_unused_keys_with_ts_checker(
+    root: impl AsRef<Path>,
+    config: &TransConfig,
+    use_ts_checker: bool,
+) -> Result<Vec<String>> {
+    Ok(find_unused_with_options(root, config, false, use_ts_checker)?.unused_ids)
 }
 
 pub fn remove_unused(
@@ -178,8 +380,17 @@ pub fn remove_unused(
     config: &TransConfig,
     force: bool,
 ) -> Result<UnusedReport> {
+    remove_unused_with_ts_checker(root, config, force, true)
+}
+
+pub fn remove_unused_with_ts_checker(
+    root: impl AsRef<Path>,
+    config: &TransConfig,
+    force: bool,
+    use_ts_checker: bool,
+) -> Result<UnusedReport> {
     let root = root.as_ref();
-    let report = find_unused_with_options(root, config, !force)?;
+    let report = find_unused_with_options(root, config, !force, use_ts_checker)?;
 
     if report.extraction_usage_detected {
         return Err(TransError::InvalidInput(
@@ -225,6 +436,7 @@ fn find_unused_with_options(
     root: impl AsRef<Path>,
     config: &TransConfig,
     apply_dynamic_exclusions: bool,
+    use_ts_checker: bool,
 ) -> Result<UnusedReport> {
     let root = root.as_ref();
     if config.mode != ConfigMode::NextIntl {
@@ -236,7 +448,10 @@ fn find_unused_with_options(
     verify_language_files(root, config)?;
     let primary = load_language_translations(root, config, &config.primary_language)?;
     let source_files = discover_source_files(root)?;
-    let scan = collect_usage_from_files(root, &source_files)?;
+    let mut scan = collect_usage_from_files(root, &source_files)?;
+    if use_ts_checker {
+        apply_ts_checker_fallback(root, &mut scan);
+    }
 
     let mut unused_ids = Vec::new();
     for id in primary.keys() {
@@ -337,6 +552,97 @@ fn collect_usage_from_files(root: &Path, paths: &[PathBuf]) -> Result<UsageScan>
     combined.extraction_usages.sort();
     combined.extraction_usages.dedup();
     Ok(combined)
+}
+
+fn apply_ts_checker_fallback(root: &Path, scan: &mut UsageScan) {
+    let queries: Vec<TsCheckerQuery> = scan
+        .dynamic_usages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, usage)| {
+            let start = usage.key_start?;
+            let end = usage.key_end?;
+            if usage.namespace.is_empty() {
+                return None;
+            }
+            Some(TsCheckerQuery {
+                index,
+                file: usage.path.to_string_lossy().to_string(),
+                start,
+                end,
+                namespace: usage.namespace.clone(),
+            })
+        })
+        .collect();
+    if queries.is_empty() {
+        return;
+    }
+
+    let request = TsCheckerRequest {
+        root: root.to_string_lossy().to_string(),
+        queries,
+    };
+    let Ok(input) = serde_json::to_vec(&request) else {
+        return;
+    };
+
+    let mut child = match Command::new("node")
+        .arg("-e")
+        .arg(TS_CHECKER_SCRIPT)
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return,
+    };
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        if stdin.write_all(&input).is_err() {
+            return;
+        }
+    }
+
+    let Ok(output) = child.wait_with_output() else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+
+    let Ok(response) = serde_json::from_slice::<TsCheckerResponse>(&output.stdout) else {
+        return;
+    };
+
+    let mut resolved = BTreeSet::new();
+    for result in response.results {
+        let Some(usage) = scan.dynamic_usages.get(result.index) else {
+            continue;
+        };
+        if usage.namespace.is_empty() || result.keys.is_empty() || result.keys.len() > 128 {
+            continue;
+        }
+        for key in &result.keys {
+            let id = if key.is_empty() {
+                usage.namespace.clone()
+            } else {
+                format!("{}.{}", usage.namespace, key)
+            };
+            scan.used_ids.insert(id);
+        }
+        resolved.insert(result.index);
+    }
+
+    if !resolved.is_empty() {
+        let mut index = 0;
+        scan.dynamic_usages.retain(|_| {
+            let keep = !resolved.contains(&index);
+            index += 1;
+            keep
+        });
+    }
 }
 
 pub fn collect_usage_from_source(source: &str, path: &Path) -> Result<UsageScan> {
@@ -3623,6 +3929,24 @@ impl SourceUsageCollector {
             namespace: namespace.unwrap_or_default().to_string(),
             path: self.path.clone(),
             line: self.line_number(start),
+            key_start: None,
+            key_end: None,
+        });
+    }
+
+    fn record_dynamic_key_usage(
+        &mut self,
+        namespace: Option<&str>,
+        call_start: u32,
+        argument: &Argument<'_>,
+    ) {
+        let span = argument.span();
+        self.scan.dynamic_usages.push(DynamicUsage {
+            namespace: namespace.unwrap_or_default().to_string(),
+            path: self.path.clone(),
+            line: self.line_number(call_start),
+            key_start: Some(span.start as usize),
+            key_end: Some(span.end as usize),
         });
     }
 
@@ -4531,7 +4855,24 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                         self.scan.used_ids.insert(id);
                     }
                 }
-                _ => self.record_dynamic_usage(binding.namespace.as_deref(), call.span.start),
+                _ => {
+                    if !binding.dynamic_namespace {
+                        if let Some(argument) = call.arguments.first() {
+                            self.record_dynamic_key_usage(
+                                binding.namespace.as_deref(),
+                                call.span.start,
+                                argument,
+                            );
+                        } else {
+                            self.record_dynamic_usage(
+                                binding.namespace.as_deref(),
+                                call.span.start,
+                            );
+                        }
+                    } else {
+                        self.record_dynamic_usage(binding.namespace.as_deref(), call.span.start);
+                    }
+                }
             }
         }
 

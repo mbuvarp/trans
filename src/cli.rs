@@ -276,6 +276,11 @@ pub enum Command {
             help = "Print unused keys only, without summary or warnings"
         )]
         keys: bool,
+        #[arg(
+            long = "no-ts-checker",
+            help = "Do not use the project TypeScript checker to resolve remaining dynamic keys"
+        )]
+        no_ts_checker: bool,
         #[command(subcommand)]
         command: Option<UnusedCommand>,
     },
