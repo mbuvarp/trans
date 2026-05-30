@@ -1164,6 +1164,69 @@ fn unused_resolves_imported_finite_return_helper_keys() {
 }
 
 #[test]
+fn unused_resolves_imported_finite_record_return_helper_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("settings.navigation.profile", "Profile"),
+            ("settings.navigation.members", "Members"),
+            ("settings.navigation.auditLog", "Audit log"),
+            ("settings.navigation.sections.account", "Account"),
+            ("settings.navigation.sections.system", "System"),
+            ("settings.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("settings-sidebar-state.ts"),
+        "const ITEMS = [\n  {labelKey: 'navigation.profile'},\n  {labelKey: 'navigation.members'},\n  {labelKey: 'navigation.auditLog'},\n] as const;\nexport function getSettingsSidebarSections(isDeveloper) {\n  const sections = [\n    {labelKey: 'navigation.sections.account', items: ITEMS.slice(0, 2)},\n  ];\n  if (isDeveloper) {\n    sections.push({labelKey: 'navigation.sections.system', items: ITEMS.slice(2)});\n  }\n  return sections;\n}\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getSettingsSidebarSections} from './settings-sidebar-state';\nconst t = useTranslations('settings');\nconst sections = getSettingsSidebarSections(isDeveloper);\nsections.map(section => {\n  t(section.labelKey);\n  section.items.forEach(item => t(item.labelKey));\n});\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_resolves_imported_finite_record_map_get_helper_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("settings.navigation.profile", "Profile"),
+            ("settings.navigation.members", "Members"),
+            ("settings.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("settings-sidebar-state.ts"),
+        "const ITEMS = [\n  {id: 'profile', labelKey: 'navigation.profile'},\n  {id: 'members', labelKey: 'navigation.members'},\n] as const;\nconst ITEM_BY_ID = new Map(ITEMS.map(item => [item.id, item]));\nexport function getSettingsSidebarItemById(id) {\n  return ITEM_BY_ID.get(id) ?? null;\n}\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getSettingsSidebarItemById} from './settings-sidebar-state';\nconst t = useTranslations('settings');\nconst item = getSettingsSidebarItemById(id);\nif (item) {\n  t(item.labelKey);\n}\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
 fn unused_traces_named_helper_import_from_relative_file() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(
