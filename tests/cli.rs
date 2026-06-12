@@ -95,6 +95,40 @@ fn setup_project_with_ai(root: &std::path::Path) -> TransConfig {
     config
 }
 
+fn setup_find_project(root: &std::path::Path) -> TransConfig {
+    let config = base_config();
+    config.save_to_root(root).expect("save config");
+
+    save_language_translations(
+        root,
+        &config,
+        "en",
+        &translations(&[
+            ("calendar.this-week", "This week"),
+            ("calendar.submit", "submit"),
+            ("calendar.submit-title", "Submit"),
+            ("calendar.submit-help", "Submit form"),
+            ("calendar.other", "Cancel"),
+        ]),
+    )
+    .expect("save en");
+    save_language_translations(
+        root,
+        &config,
+        "nb",
+        &translations(&[
+            ("calendar.this-week", "Denne uken"),
+            ("calendar.submit", "send inn"),
+            ("calendar.submit-title", "Send inn"),
+            ("calendar.submit-help", "Send inn skjema"),
+            ("calendar.other", "Avbryt"),
+        ]),
+    )
+    .expect("save nb");
+
+    config
+}
+
 fn trans_cmd() -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("trans"));
     cmd.env("TRANS_AI_DISABLE", "1");
@@ -241,6 +275,162 @@ fn help_documents_cwd_flag() {
         .assert()
         .success()
         .stdout(predicate::str::contains("-C, --cwd <DIR>"));
+}
+
+#[test]
+fn find_uses_primary_language_by_default() {
+    let dir = tempdir().expect("tempdir");
+    setup_find_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["find", "This week"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("calendar.this-week")
+                .and(predicate::str::contains("exact"))
+                .and(predicate::str::contains("Denne uken").not()),
+        );
+}
+
+#[test]
+fn find_searches_explicit_language() {
+    let dir = tempdir().expect("tempdir");
+    setup_find_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["find", "--language", "nb", "Denne uken"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("calendar.this-week").and(predicate::str::contains("exact")),
+        );
+}
+
+#[test]
+fn find_outputs_exact_casing_and_partial_matches_in_order() {
+    let dir = tempdir().expect("tempdir");
+    setup_find_project(dir.path());
+
+    let assert = trans_cmd()
+        .current_dir(dir.path())
+        .args(["find", "submit"])
+        .assert()
+        .success();
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
+    let lines: Vec<&str> = output.lines().collect();
+
+    assert_eq!(lines.len(), 3);
+    assert!(lines[0].contains("calendar.submit"));
+    assert!(lines[0].contains("exact"));
+    assert!(lines[1].contains("calendar.submit-title"));
+    assert!(lines[1].contains("casing"));
+    assert!(lines[2].contains("calendar.submit-help"));
+    assert!(lines[2].contains("partial"));
+}
+
+#[test]
+fn find_exact_only_excludes_casing_and_partial_matches() {
+    let dir = tempdir().expect("tempdir");
+    setup_find_project(dir.path());
+
+    let assert = trans_cmd()
+        .current_dir(dir.path())
+        .args(["find", "--exact-only", "submit"])
+        .assert()
+        .success();
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
+
+    assert!(output.contains("calendar.submit"));
+    assert!(output.contains("exact"));
+    assert!(!output.contains("calendar.submit-title"));
+    assert!(!output.contains("calendar.submit-help"));
+}
+
+#[test]
+fn find_case_sensitive_excludes_casing_matches() {
+    let dir = tempdir().expect("tempdir");
+    setup_find_project(dir.path());
+
+    let assert = trans_cmd()
+        .current_dir(dir.path())
+        .args(["find", "--case-sensitive", "Submit"])
+        .assert()
+        .success();
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
+
+    assert!(output.contains("calendar.submit-title"));
+    assert!(output.contains("exact"));
+    assert!(output.contains("calendar.submit-help"));
+    assert!(output.contains("partial"));
+    assert!(!output.contains("calendar.submit  "));
+    assert!(!output.contains("casing"));
+}
+
+#[test]
+fn find_exact_only_and_case_sensitive_returns_same_case_exact_matches() {
+    let dir = tempdir().expect("tempdir");
+    setup_find_project(dir.path());
+
+    let assert = trans_cmd()
+        .current_dir(dir.path())
+        .args(["find", "--exact-only", "--case-sensitive", "submit"])
+        .assert()
+        .success();
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
+
+    assert!(output.contains("calendar.submit"));
+    assert!(output.contains("exact"));
+    assert!(!output.contains("calendar.submit-title"));
+    assert!(!output.contains("calendar.submit-help"));
+}
+
+#[test]
+fn find_no_matches_exits_successfully_with_empty_stdout() {
+    let dir = tempdir().expect("tempdir");
+    setup_find_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["find", "Missing"])
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
+fn find_rejects_invalid_language() {
+    let dir = tempdir().expect("tempdir");
+    setup_find_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["find", "--language", "fr", "submit"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("available_languages"));
+}
+
+#[test]
+fn find_searches_next_intl_nested_values() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project(dir.path());
+    std::fs::write(
+        dir.path().join("messages/en.json"),
+        "{\n  \"calendar\": {\n    \"thisWeek\": \"This week\"\n  }\n}\n",
+    )
+    .expect("write en");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["find", "This week"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("calendar.thisWeek").and(predicate::str::contains("exact")),
+        );
 }
 
 #[test]

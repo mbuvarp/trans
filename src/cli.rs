@@ -114,6 +114,30 @@ pub enum Command {
         )]
         lang: Option<String>,
     },
+    #[command(about = "Find message ids by searching translation values")]
+    Find {
+        #[arg(value_name = "QUERY", help = "Translation string to search for")]
+        query: String,
+        #[arg(
+            short = 'e',
+            long = "exact-only",
+            help = "Only include exact same-case string matches"
+        )]
+        exact_only: bool,
+        #[arg(
+            short = 'c',
+            long = "case-sensitive",
+            help = "Match using exact casing"
+        )]
+        case_sensitive: bool,
+        #[arg(
+            short = 'l',
+            long = "language",
+            value_name = "LANG",
+            help = "Language file to search (defaults to primaryLanguage)"
+        )]
+        language: Option<String>,
+    },
     #[command(
         about = "Update config values interactively",
         long_about = "Update config values interactively.\n\nRoot config options:\n- mode: translation library mode (react-intl or next-intl)\n- languageFilesPath: location of language files\n- availableLanguages: all known languages\n- requiredLanguages: languages required for input\n- primaryLanguage: first language in interactive mode\n- defaultUntranslatedValue: default for non-required languages\n- defaultExportFormat: csv or excel\n- excelPassword: password for Excel sheet protection\n- runUpdateCheck: enable brew update check prompt after successful commands\n\nUse `trans config ai` to edit AI settings:\n- enabled\n- model\n- apiKeyEnv\n- maxOutputTokens\n- concurrency\n\nUse `trans config show` to print current configuration values.\nUse `trans config edit [key]` to edit all values or a single key.\nUse `trans config --format json|yaml` to convert the config file format."
