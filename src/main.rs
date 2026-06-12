@@ -25,7 +25,10 @@ use trans::operations::{
     add_language, add_translation, change_message_id, delete_language, delete_translation,
     update_translation,
 };
-use trans::query::{get_translation, get_translations_all, list_required_languages};
+use trans::query::{
+    FindMatchKind, find_translations, get_translation, get_translations_all,
+    list_required_languages,
+};
 use trans::sync::{apply_sync_plan, collect_missing_ids, maybe_prompt_sync};
 use trans::translations::{migrate_language_files_to_dir, validate_language_file_migration};
 use trans::update_check::{UpdateInfo, spawn_update_check};
@@ -324,6 +327,25 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::Find {
+            query,
+            exact_only,
+            case_sensitive,
+            language,
+        }) => {
+            let root = config_root(&effective_cwd)?;
+            let config = TransConfig::load_from_root(&root)?;
+            let matches = find_translations(
+                &root,
+                &config,
+                &query,
+                language.as_deref(),
+                exact_only,
+                case_sensitive,
+            )?;
+            print_find_matches(&matches);
+            Ok(())
+        }
         Some(Command::Config { section, format }) => {
             let root = config_root(&effective_cwd)?;
             if let Some(format) = format {
@@ -470,6 +492,31 @@ fn run() -> Result<()> {
         maybe_prompt_update(update_check)?;
     }
     result
+}
+
+fn print_find_matches(matches: &[trans::query::FindMatch]) {
+    let width = matches
+        .iter()
+        .map(|find_match| find_match.message_id.len())
+        .max()
+        .unwrap_or(0);
+
+    for find_match in matches {
+        println!(
+            "{:<width$}  {}",
+            find_match.message_id,
+            format_find_match_kind(find_match.kind),
+            width = width
+        );
+    }
+}
+
+fn format_find_match_kind(kind: FindMatchKind) -> String {
+    match kind {
+        FindMatchKind::Exact => style("exact").green().to_string(),
+        FindMatchKind::Casing => style("casing").yellow().to_string(),
+        FindMatchKind::Partial => style("partial").color256(208).to_string(),
+    }
 }
 
 fn handle_sync(root: &Path, config: &TransConfig) -> Result<()> {
