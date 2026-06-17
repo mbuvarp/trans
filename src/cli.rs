@@ -114,6 +114,11 @@ pub enum Command {
         )]
         lang: Option<String>,
     },
+    #[command(about = "Check whether a message id exists in all languages")]
+    Has {
+        #[arg(value_name = "MESSAGE_ID", help = "Message id with namespace to check")]
+        id: String,
+    },
     #[command(about = "Find message ids by searching translation values")]
     Find {
         #[arg(value_name = "QUERY", help = "Translation string to search for")]

@@ -23,6 +23,12 @@ pub struct FindMatch {
     pub kind: FindMatchKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HasMessageIdResult {
+    pub found: Vec<String>,
+    pub not_found: Vec<String>,
+}
+
 pub fn find_translations(
     root: impl AsRef<Path>,
     config: &TransConfig,
@@ -136,6 +142,27 @@ pub fn get_translations_all(
     }
 
     Ok(results)
+}
+
+pub fn has_message_id(
+    root: impl AsRef<Path>,
+    config: &TransConfig,
+    message_id: &str,
+) -> Result<HasMessageIdResult> {
+    validate_message_id(message_id)?;
+
+    let mut found = Vec::new();
+    let mut not_found = Vec::new();
+    for language in &config.available_languages {
+        let translations = load_language_translations(&root, config, language)?;
+        if translations.contains_key(message_id) {
+            found.push(language.clone());
+        } else {
+            not_found.push(language.clone());
+        }
+    }
+
+    Ok(HasMessageIdResult { found, not_found })
 }
 
 #[cfg(test)]
@@ -265,5 +292,145 @@ mod tests {
             .expect_err("invalid language");
 
         assert!(err.to_string().contains("available_languages"));
+    }
+
+    #[test]
+    fn has_message_id_reports_all_languages_found() {
+        let dir = tempdir().expect("tempdir");
+        let config = base_config();
+        save_language_translations(
+            dir.path(),
+            &config,
+            "en",
+            &translations(&[("app.title", "Title")]),
+        )
+        .expect("save en");
+        save_language_translations(
+            dir.path(),
+            &config,
+            "nb",
+            &translations(&[("app.title", "Tittel")]),
+        )
+        .expect("save nb");
+
+        let result = has_message_id(dir.path(), &config, "app.title").expect("has");
+
+        assert_eq!(
+            result,
+            HasMessageIdResult {
+                found: vec!["en".to_string(), "nb".to_string()],
+                not_found: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn has_message_id_reports_no_languages_found() {
+        let dir = tempdir().expect("tempdir");
+        let config = base_config();
+        save_language_translations(
+            dir.path(),
+            &config,
+            "en",
+            &translations(&[("app.other", "Other")]),
+        )
+        .expect("save en");
+        save_language_translations(
+            dir.path(),
+            &config,
+            "nb",
+            &translations(&[("app.other", "Annet")]),
+        )
+        .expect("save nb");
+
+        let result = has_message_id(dir.path(), &config, "app.title").expect("has");
+
+        assert_eq!(
+            result,
+            HasMessageIdResult {
+                found: vec![],
+                not_found: vec!["en".to_string(), "nb".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn has_message_id_reports_partial_found_in_config_order() {
+        let dir = tempdir().expect("tempdir");
+        let mut config = base_config();
+        config.available_languages = vec![
+            "nb".to_string(),
+            "en".to_string(),
+            "pl".to_string(),
+            "se".to_string(),
+        ];
+        save_language_translations(
+            dir.path(),
+            &config,
+            "nb",
+            &translations(&[("app.title", "Tittel")]),
+        )
+        .expect("save nb");
+        save_language_translations(
+            dir.path(),
+            &config,
+            "en",
+            &translations(&[("app.title", "Title")]),
+        )
+        .expect("save en");
+        save_language_translations(
+            dir.path(),
+            &config,
+            "pl",
+            &translations(&[("app.other", "Inne")]),
+        )
+        .expect("save pl");
+        save_language_translations(
+            dir.path(),
+            &config,
+            "se",
+            &translations(&[("app.other", "Other")]),
+        )
+        .expect("save se");
+
+        let result = has_message_id(dir.path(), &config, "app.title").expect("has");
+
+        assert_eq!(
+            result,
+            HasMessageIdResult {
+                found: vec!["nb".to_string(), "en".to_string()],
+                not_found: vec!["pl".to_string(), "se".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn has_message_id_counts_empty_values_as_found() {
+        let dir = tempdir().expect("tempdir");
+        let config = base_config();
+        save_language_translations(
+            dir.path(),
+            &config,
+            "en",
+            &translations(&[("app.title", "")]),
+        )
+        .expect("save en");
+        save_language_translations(
+            dir.path(),
+            &config,
+            "nb",
+            &translations(&[("app.title", "")]),
+        )
+        .expect("save nb");
+
+        let result = has_message_id(dir.path(), &config, "app.title").expect("has");
+
+        assert_eq!(
+            result,
+            HasMessageIdResult {
+                found: vec!["en".to_string(), "nb".to_string()],
+                not_found: vec![],
+            }
+        );
     }
 }
