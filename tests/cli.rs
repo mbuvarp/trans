@@ -129,6 +129,48 @@ fn setup_find_project(root: &std::path::Path) -> TransConfig {
     config
 }
 
+fn setup_partial_has_project(root: &std::path::Path) -> TransConfig {
+    let mut config = base_config();
+    config.available_languages = vec![
+        "en".to_string(),
+        "nb".to_string(),
+        "pl".to_string(),
+        "se".to_string(),
+    ];
+    config.save_to_root(root).expect("save config");
+
+    save_language_translations(
+        root,
+        &config,
+        "en",
+        &translations(&[("common.help", "Help")]),
+    )
+    .expect("save en");
+    save_language_translations(
+        root,
+        &config,
+        "nb",
+        &translations(&[("common.help", "Hjelp")]),
+    )
+    .expect("save nb");
+    save_language_translations(
+        root,
+        &config,
+        "pl",
+        &translations(&[("common.other", "Other")]),
+    )
+    .expect("save pl");
+    save_language_translations(
+        root,
+        &config,
+        "se",
+        &translations(&[("common.other", "Other")]),
+    )
+    .expect("save se");
+
+    config
+}
+
 fn trans_cmd() -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("trans"));
     cmd.env("TRANS_AI_DISABLE", "1");
@@ -292,6 +334,73 @@ fn find_uses_primary_language_by_default() {
                 .and(predicate::str::contains("exact"))
                 .and(predicate::str::contains("Denne uken").not()),
         );
+}
+
+#[test]
+fn has_outputs_found_and_exits_zero_when_all_languages_contain_id() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["has", "app.title"])
+        .assert()
+        .success()
+        .stdout("found\n");
+}
+
+#[test]
+fn has_outputs_not_found_and_exits_one_when_no_languages_contain_id() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["has", "app.missing"])
+        .assert()
+        .code(1)
+        .stdout("not found\n")
+        .stderr("");
+}
+
+#[test]
+fn has_outputs_partial_language_lists_and_exits_two() {
+    let dir = tempdir().expect("tempdir");
+    setup_partial_has_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["has", "common.help"])
+        .assert()
+        .code(2)
+        .stdout("found: en, nb\nnot found: pl, se\n")
+        .stderr("");
+}
+
+#[test]
+fn has_searches_next_intl_nested_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["has", "app.title"])
+        .assert()
+        .success()
+        .stdout("found\n");
+}
+
+#[test]
+fn has_rejects_invalid_message_id() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["has", "title"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("namespace"));
 }
 
 #[test]

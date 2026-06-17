@@ -26,7 +26,7 @@ use trans::operations::{
     update_translation,
 };
 use trans::query::{
-    FindMatchKind, find_translations, get_translation, get_translations_all,
+    FindMatchKind, find_translations, get_translation, get_translations_all, has_message_id,
     list_required_languages,
 };
 use trans::sync::{apply_sync_plan, collect_missing_ids, maybe_prompt_sync};
@@ -326,6 +326,22 @@ fn run() -> Result<()> {
                 }
             }
             Ok(())
+        }
+        Some(Command::Has { id }) => {
+            let root = config_root(&effective_cwd)?;
+            let config = TransConfig::load_from_root(&root)?;
+            let result = has_message_id(&root, &config, &id)?;
+            if result.not_found.is_empty() {
+                println!("found");
+                Ok(())
+            } else if result.found.is_empty() {
+                println!("not found");
+                process::exit(1);
+            } else {
+                println!("found: {}", result.found.join(", "));
+                println!("not found: {}", result.not_found.join(", "));
+                process::exit(2);
+            }
         }
         Some(Command::Find {
             query,
