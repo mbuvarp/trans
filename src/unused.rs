@@ -147,6 +147,42 @@ struct HelperSummary {
 struct HelperParamUsage {
     param_index: usize,
     keys: Option<FiniteStrings>,
+    query: Option<HelperKeyQuery>,
+}
+
+#[derive(Debug, Clone)]
+struct HelperKeyQuery {
+    path: PathBuf,
+    line: usize,
+    key_start: usize,
+    key_end: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SourceQueryContext {
+    path: PathBuf,
+    line_starts: Vec<usize>,
+    utf16_offset_corrections: Vec<(usize, usize)>,
+}
+
+impl SourceQueryContext {
+    fn new(path: &Path, source: &str) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            line_starts: line_starts(source),
+            utf16_offset_corrections: utf16_offset_corrections(source),
+        }
+    }
+
+    fn key_query(&self, call_start: u32, argument: &Argument<'_>) -> HelperKeyQuery {
+        let span = argument.span();
+        HelperKeyQuery {
+            path: self.path.clone(),
+            line: line_number(&self.line_starts, call_start as usize),
+            key_start: utf16_offset(span.start as usize, &self.utf16_offset_corrections),
+            key_end: utf16_offset(span.end as usize, &self.utf16_offset_corrections),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -288,6 +324,32 @@ function transform(values, method) {
   return null;
 }
 
+function finiteFromObjectEntriesBinding(ts, checker, node) {
+  if (!ts.isIdentifier(node)) return null;
+  const symbol = checker.getSymbolAtLocation(node);
+  const declaration = symbol?.valueDeclaration;
+  if (!declaration || !ts.isBindingElement(declaration)) return null;
+  const pattern = declaration.parent;
+  if (!ts.isArrayBindingPattern(pattern) || pattern.elements[0] !== declaration) return null;
+  const parameter = pattern.parent;
+  if (!ts.isParameter(parameter)) return null;
+  const callback = parameter.parent;
+  if (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback)) return null;
+  const iterationCall = callback.parent;
+  if (!ts.isCallExpression(iterationCall) || !ts.isPropertyAccessExpression(iterationCall.expression)) return null;
+  if (iterationCall.expression.name.text !== 'map' && iterationCall.expression.name.text !== 'flatMap' && iterationCall.expression.name.text !== 'forEach') return null;
+  const entriesCall = iterationCall.expression.expression;
+  if (!ts.isCallExpression(entriesCall) || !ts.isPropertyAccessExpression(entriesCall.expression)) return null;
+  if (!ts.isIdentifier(entriesCall.expression.expression) || entriesCall.expression.expression.text !== 'Object' || entriesCall.expression.name.text !== 'entries') return null;
+  const object = entriesCall.arguments[0];
+  if (!object) return null;
+  const objectType = checker.getTypeAtLocation(object);
+  if (!(objectType.flags & ts.TypeFlags.Object) || !(objectType.objectFlags & ts.ObjectFlags.Mapped)) return null;
+  const keys = checker.getPropertiesOfType(objectType).map(property => property.name);
+  if (keys.length === 0 || keys.length > 128) return null;
+  return unique(keys);
+}
+
 function finiteFromExpression(ts, checker, node) {
   if (!node) return null;
 
@@ -317,6 +379,11 @@ function finiteFromExpression(ts, checker, node) {
     const objectValues = finiteFromExpression(ts, checker, node.expression.expression);
     if (!objectValues) return null;
     return transform(objectValues, method);
+  }
+
+  if (ts.isIdentifier(node)) {
+    const entryKeys = finiteFromObjectEntriesBinding(ts, checker, node);
+    if (entryKeys) return entryKeys;
   }
 
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) || ts.isIdentifier(node)) {
@@ -769,7 +836,7 @@ fn collect_usage_from_source_with_project(
     let project = match project {
         Some(project) => Some(project),
         None => {
-            let mut index_collector = SourceIndexCollector::default();
+            let mut index_collector = SourceIndexCollector::new(path, source);
             index_collector.visit_program(&ret.program);
             let mut files = BTreeMap::new();
             files.insert(path.to_path_buf(), index_collector.finish());
@@ -925,7 +992,7 @@ impl ProjectIndex {
                 )));
             }
 
-            let mut collector = SourceIndexCollector::default();
+            let mut collector = SourceIndexCollector::new(&path, &source);
             collector.visit_program(&ret.program);
             let index = collector.finish();
             let dependency_sources: Vec<_> = index.dependency_sources.iter().cloned().collect();
@@ -1476,6 +1543,7 @@ fn strip_json_comments(input: &str) -> String {
 struct SourceUsageCollector {
     path: PathBuf,
     line_starts: Vec<usize>,
+    utf16_offset_corrections: Vec<(usize, usize)>,
     project: Option<ProjectIndex>,
     file_index: Option<SourceFileIndex>,
     use_translations: BTreeSet<String>,
@@ -1508,6 +1576,7 @@ fn helper_summary_from_expression_with_context(
     finite_record_iterables: &FiniteRecordBindings,
     finite_record_maps: &FiniteRecordMaps,
     enum_member_domains: &TypeDomains,
+    source_context: Option<&SourceQueryContext>,
 ) -> Option<HelperSummary> {
     match expression.get_inner_expression() {
         Expression::ArrowFunctionExpression(arrow) => Some(helper_summary_from_arrow_with_context(
@@ -1520,6 +1589,7 @@ fn helper_summary_from_expression_with_context(
             finite_record_iterables,
             finite_record_maps,
             enum_member_domains,
+            source_context,
         )),
         Expression::FunctionExpression(function) => helper_summary_from_function_with_context(
             function,
@@ -1531,6 +1601,7 @@ fn helper_summary_from_expression_with_context(
             finite_record_iterables,
             finite_record_maps,
             enum_member_domains,
+            source_context,
         ),
         _ => None,
     }
@@ -1546,6 +1617,7 @@ fn helper_summary_from_arrow_with_context(
     finite_record_iterables: &FiniteRecordBindings,
     finite_record_maps: &FiniteRecordMaps,
     enum_member_domains: &TypeDomains,
+    source_context: Option<&SourceQueryContext>,
 ) -> HelperSummary {
     helper_summary_from_body_with_context(
         &arrow.params,
@@ -1558,6 +1630,7 @@ fn helper_summary_from_arrow_with_context(
         finite_record_iterables,
         finite_record_maps,
         enum_member_domains,
+        source_context,
     )
 }
 
@@ -1571,6 +1644,7 @@ fn helper_summary_from_function_with_context(
     finite_record_iterables: &FiniteRecordBindings,
     finite_record_maps: &FiniteRecordMaps,
     enum_member_domains: &TypeDomains,
+    source_context: Option<&SourceQueryContext>,
 ) -> Option<HelperSummary> {
     let body = function.body.as_ref()?;
     Some(helper_summary_from_body_with_context(
@@ -1584,6 +1658,7 @@ fn helper_summary_from_function_with_context(
         finite_record_iterables,
         finite_record_maps,
         enum_member_domains,
+        source_context,
     ))
 }
 
@@ -1598,6 +1673,7 @@ fn helper_summary_from_body_with_context(
     finite_record_iterables: &FiniteRecordBindings,
     finite_record_maps: &FiniteRecordMaps,
     enum_member_domains: &TypeDomains,
+    source_context: Option<&SourceQueryContext>,
 ) -> HelperSummary {
     let mut param_names = BTreeMap::new();
     for (index, parameter) in params.items.iter().enumerate() {
@@ -1616,6 +1692,7 @@ fn helper_summary_from_body_with_context(
         finite_record_iterables: finite_record_iterables.clone(),
         finite_record_maps: finite_record_maps.clone(),
         enum_member_domains: enum_member_domains.clone(),
+        source_context: source_context.cloned(),
         usages: Vec::new(),
     };
     for statement in &body.statements {
@@ -2681,6 +2758,67 @@ fn finite_records_from_callback_argument(
     }
 }
 
+fn finite_records_from_array_from_call(
+    call: &CallExpression<'_>,
+    constants: &BTreeMap<String, FiniteStrings>,
+    object_maps: &FiniteObjectMaps,
+    enum_member_domains: &TypeDomains,
+    record_iterables: &FiniteRecordBindings,
+    record_maps: &FiniteRecordMaps,
+) -> Option<FiniteRecords> {
+    let member = call.callee.get_member_expr()?;
+    if member.static_property_name()? != "from"
+        || !is_identifier_expression(member.object(), "Array")
+    {
+        return None;
+    }
+    let Argument::ObjectExpression(options) = call.arguments.first()? else {
+        return None;
+    };
+    let length = options.properties.iter().find_map(|property| {
+        let ObjectPropertyKind::ObjectProperty(property) = property else {
+            return None;
+        };
+        if property.key.static_name().as_deref() != Some("length") {
+            return None;
+        }
+        let Expression::NumericLiteral(length) = &property.value else {
+            return None;
+        };
+        if length.value.is_finite() && length.value >= 0.0 && length.value.fract() == 0.0 {
+            Some(length.value as usize)
+        } else {
+            None
+        }
+    })?;
+    if length == 0 || length > MAX_FINITE_STRINGS {
+        return None;
+    }
+    let callback = call.arguments.get(1)?;
+    let Argument::ArrowFunctionExpression(arrow) = callback else {
+        return None;
+    };
+    let index_name = arrow
+        .params
+        .items
+        .get(1)
+        .and_then(|parameter| binding_identifier_name(&parameter.pattern))?;
+    let mut callback_constants = constants.clone();
+    callback_constants.insert(
+        index_name.to_string(),
+        (0..length).map(|index| index.to_string()).collect(),
+    );
+    finite_records_from_callback_argument(
+        callback,
+        &callback_constants,
+        &BTreeMap::new(),
+        object_maps,
+        enum_member_domains,
+        record_iterables,
+        record_maps,
+    )
+}
+
 fn finite_records_from_object_values(
     object: &ObjectExpression<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
@@ -2855,6 +2993,16 @@ fn finite_record_iterable_from_expression(
             finite_record_property_iterable(records, member.property.name.as_str())
         }
         Expression::CallExpression(call) => {
+            if let Some(records) = finite_records_from_array_from_call(
+                call,
+                constants,
+                object_maps,
+                enum_member_domains,
+                record_iterables,
+                record_maps,
+            ) {
+                return Some(records);
+            }
             if call_is_callback_value_wrapper(call, "useMemo") {
                 return call.arguments.first().and_then(|callback| {
                     finite_records_from_callback_argument(
@@ -3285,6 +3433,7 @@ fn finite_strings_from_template(
 
 struct HelperBodyCollector {
     param_names: BTreeMap<String, usize>,
+    source_context: Option<SourceQueryContext>,
     helpers: BTreeMap<String, HelperSummary>,
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
@@ -3368,6 +3517,7 @@ impl HelperBodyCollector {
             self.usages.push(HelperParamUsage {
                 param_index,
                 keys: usage.keys.clone(),
+                query: usage.query.clone(),
             });
         }
     }
@@ -3571,7 +3721,7 @@ impl HelperBodyCollector {
         let Some(method) = member.static_property_name() else {
             return false;
         };
-        if !matches!(method.as_ref(), "map" | "forEach") {
+        if !matches!(method.as_ref(), "map" | "flatMap" | "forEach") {
             return false;
         }
         let Some(values) = self.finite_iterable_from_expression(member.object()) else {
@@ -3628,7 +3778,7 @@ impl HelperBodyCollector {
         let Some(method) = member.static_property_name() else {
             return false;
         };
-        if !matches!(method.as_ref(), "map" | "forEach") {
+        if !matches!(method.as_ref(), "map" | "flatMap" | "forEach") {
             return false;
         }
         let Some(values) = self.finite_record_iterable_from_expression(member.object()) else {
@@ -3723,11 +3873,22 @@ impl<'a> Visit<'a> for HelperBodyCollector {
         }
 
         if let Some(param_index) = self.callee_param_index(&call.callee) {
-            let keys = call
-                .arguments
-                .first()
-                .and_then(|argument| self.finite_strings_from_argument(argument));
-            self.usages.push(HelperParamUsage { param_index, keys });
+            let argument = call.arguments.first();
+            let keys = argument.and_then(|argument| self.finite_strings_from_argument(argument));
+            let query = if keys.is_none() {
+                argument.and_then(|argument| {
+                    self.source_context
+                        .as_ref()
+                        .map(|context| context.key_query(call.span.start, argument))
+                })
+            } else {
+                None
+            };
+            self.usages.push(HelperParamUsage {
+                param_index,
+                keys,
+                query,
+            });
         }
         self.visit_callback_arguments(call);
         walk::walk_call_expression(self, call);
@@ -4008,6 +4169,7 @@ impl<'a> Visit<'a> for ReturnValueCollector {
 
 #[derive(Default)]
 struct SourceIndexCollector {
+    source_context: SourceQueryContext,
     imports: BTreeMap<String, ImportTarget>,
     re_exports: BTreeMap<String, ImportTarget>,
     dependency_sources: BTreeSet<String>,
@@ -4031,6 +4193,13 @@ struct SourceIndexCollector {
 }
 
 impl SourceIndexCollector {
+    fn new(path: &Path, source: &str) -> Self {
+        Self {
+            source_context: SourceQueryContext::new(path, source),
+            ..Self::default()
+        }
+    }
+
     fn finish(self) -> SourceFileIndex {
         let mut named_exports = BTreeMap::new();
         let mut named_return_exports = BTreeMap::new();
@@ -4150,6 +4319,7 @@ impl SourceIndexCollector {
                 &self.finite_record_iterables,
                 &self.finite_record_maps,
                 &self.enum_member_domains,
+                Some(&self.source_context),
             ) {
                 self.record_helper(name, summary);
             }
@@ -4302,6 +4472,7 @@ impl SourceIndexCollector {
                     &self.finite_record_iterables,
                     &self.finite_record_maps,
                     &self.enum_member_domains,
+                    Some(&self.source_context),
                 ) {
                     self.default_summary = Some(summary);
                 }
@@ -4347,6 +4518,7 @@ impl SourceIndexCollector {
                     &self.finite_record_iterables,
                     &self.finite_record_maps,
                     &self.enum_member_domains,
+                    Some(&self.source_context),
                 ));
                 self.default_return_summary = finite_return_summary_from_arrow(arrow);
                 if let Some(summary) = finite_record_return_summary_from_arrow(arrow) {
@@ -4364,6 +4536,7 @@ impl SourceIndexCollector {
                     &self.finite_record_iterables,
                     &self.finite_record_maps,
                     &self.enum_member_domains,
+                    Some(&self.source_context),
                 );
                 self.default_return_summary = finite_return_summary_from_function(function);
                 if let Some(summary) = finite_record_return_summary_from_function(function) {
@@ -4441,6 +4614,7 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                 &self.finite_record_iterables,
                 &self.finite_record_maps,
                 &self.enum_member_domains,
+                Some(&self.source_context),
             ) {
                 self.record_helper(id.name.as_str(), summary);
             }
@@ -4534,6 +4708,7 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                     &self.finite_record_iterables,
                     &self.finite_record_maps,
                     &self.enum_member_domains,
+                    Some(&self.source_context),
                 ) {
                     self.record_helper(name, summary);
                 }
@@ -4575,6 +4750,7 @@ impl SourceUsageCollector {
         Self {
             path: path.to_path_buf(),
             line_starts: line_starts(source),
+            utf16_offset_corrections: utf16_offset_corrections(source),
             project,
             file_index,
             use_translations: BTreeSet::new(),
@@ -4927,16 +5103,17 @@ impl SourceUsageCollector {
             namespace: namespace.unwrap_or_default().to_string(),
             path: self.path.clone(),
             line: self.line_number(call_start),
-            key_start: Some(span.start as usize),
-            key_end: Some(span.end as usize),
+            key_start: Some(self.utf16_offset(span.start as usize)),
+            key_end: Some(self.utf16_offset(span.end as usize)),
         });
     }
 
+    fn utf16_offset(&self, byte_offset: usize) -> usize {
+        utf16_offset(byte_offset, &self.utf16_offset_corrections)
+    }
+
     fn line_number(&self, start: u32) -> usize {
-        let offset = start as usize;
-        self.line_starts
-            .partition_point(|line_start| *line_start <= offset)
-            .max(1)
+        line_number(&self.line_starts, start as usize)
     }
 
     fn call_namespace(&self, call: &CallExpression<'_>) -> NamespaceArg {
@@ -5021,19 +5198,43 @@ impl SourceUsageCollector {
             .finite_iterable_for_import(&self.path, target)
     }
 
-    fn finite_strings_for_property_name(&self, property: &str) -> Option<FiniteStrings> {
+    fn finite_strings_for_property_name(
+        &self,
+        object: &Expression<'_>,
+        property: &str,
+    ) -> Option<FiniteStrings> {
         let mut values = BTreeSet::new();
         for (name, domain) in &self.finite_iterables {
             if property_names_from_value_constant_name(name).contains(property) {
                 values.extend(domain.iter().cloned());
             }
         }
+        let object_name = object
+            .get_inner_expression()
+            .get_identifier_reference()
+            .map(|identifier| identifier.name.as_str());
+        if let Some(object_name) = object_name {
+            for (name, records) in &self.finite_record_iterables {
+                if property_names_from_value_constant_name(name).contains(object_name)
+                    && let Some(domain) = finite_record_property_strings(records, property)
+                {
+                    values.extend(domain);
+                }
+            }
+        }
         if let (Some(file_index), Some(project)) = (&self.file_index, &self.project) {
             for (name, target) in &file_index.imports {
-                if !property_names_from_value_constant_name(name).contains(property) {
-                    continue;
+                let inferred_names = property_names_from_value_constant_name(name);
+                if inferred_names.contains(property)
+                    && let Some(domain) = project.finite_iterable_for_import(&self.path, target)
+                {
+                    values.extend(domain);
                 }
-                if let Some(domain) = project.finite_iterable_for_import(&self.path, target) {
+                if object_name.is_some_and(|object_name| inferred_names.contains(object_name))
+                    && let Some(records) =
+                        project.finite_record_iterable_for_import(&self.path, target)
+                    && let Some(domain) = finite_record_property_strings(&records, property)
+                {
                     values.extend(domain);
                 }
             }
@@ -5462,6 +5663,26 @@ impl SourceUsageCollector {
         }
     }
 
+    fn record_dynamic_query_for_binding(
+        &mut self,
+        binding: &TranslatorBinding,
+        query: &HelperKeyQuery,
+    ) {
+        let namespaces: Vec<_> = match &binding.namespaces {
+            Some(namespaces) => namespaces.iter().cloned().collect(),
+            None => vec![binding.namespace.clone().unwrap_or_default()],
+        };
+        for namespace in namespaces {
+            self.scan.dynamic_usages.push(DynamicUsage {
+                namespace,
+                path: query.path.clone(),
+                line: query.line,
+                key_start: Some(query.key_start),
+                key_end: Some(query.key_end),
+            });
+        }
+    }
+
     fn apply_helper_summary(&mut self, call: &CallExpression<'_>, summary: &HelperSummary) {
         for usage in &summary.param_usages {
             let Some(argument) = call.arguments.get(usage.param_index) else {
@@ -5474,6 +5695,13 @@ impl SourceUsageCollector {
                 (Some(keys), false) => {
                     for key in keys {
                         self.record_used_key_for_binding(&binding, key);
+                    }
+                }
+                (None, false) => {
+                    if let Some(query) = &usage.query {
+                        self.record_dynamic_query_for_binding(&binding, query);
+                    } else {
+                        self.record_dynamic_key_for_binding(&binding, call.span.start, None);
                     }
                 }
                 _ => self.record_dynamic_key_for_binding(&binding, call.span.start, None),
@@ -5495,7 +5723,12 @@ impl SourceUsageCollector {
             Argument::TemplateLiteral(literal) => self.finite_strings_from_template(literal),
             Argument::StaticMemberExpression(member) => self
                 .finite_strings_from_record_member(&member.object, member.property.name.as_str())
-                .or_else(|| self.finite_strings_for_property_name(member.property.name.as_str()))
+                .or_else(|| {
+                    self.finite_strings_for_property_name(
+                        &member.object,
+                        member.property.name.as_str(),
+                    )
+                })
                 .or_else(|| {
                     finite_strings_from_argument(
                         argument,
@@ -5519,7 +5752,12 @@ impl SourceUsageCollector {
             Expression::TemplateLiteral(literal) => self.finite_strings_from_template(literal),
             Expression::StaticMemberExpression(member) => self
                 .finite_strings_from_record_member(&member.object, member.property.name.as_str())
-                .or_else(|| self.finite_strings_for_property_name(member.property.name.as_str()))
+                .or_else(|| {
+                    self.finite_strings_for_property_name(
+                        &member.object,
+                        member.property.name.as_str(),
+                    )
+                })
                 .or_else(|| {
                     finite_strings_from_expression(
                         expression,
@@ -5760,7 +5998,7 @@ impl SourceUsageCollector {
         let Some(method) = member.static_property_name() else {
             return false;
         };
-        if !matches!(method.as_ref(), "map" | "forEach") {
+        if !matches!(method.as_ref(), "map" | "flatMap" | "forEach") {
             return false;
         }
         let Some(values) = self.finite_iterable_from_expression(member.object()) else {
@@ -5817,7 +6055,7 @@ impl SourceUsageCollector {
         let Some(method) = member.static_property_name() else {
             return false;
         };
-        if !matches!(method.as_ref(), "map" | "forEach") {
+        if !matches!(method.as_ref(), "map" | "flatMap" | "forEach") {
             return false;
         }
         let Some(values) = self.finite_record_iterable_from_expression(member.object()) else {
@@ -6138,6 +6376,36 @@ fn line_starts(source: &str) -> Vec<usize> {
     starts
 }
 
+fn line_number(line_starts: &[usize], byte_offset: usize) -> usize {
+    line_starts
+        .partition_point(|line_start| *line_start <= byte_offset)
+        .max(1)
+}
+
+fn utf16_offset(byte_offset: usize, corrections: &[(usize, usize)]) -> usize {
+    let correction_count = corrections.partition_point(|(byte_end, _)| *byte_end <= byte_offset);
+    let correction = correction_count
+        .checked_sub(1)
+        .map(|index| corrections[index].1)
+        .unwrap_or(0);
+    byte_offset - correction
+}
+
+fn utf16_offset_corrections(source: &str) -> Vec<(usize, usize)> {
+    let mut cumulative = 0;
+    source
+        .char_indices()
+        .filter_map(|(byte_start, character)| {
+            let correction = character.len_utf8() - character.len_utf16();
+            if correction == 0 {
+                return None;
+            }
+            cumulative += correction;
+            Some((byte_start + character.len_utf8(), cumulative))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6184,6 +6452,30 @@ mod tests {
         assert_eq!(queries[0].namespace, "");
         assert_eq!(queries[0].start, 10);
         assert_eq!(queries[0].end, 20);
+    }
+
+    #[test]
+    fn ts_checker_query_offsets_use_utf16_positions_after_non_ascii_source() {
+        let source = r#"
+            import {useTranslations} from 'next-intl';
+            const description = 'Møppe (valgfritt)';
+            const t = useTranslations('common');
+            t(labelKey);
+        "#;
+        let scan = scan(source);
+        let usage = scan.dynamic_usages.first().expect("dynamic usage");
+        let byte_start = source.find("labelKey").expect("labelKey");
+        let byte_end = byte_start + "labelKey".len();
+
+        assert_eq!(
+            usage.key_start,
+            Some(source[..byte_start].encode_utf16().count())
+        );
+        assert_eq!(
+            usage.key_end,
+            Some(source[..byte_end].encode_utf16().count())
+        );
+        assert_ne!(usage.key_start, Some(byte_start));
     }
 
     #[test]
@@ -6968,6 +7260,48 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_helper_keys_retain_checker_query_location() {
+        let source = r#"import {useTranslations} from 'next-intl';
+type SourceType = 'project-files' | 'deviation';
+interface Item { source: { type: SourceType } }
+function getSubtitle(item: Item, translate) {
+  return translate(`upload-queue.source-types.${item.source.type}`);
+}
+const t = useTranslations();
+getSubtitle(item, t);
+"#;
+        let scan = scan(source);
+        let usage = scan.dynamic_usages.first().expect("dynamic helper usage");
+        let key_expression = "`upload-queue.source-types.${item.source.type}`";
+        let byte_start = source.find(key_expression).expect("key expression");
+        let byte_end = byte_start + key_expression.len();
+
+        assert_eq!(scan.dynamic_usages.len(), 1);
+        assert_eq!(usage.path, PathBuf::from("sample.tsx"));
+        assert_eq!(usage.line, 5);
+        assert_eq!(usage.key_start, Some(byte_start));
+        assert_eq!(usage.key_end, Some(byte_end));
+    }
+
+    #[test]
+    fn object_entries_record_key_retains_checker_query() {
+        let source = r#"import {getTranslations} from 'next-intl/server';
+type Resource = 'project' | 'customer';
+const groups = getGroups() as Partial<Record<Resource, unknown[]>>;
+const t = getTranslations('userTypes');
+Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
+"#;
+        let scan = scan(source);
+        let usage = scan.dynamic_usages.first().expect("dynamic record key");
+        let key_expression = "`resources.${resource}`";
+        let byte_start = source.find(key_expression).expect("key expression");
+
+        assert_eq!(scan.dynamic_usages.len(), 1);
+        assert_eq!(usage.key_start, Some(byte_start));
+        assert_eq!(usage.key_end, Some(byte_start + key_expression.len()));
+    }
+
+    #[test]
     fn traces_helper_calls_used_as_chained_receiver() {
         let scan = scan(
             r#"
@@ -7022,6 +7356,85 @@ mod tests {
         );
         assert!(scan.used_ids.contains("settings.navigation.profile"));
         assert!(scan.used_ids.contains("settings.navigation.members"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_finite_record_flat_map_callback_properties() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const ITEMS = [
+              {id: 'home', labelKey: 'common.home'},
+              {id: 'offers', labelKey: 'common.offers'},
+            ];
+            const t = useTranslations();
+            ITEMS.flatMap(item =>
+              item.id === 'home' ? [] : [{label: t(item.labelKey)}]
+            );
+            "#,
+        );
+        assert!(scan.used_ids.contains("common.home"));
+        assert!(scan.used_ids.contains("common.offers"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn resolves_finite_record_properties_after_unknown_regrouping() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const SAMPLE_FLAGS = [
+              {name: 'onboarding', desc: 'guidedFiveStep'},
+              {name: 'photoAi', desc: 'autoClassifyPhoto'},
+            ];
+            const visibleGroups = getVisibleGroups(groupFlags(SAMPLE_FLAGS));
+            const t = useTranslations('flags');
+            visibleGroups.map(({list}) => list.map(flag => {
+              t(`names.${flag.name}`);
+              t(`descs.${flag.desc}`);
+            }));
+            "#,
+        );
+        assert!(scan.used_ids.contains("flags.names.onboarding"));
+        assert!(scan.used_ids.contains("flags.names.photoAi"));
+        assert!(scan.used_ids.contains("flags.descs.guidedFiveStep"));
+        assert!(scan.used_ids.contains("flags.descs.autoClassifyPhoto"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn unrelated_finite_record_properties_do_not_resolve_dynamic_members() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const SAMPLE_FLAGS = [{name: 'onboarding'}];
+            const user = getUser();
+            const t = useTranslations('users');
+            t(user.name);
+            "#,
+        );
+        assert!(scan.used_ids.is_empty());
+        assert_eq!(scan.dynamic_usages.len(), 1);
+    }
+
+    #[test]
+    fn resolves_bounded_array_from_index_record_properties() {
+        let scan = scan(
+            r#"
+            import {getTranslations} from 'next-intl/server';
+            const BARS = Array.from({length: 3}, (_, monthIndex) => ({
+              height: Math.max(1, monthIndex),
+              key: `month-${monthIndex}`,
+              monthIndex,
+            }));
+            const t = getTranslations('overview');
+            BARS.map(bar => t(`chart.months.${bar.monthIndex}`));
+            "#,
+        );
+        assert!(scan.used_ids.contains("overview.chart.months.0"));
+        assert!(scan.used_ids.contains("overview.chart.months.1"));
+        assert!(scan.used_ids.contains("overview.chart.months.2"));
         assert!(scan.dynamic_usages.is_empty());
     }
 

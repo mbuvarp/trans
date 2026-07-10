@@ -1446,7 +1446,7 @@ fn unused_resolves_imported_finite_record_return_helper_keys() {
 }
 
 #[test]
-fn unused_resolves_imported_filtered_record_iterable_keys() {
+fn unused_resolves_imported_record_flat_map_keys() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(
         dir.path(),
@@ -1464,7 +1464,7 @@ fn unused_resolves_imported_filtered_record_iterable_keys() {
     .expect("write nav items");
     std::fs::write(
         dir.path().join("page.tsx"),
-        "import {useTranslations} from 'next-intl';\nimport {FOOTER_NAV_ITEMS} from './footer-navigation';\nconst t = useTranslations();\nFOOTER_NAV_ITEMS.filter(item => item.id !== 'home').map(item => t(item.labelKey));\n",
+        "import {useTranslations} from 'next-intl';\nimport {FOOTER_NAV_ITEMS} from './footer-navigation';\nconst t = useTranslations();\nFOOTER_NAV_ITEMS.flatMap(item => item.id === 'home' ? [] : [t(item.labelKey)]);\n",
     )
     .expect("write source");
 
