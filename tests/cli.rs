@@ -955,6 +955,64 @@ fn unused_traces_member_translator_props_into_namespace_jsx_components() {
 }
 
 #[test]
+fn unused_traces_translator_props_through_jsx_spreads() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.noDescription", "No description"),
+            ("projects.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("card.tsx"),
+        "export function Card({format}) { return <p>{format('noDescription')}</p>; }\n",
+    )
+    .expect("write component");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {Card} from './card';\nconst tProjects = useTranslations('projects');\nconst cardProps = {format: tProjects};\nexport default function Page() { return <Card {...cardProps} />; }\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("projects.unused\n");
+}
+
+#[test]
+fn unused_conservatively_handles_unknown_jsx_spreads() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.noDescription", "No description"),
+            ("projects.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("card.tsx"),
+        "export function Card({format}) { return <p>{format('noDescription')}</p>; }\n",
+    )
+    .expect("write component");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {Card} from './card';\nexport default function Page({cardProps}) { return <Card {...cardProps} />; }\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("projects.unused\n");
+}
+
+#[test]
 fn unused_traces_jsx_component_through_star_re_export() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(

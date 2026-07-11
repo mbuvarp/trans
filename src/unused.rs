@@ -23,7 +23,7 @@ use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::{
-    operator::LogicalOperator,
+    operator::{AssignmentOperator, LogicalOperator},
     scope::{ScopeFlags, ScopeId},
 };
 use serde::{Deserialize, Serialize};
@@ -7342,18 +7342,15 @@ impl SourceUsageCollector {
                         .then(|| binding.clone())
                 }));
             }
-            if let Some(array) = self
-                .translator_argument_arrays
-                .get(name)
-                .filter(|array| array.safe_layout)
-            {
+            if let Some(array) = self.translator_argument_arrays.get(name) {
                 candidates.extend(array.bindings.iter().enumerate().filter_map(
                     |(index, binding)| {
-                        property_names
-                            .as_ref()
-                            .is_none_or(|properties| properties.contains(&index.to_string()))
-                            .then(|| binding.clone())
-                            .flatten()
+                        (!array.safe_layout
+                            || property_names
+                                .as_ref()
+                                .is_none_or(|properties| properties.contains(&index.to_string())))
+                        .then(|| binding.clone())
+                        .flatten()
                     },
                 ));
             }
@@ -7913,29 +7910,43 @@ impl SourceUsageCollector {
         };
 
         for usage in summary.usages {
-            let binding = opening.attributes.iter().find_map(|attribute| {
-                let JSXAttributeItem::Attribute(attribute) = attribute else {
-                    return None;
-                };
-                let JSXAttributeName::Identifier(name) = &attribute.name else {
-                    return None;
-                };
-                if name.name.as_str() != usage.prop_name {
-                    return None;
-                }
-                let Some(JSXAttributeValue::ExpressionContainer(container)) = &attribute.value
-                else {
-                    return None;
-                };
-                if matches!(&container.expression, JSXExpression::EmptyExpression(_)) {
-                    return None;
-                }
-                self.translator_binding_from_expression(container.expression.to_expression())
-            });
-            let Some(binding) = binding else {
-                if !usage.translator_like {
-                    continue;
-                }
+            let mut unknown_spread = false;
+            let binding =
+                merge_translator_binding_iter(opening.attributes.iter().filter_map(|attribute| {
+                    match attribute {
+                        JSXAttributeItem::Attribute(attribute) => {
+                            let JSXAttributeName::Identifier(name) = &attribute.name else {
+                                return None;
+                            };
+                            if name.name.as_str() != usage.prop_name {
+                                return None;
+                            }
+                            let Some(JSXAttributeValue::ExpressionContainer(container)) =
+                                &attribute.value
+                            else {
+                                return None;
+                            };
+                            if matches!(&container.expression, JSXExpression::EmptyExpression(_)) {
+                                return None;
+                            }
+                            self.translator_binding_from_expression(
+                                container.expression.to_expression(),
+                            )
+                        }
+                        JSXAttributeItem::SpreadAttribute(spread) => {
+                            let Some(bindings) =
+                                self.translator_object_bindings_from_expression(&spread.argument)
+                            else {
+                                unknown_spread = true;
+                                return None;
+                            };
+                            bindings.get(&usage.prop_name).cloned()
+                        }
+                    }
+                }));
+            if (unknown_spread && usage.keys.is_some())
+                || (binding.is_none() && usage.translator_like)
+            {
                 if let Some(query) = usage.query {
                     self.scan.dynamic_usages.push(DynamicUsage {
                         namespace: String::new(),
@@ -7957,6 +7968,9 @@ impl SourceUsageCollector {
                         key_end: None,
                     });
                 }
+                continue;
+            }
+            let Some(binding) = binding else {
                 continue;
             };
             match usage.keys {
@@ -8783,7 +8797,16 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     if let Some(argument_array) =
                         call.arguments.get(1).and_then(Argument::as_expression)
                     {
-                        let keys = self.finite_iterable_from_expression(argument_array);
+                        let layout_safe = argument_array
+                            .get_identifier_reference()
+                            .and_then(|identifier| {
+                                self.translator_argument_arrays
+                                    .get(identifier.name.as_str())
+                            })
+                            .is_none_or(|array| array.safe_layout);
+                        let keys = layout_safe
+                            .then(|| self.finite_iterable_from_expression(argument_array))
+                            .flatten();
                         self.record_translator_keys(&binding, keys, call.span.start);
                     }
                 }
@@ -8869,6 +8892,36 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     }
 
     fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
+        if expression.operator == AssignmentOperator::Assign
+            && let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &expression.left
+        {
+            let translator = self.translator_binding_from_expression(&expression.right);
+            let object_bindings =
+                self.translator_object_bindings_from_expression(&expression.right);
+            let argument_array = self.translator_argument_array_from_expression(&expression.right);
+            if argument_array.is_some()
+                && let Some(source) = expression.right.get_identifier_reference()
+                && let Some(source_array) = self
+                    .translator_argument_arrays
+                    .get_mut(source.name.as_str())
+            {
+                source_array.safe_layout = false;
+            }
+            let name = identifier.name.as_str();
+            self.mask_binding_name(name);
+            if let Some(binding) = translator {
+                self.translators.insert(name.to_string(), binding);
+            }
+            if let Some(bindings) = object_bindings {
+                self.translator_object_bindings
+                    .insert(name.to_string(), bindings);
+            }
+            if let Some(mut array) = argument_array {
+                array.safe_layout = false;
+                self.translator_argument_arrays
+                    .insert(name.to_string(), array);
+            }
+        }
         if let Some(name) = assignment_target_member_object_name(&expression.left) {
             if let Some(array) = self.translator_argument_arrays.get_mut(name) {
                 array.safe_layout = false;
@@ -9460,6 +9513,61 @@ mod tests {
             const translators = {};
             translators.common = t;
             translators.common('title');
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn translator_functions_assigned_to_identifiers_preserve_used_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('common');
+            let format;
+            format = t;
+            format('assigned');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.assigned"));
+    }
+
+    #[test]
+    fn unsafe_translator_array_aliases_merge_known_namespaces() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const tCommon = useTranslations('common');
+            const tSettings = useTranslations('settings');
+            const translators = [tCommon, tSettings];
+            const alias = translators;
+            alias.reverse();
+            alias[0]('aliased');
+            translators[0]('original');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.aliased"));
+        assert!(scan.used_ids.contains("settings.aliased"));
+        assert!(scan.used_ids.contains("common.original"));
+        assert!(scan.used_ids.contains("settings.original"));
+    }
+
+    #[test]
+    fn mutated_translator_apply_key_arrays_are_conservatively_dynamic() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('common');
+            const args = ['old'];
+            args[0] = 'new';
+            t.apply(null, args);
             "#,
         );
 
