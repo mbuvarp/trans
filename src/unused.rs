@@ -8,15 +8,15 @@ use std::process::{Command, Stdio};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, ArrowFunctionExpression, BindingPattern, CallExpression,
-    ComputedMemberExpression, ConditionalExpression, Declaration, ExportDefaultDeclaration,
-    ExportDefaultDeclarationKind, ExportNamedDeclaration, Expression, ForOfStatement,
-    ForStatementLeft, Function, FunctionBody, ImportDeclaration, ImportDeclarationSpecifier,
-    JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXElementName, JSXExpression,
-    JSXOpeningElement, ModuleExportName, ObjectExpression, ObjectPropertyKind, PropertyKind,
-    ReturnStatement, Statement, StaticMemberExpression, TSInterfaceDeclaration, TSLiteral,
-    TSSignature, TSType, TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator,
-    TSTypeQueryExprName, TemplateLiteral, VariableDeclaration, VariableDeclarationKind,
-    VariableDeclarator,
+    CatchParameter, ComputedMemberExpression, ConditionalExpression, Declaration,
+    ExportDefaultDeclaration, ExportDefaultDeclarationKind, ExportNamedDeclaration, Expression,
+    ForOfStatement, ForStatementLeft, Function, FunctionBody, FunctionType, ImportDeclaration,
+    ImportDeclarationSpecifier, JSXAttributeItem, JSXAttributeName, JSXAttributeValue,
+    JSXElementName, JSXExpression, JSXOpeningElement, ModuleExportName, ObjectExpression,
+    ObjectPropertyKind, PropertyKind, ReturnStatement, Statement, StaticMemberExpression,
+    TSInterfaceDeclaration, TSLiteral, TSSignature, TSType, TSTypeAliasDeclaration, TSTypeName,
+    TSTypeOperatorOperator, TSTypeQueryExprName, TemplateLiteral, VariableDeclaration,
+    VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -94,6 +94,7 @@ pub struct UsageScan {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DynamicUsage {
     pub namespace: String,
+    namespace_unknown: bool,
     pub path: PathBuf,
     pub line: usize,
     possible_keys: Option<FiniteStrings>,
@@ -851,19 +852,28 @@ fn apply_ts_checker_fallback(root: &Path, scan: &mut UsageScan) -> std::result::
         return Err(error);
     }
 
+    apply_ts_checker_results(scan, response.results);
+    Ok(())
+}
+
+fn apply_ts_checker_results(scan: &mut UsageScan, results: Vec<TsCheckerResult>) {
     let mut resolved = BTreeSet::new();
-    for result in response.results {
+    for result in results {
         let Some(usage) = scan.dynamic_usages.get(result.index) else {
             continue;
         };
         if result.keys.is_empty() || result.keys.len() > 128 {
             continue;
         }
-        for key in &result.keys {
-            let Some(id) = resolved_translation_id(&usage.namespace, key) else {
-                continue;
-            };
-            scan.used_ids.insert(id);
+        if usage.namespace_unknown {
+            scan.used_key_suffixes.extend(result.keys);
+        } else {
+            for key in &result.keys {
+                let Some(id) = resolved_translation_id(&usage.namespace, key) else {
+                    continue;
+                };
+                scan.used_ids.insert(id);
+            }
         }
         resolved.insert(result.index);
     }
@@ -876,7 +886,6 @@ fn apply_ts_checker_fallback(root: &Path, scan: &mut UsageScan) -> std::result::
             keep
         });
     }
-    Ok(())
 }
 
 fn ts_checker_queries(dynamic_usages: &[DynamicUsage]) -> Vec<TsCheckerQuery> {
@@ -1178,15 +1187,37 @@ impl ProjectIndex {
     fn expand_jsx_component_summary(
         &self,
         path: &Path,
+        summary: JsxComponentSummary,
+        depth: usize,
+    ) -> Option<JsxComponentSummary> {
+        self.expand_jsx_component_summary_with_active(
+            path,
+            summary,
+            depth,
+            &mut BTreeSet::new(),
+            &mut BTreeMap::new(),
+        )
+    }
+
+    fn expand_jsx_component_summary_with_active(
+        &self,
+        path: &Path,
         mut summary: JsxComponentSummary,
         depth: usize,
+        active: &mut BTreeSet<(PathBuf, String)>,
+        cache: &mut BTreeMap<(PathBuf, String), Option<JsxComponentSummary>>,
     ) -> Option<JsxComponentSummary> {
         if depth > 16 {
             return None;
         }
         let forwards = std::mem::take(&mut summary.forwards);
         for forward in forwards {
+            let edge = (path.to_path_buf(), forward.component_name.clone());
+            if !active.insert(edge.clone()) {
+                continue;
+            }
             let Some(file) = self.files.get(path) else {
+                active.remove(&edge);
                 continue;
             };
             let child = if let Some(child) = file.jsx_components.get(&forward.component_name) {
@@ -1199,11 +1230,25 @@ impl ProjectIndex {
                     })
             };
             let Some((child_path, child_summary)) = child else {
+                active.remove(&edge);
                 continue;
             };
-            let Some(child_summary) =
-                self.expand_jsx_component_summary(&child_path, child_summary, depth + 1)
-            else {
+            let cache_key = (child_path.clone(), forward.component_name.clone());
+            let child_summary = if let Some(summary) = cache.get(&cache_key) {
+                summary.clone()
+            } else {
+                let summary = self.expand_jsx_component_summary_with_active(
+                    &child_path,
+                    child_summary,
+                    depth + 1,
+                    active,
+                    cache,
+                );
+                cache.insert(cache_key, summary.clone());
+                summary
+            };
+            active.remove(&edge);
+            let Some(child_summary) = child_summary else {
                 continue;
             };
             summary.usages.extend(
@@ -1742,10 +1787,12 @@ struct SourceUsageCollector {
     zod_schema_property_domains: TypePropertyDomains,
     enum_member_domains: TypeDomains,
     translators: BTreeMap<String, TranslatorBinding>,
+    potential_translators: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
     binding_scopes: Vec<BindingEnvironment>,
     scope_depth: usize,
     injected_bindings: BTreeSet<String>,
+    summarized_dynamic_key_spans: BTreeSet<(usize, usize)>,
     scan: UsageScan,
 }
 
@@ -1763,6 +1810,7 @@ struct BindingEnvironment {
     zod_schema_property_domains: TypePropertyDomains,
     enum_member_domains: TypeDomains,
     translators: BTreeMap<String, TranslatorBinding>,
+    potential_translators: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
 }
 
@@ -1882,19 +1930,40 @@ fn helper_summary_from_body_with_context(
         }
     }
 
+    let mut helpers = helpers.clone();
+    let mut finite_constants = finite_constants.clone();
+    let mut finite_iterables = finite_iterables.clone();
+    let mut finite_object_maps = finite_object_maps.clone();
+    let mut finite_record_constants = finite_record_constants.clone();
+    let mut finite_record_iterables = finite_record_iterables.clone();
+    let mut finite_record_maps = finite_record_maps.clone();
+    let mut enum_member_domains = enum_member_domains.clone();
+    for name in param_names.keys() {
+        helpers.remove(name);
+        finite_constants.remove(name);
+        finite_iterables.remove(name);
+        finite_object_maps.remove(name);
+        finite_record_constants.remove(name);
+        finite_record_iterables.remove(name);
+        finite_record_maps.remove(name);
+        enum_member_domains.remove(name);
+    }
+
     let mut collector = HelperBodyCollector {
         param_names,
-        helpers: helpers.clone(),
-        finite_constants: finite_constants.clone(),
-        finite_iterables: finite_iterables.clone(),
-        finite_object_maps: finite_object_maps.clone(),
-        finite_record_constants: finite_record_constants.clone(),
-        finite_record_iterables: finite_record_iterables.clone(),
-        finite_record_maps: finite_record_maps.clone(),
-        enum_member_domains: enum_member_domains.clone(),
+        helpers,
+        finite_constants,
+        finite_iterables,
+        finite_object_maps,
+        finite_record_constants,
+        finite_record_iterables,
+        finite_record_maps,
+        enum_member_domains,
         source_context: source_context.cloned(),
         usages: Vec::new(),
         jsx_forwards: Vec::new(),
+        binding_scopes: Vec::new(),
+        injected_bindings: BTreeSet::new(),
     };
     for statement in &body.statements {
         collector.visit_statement(statement);
@@ -1954,7 +2023,13 @@ fn jsx_component_summary_from_body(
         source_context: Some(source_context.clone()),
         usages: Vec::new(),
         jsx_forwards: Vec::new(),
+        binding_scopes: Vec::new(),
+        injected_bindings: BTreeSet::new(),
     };
+    let parameter_names = collector.param_names.keys().cloned().collect::<Vec<_>>();
+    for name in parameter_names {
+        collector.mask_outer_binding_name(&name);
+    }
     for statement in &body.statements {
         collector.visit_statement(statement);
     }
@@ -3727,6 +3802,25 @@ struct HelperBodyCollector {
     enum_member_domains: TypeDomains,
     usages: Vec<HelperParamUsage>,
     jsx_forwards: Vec<HelperJsxForward>,
+    binding_scopes: Vec<HelperScopeFrame>,
+    injected_bindings: BTreeSet<String>,
+}
+
+struct HelperScopeFrame {
+    bindings: BTreeMap<String, HelperBindingValues>,
+    enum_domains: BTreeMap<String, Option<FiniteStrings>>,
+}
+
+struct HelperBindingValues {
+    param_index: Option<usize>,
+    helper: Option<HelperSummary>,
+    finite_constant: Option<FiniteStrings>,
+    finite_iterable: Option<FiniteStrings>,
+    finite_object_map: Option<FiniteObjectMap>,
+    finite_record_constant: Option<FiniteRecords>,
+    finite_record_iterable: Option<FiniteRecords>,
+    finite_record_map: Option<FiniteRecords>,
+    enum_member_domain: Option<FiniteStrings>,
 }
 
 struct HelperJsxForward {
@@ -3767,6 +3861,117 @@ impl<'a> Visit<'a> for MessageKeyHelperCollector {
 }
 
 impl HelperBodyCollector {
+    fn record_binding_before_change(&mut self, name: &str) {
+        if self
+            .binding_scopes
+            .last()
+            .is_none_or(|scope| scope.bindings.contains_key(name))
+        {
+            return;
+        }
+        let values = HelperBindingValues {
+            param_index: self.param_names.remove(name),
+            helper: self.helpers.remove(name),
+            finite_constant: self.finite_constants.remove(name),
+            finite_iterable: self.finite_iterables.remove(name),
+            finite_object_map: self.finite_object_maps.remove(name),
+            finite_record_constant: self.finite_record_constants.remove(name),
+            finite_record_iterable: self.finite_record_iterables.remove(name),
+            finite_record_map: self.finite_record_maps.remove(name),
+            enum_member_domain: self.enum_member_domains.remove(name),
+        };
+        if let Some(scope) = self.binding_scopes.last_mut() {
+            scope.bindings.insert(name.to_string(), values);
+        }
+    }
+
+    fn record_enum_domain_before_change(&mut self, name: &str) {
+        let Some(scope) = self.binding_scopes.last() else {
+            return;
+        };
+        if scope.bindings.contains_key(name) || scope.enum_domains.contains_key(name) {
+            return;
+        }
+        let previous = self.enum_member_domains.remove(name);
+        if let Some(scope) = self.binding_scopes.last_mut() {
+            scope.enum_domains.insert(name.to_string(), previous);
+        }
+    }
+
+    fn restore_scope(&mut self, scope: HelperScopeFrame) {
+        fn restore<T>(map: &mut BTreeMap<String, T>, name: &str, value: Option<T>) {
+            match value {
+                Some(value) => {
+                    map.insert(name.to_string(), value);
+                }
+                None => {
+                    map.remove(name);
+                }
+            }
+        }
+
+        for (name, values) in scope.bindings {
+            restore(&mut self.param_names, &name, values.param_index);
+            restore(&mut self.helpers, &name, values.helper);
+            restore(&mut self.finite_constants, &name, values.finite_constant);
+            restore(&mut self.finite_iterables, &name, values.finite_iterable);
+            restore(
+                &mut self.finite_object_maps,
+                &name,
+                values.finite_object_map,
+            );
+            restore(
+                &mut self.finite_record_constants,
+                &name,
+                values.finite_record_constant,
+            );
+            restore(
+                &mut self.finite_record_iterables,
+                &name,
+                values.finite_record_iterable,
+            );
+            restore(
+                &mut self.finite_record_maps,
+                &name,
+                values.finite_record_map,
+            );
+            restore(
+                &mut self.enum_member_domains,
+                &name,
+                values.enum_member_domain,
+            );
+        }
+        for (name, values) in scope.enum_domains {
+            restore(&mut self.enum_member_domains, &name, values);
+        }
+    }
+
+    fn mask_outer_binding_name(&mut self, name: &str) {
+        self.record_binding_before_change(name);
+        self.helpers.remove(name);
+        self.finite_constants.remove(name);
+        self.finite_iterables.remove(name);
+        self.finite_object_maps.remove(name);
+        self.finite_record_constants.remove(name);
+        self.finite_record_iterables.remove(name);
+        self.finite_record_maps.remove(name);
+        self.enum_member_domains.remove(name);
+    }
+
+    fn mask_binding_name(&mut self, name: &str) {
+        self.mask_outer_binding_name(name);
+        self.param_names.remove(name);
+    }
+
+    fn mask_binding_pattern(&mut self, pattern: &BindingPattern<'_>) {
+        for identifier in pattern.get_binding_identifiers() {
+            let name = identifier.name.as_str();
+            if !self.injected_bindings.remove(name) {
+                self.mask_binding_name(name);
+            }
+        }
+    }
+
     fn callee_param_index(&self, expression: &Expression<'_>) -> Option<usize> {
         if let Some(identifier) = expression.get_identifier_reference() {
             return self.param_names.get(identifier.name.as_str()).copied();
@@ -3828,15 +4033,38 @@ impl HelperBodyCollector {
         for argument in &call.arguments {
             match argument {
                 Argument::ArrowFunctionExpression(arrow) => {
+                    self.binding_scopes.push(HelperScopeFrame {
+                        bindings: BTreeMap::new(),
+                        enum_domains: BTreeMap::new(),
+                    });
+                    for parameter in &arrow.params.items {
+                        self.mask_binding_pattern(&parameter.pattern);
+                    }
                     for statement in &arrow.body.statements {
                         self.visit_statement(statement);
                     }
+                    if let Some(scope) = self.binding_scopes.pop() {
+                        self.restore_scope(scope);
+                    }
                 }
                 Argument::FunctionExpression(function) => {
+                    self.binding_scopes.push(HelperScopeFrame {
+                        bindings: BTreeMap::new(),
+                        enum_domains: BTreeMap::new(),
+                    });
+                    if let Some(id) = &function.id {
+                        self.mask_binding_name(id.name.as_str());
+                    }
+                    for parameter in &function.params.items {
+                        self.mask_binding_pattern(&parameter.pattern);
+                    }
                     if let Some(body) = &function.body {
                         for statement in &body.statements {
                             self.visit_statement(statement);
                         }
+                    }
+                    if let Some(scope) = self.binding_scopes.pop() {
+                        self.restore_scope(scope);
                     }
                 }
                 _ => {}
@@ -3946,7 +4174,9 @@ impl HelperBodyCollector {
         visit: impl FnOnce(&mut Self),
     ) {
         let previous = self.finite_constants.insert(name.to_string(), values);
+        self.injected_bindings.insert(name.to_string());
         visit(self);
+        self.injected_bindings.remove(name);
         match previous {
             Some(values) => {
                 self.finite_constants.insert(name.to_string(), values);
@@ -3966,7 +4196,9 @@ impl HelperBodyCollector {
         let previous = self
             .finite_record_constants
             .insert(name.to_string(), values);
+        self.injected_bindings.insert(name.to_string());
         visit(self);
+        self.injected_bindings.remove(name);
         match previous {
             Some(values) => {
                 self.finite_record_constants
@@ -4107,6 +4339,24 @@ impl HelperBodyCollector {
 }
 
 impl<'a> Visit<'a> for HelperBodyCollector {
+    fn enter_scope(&mut self, _flags: ScopeFlags, _scope_id: &Cell<Option<ScopeId>>) {
+        self.binding_scopes.push(HelperScopeFrame {
+            bindings: BTreeMap::new(),
+            enum_domains: BTreeMap::new(),
+        });
+    }
+
+    fn leave_scope(&mut self) {
+        if let Some(scope) = self.binding_scopes.pop() {
+            self.restore_scope(scope);
+        }
+    }
+
+    fn visit_formal_parameter(&mut self, parameter: &oxc_ast::ast::FormalParameter<'a>) {
+        self.mask_binding_pattern(&parameter.pattern);
+        walk::walk_formal_parameter(self, parameter);
+    }
+
     fn visit_jsx_opening_element(&mut self, opening: &JSXOpeningElement<'a>) {
         let component_name = match &opening.name {
             JSXElementName::Identifier(identifier) => identifier.name.as_str(),
@@ -4142,22 +4392,30 @@ impl<'a> Visit<'a> for HelperBodyCollector {
     }
 
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
-        if let Some(source) = declarator
+        let aliased_param = declarator
             .init
             .as_ref()
             .and_then(Expression::get_identifier_reference)
-        {
-            if let Some(param_index) = self.param_names.get(source.name.as_str()).copied() {
-                for identifier in declarator.id.get_binding_identifiers() {
-                    self.param_names
-                        .insert(identifier.name.to_string(), param_index);
-                }
+            .and_then(|source| self.param_names.get(source.name.as_str()).copied());
+        self.mask_binding_pattern(&declarator.id);
+        if let Some(param_index) = aliased_param {
+            for identifier in declarator.id.get_binding_identifiers() {
+                self.param_names
+                    .insert(identifier.name.to_string(), param_index);
             }
         }
         if declarator.kind == VariableDeclarationKind::Const {
             if let Some(name) = binding_identifier_name(&declarator.id) {
                 if let Some(init) = &declarator.init {
-                    record_enum_member_domains_from_expression(init, &mut self.enum_member_domains);
+                    let mut domains = BTreeMap::new();
+                    record_enum_member_domains_from_expression(init, &mut domains);
+                    for (name, values) in domains {
+                        self.record_enum_domain_before_change(&name);
+                        self.enum_member_domains
+                            .entry(name)
+                            .or_default()
+                            .extend(values);
+                    }
                     if let Some(values) = finite_strings_from_expression(
                         init,
                         &self.finite_constants,
@@ -5300,6 +5558,10 @@ impl SourceUsageCollector {
         let file_index = project
             .as_ref()
             .and_then(|project| project.files.get(path).cloned());
+        let summarized_dynamic_key_spans = file_index
+            .as_ref()
+            .map(summarized_dynamic_key_spans)
+            .unwrap_or_default();
         Self {
             path: path.to_path_buf(),
             line_starts: line_starts(source),
@@ -5322,10 +5584,12 @@ impl SourceUsageCollector {
             zod_schema_property_domains: BTreeMap::new(),
             enum_member_domains: BTreeMap::new(),
             translators: BTreeMap::new(),
+            potential_translators: BTreeSet::new(),
             message_key_helpers: BTreeMap::new(),
             binding_scopes: Vec::new(),
             scope_depth: 0,
             injected_bindings: BTreeSet::new(),
+            summarized_dynamic_key_spans,
             scan: UsageScan::default(),
         }
     }
@@ -5344,6 +5608,7 @@ impl SourceUsageCollector {
             zod_schema_property_domains: self.zod_schema_property_domains.clone(),
             enum_member_domains: self.enum_member_domains.clone(),
             translators: self.translators.clone(),
+            potential_translators: self.potential_translators.clone(),
             message_key_helpers: self.message_key_helpers.clone(),
         }
     }
@@ -5361,6 +5626,7 @@ impl SourceUsageCollector {
         self.zod_schema_property_domains = environment.zod_schema_property_domains;
         self.enum_member_domains = environment.enum_member_domains;
         self.translators = environment.translators;
+        self.potential_translators = environment.potential_translators;
         self.message_key_helpers = environment.message_key_helpers;
     }
 
@@ -5375,6 +5641,7 @@ impl SourceUsageCollector {
         self.zod_schema_property_domains.remove(name);
         self.enum_member_domains.remove(name);
         self.translators.remove(name);
+        self.potential_translators.remove(name);
         self.message_key_helpers.remove(name);
     }
 
@@ -5385,6 +5652,20 @@ impl SourceUsageCollector {
                 self.mask_binding_name(name);
             }
         }
+    }
+
+    fn track_destructured_translator_bindings(&mut self, pattern: &BindingPattern<'_>) {
+        if !matches!(pattern, BindingPattern::ObjectPattern(_)) {
+            return;
+        }
+        self.potential_translators.extend(
+            pattern
+                .get_binding_identifiers()
+                .into_iter()
+                .map(|identifier| identifier.name.as_str())
+                .filter(|name| is_translator_like_name(name))
+                .map(ToOwned::to_owned),
+        );
     }
 
     fn finish(self) -> UsageScan {
@@ -5698,6 +5979,7 @@ impl SourceUsageCollector {
     fn record_dynamic_usage(&mut self, namespace: Option<&str>, start: u32) {
         self.scan.dynamic_usages.push(DynamicUsage {
             namespace: namespace.unwrap_or_default().to_string(),
+            namespace_unknown: false,
             path: self.path.clone(),
             line: self.line_number(start),
             possible_keys: None,
@@ -5715,12 +5997,38 @@ impl SourceUsageCollector {
         let span = argument.span();
         self.scan.dynamic_usages.push(DynamicUsage {
             namespace: namespace.unwrap_or_default().to_string(),
+            namespace_unknown: false,
             path: self.path.clone(),
             line: self.line_number(call_start),
             possible_keys: None,
             key_start: Some(self.utf16_offset(span.start as usize)),
             key_end: Some(self.utf16_offset(span.end as usize)),
         });
+    }
+
+    fn record_unknown_dynamic_key_usage(
+        &mut self,
+        call_start: u32,
+        argument: Option<&Argument<'_>>,
+    ) {
+        let span = argument.map(GetSpan::span);
+        self.scan.dynamic_usages.push(DynamicUsage {
+            namespace: String::new(),
+            namespace_unknown: true,
+            path: self.path.clone(),
+            line: self.line_number(call_start),
+            possible_keys: None,
+            key_start: span.map(|span| self.utf16_offset(span.start as usize)),
+            key_end: span.map(|span| self.utf16_offset(span.end as usize)),
+        });
+    }
+
+    fn dynamic_argument_is_summarized(&self, argument: &Argument<'_>) -> bool {
+        let span = argument.span();
+        self.summarized_dynamic_key_spans.contains(&(
+            self.utf16_offset(span.start as usize),
+            self.utf16_offset(span.end as usize),
+        ))
     }
 
     fn utf16_offset(&self, byte_offset: usize) -> usize {
@@ -5961,17 +6269,29 @@ impl SourceUsageCollector {
     }
 
     fn is_unbound_translator_call(&self, expression: &Expression<'_>) -> bool {
+        self.unbound_translator_name(expression)
+            .is_some_and(is_translator_like_name)
+    }
+
+    fn unbound_translator_name<'a>(&self, expression: &'a Expression<'a>) -> Option<&'a str> {
         if let Some(identifier) = expression.get_identifier_reference() {
-            return is_translator_like_name(identifier.name.as_str());
+            return Some(identifier.name.as_str());
         }
-        let Some(member) = expression.get_member_expr() else {
-            return false;
-        };
-        TRANSLATOR_METHODS.contains(&member.static_property_name().as_deref().unwrap_or_default())
-            && member
-                .object()
-                .get_identifier_reference()
-                .is_some_and(|identifier| is_translator_like_name(identifier.name.as_str()))
+        let member = expression.get_member_expr()?;
+        if !TRANSLATOR_METHODS
+            .contains(&member.static_property_name().as_deref().unwrap_or_default())
+        {
+            return None;
+        }
+        member
+            .object()
+            .get_identifier_reference()
+            .map(|identifier| identifier.name.as_str())
+    }
+
+    fn is_tracked_unbound_translator_call(&self, expression: &Expression<'_>) -> bool {
+        self.unbound_translator_name(expression)
+            .is_some_and(|name| self.potential_translators.contains(name))
     }
 
     fn maybe_translator_call(&self, expression: &Expression<'_>) -> Option<TranslatorBinding> {
@@ -6304,6 +6624,7 @@ impl SourceUsageCollector {
         for namespace in namespaces {
             self.scan.dynamic_usages.push(DynamicUsage {
                 namespace,
+                namespace_unknown: false,
                 path: query.path.clone(),
                 line: query.line,
                 possible_keys: None,
@@ -6376,6 +6697,7 @@ impl SourceUsageCollector {
                 if let Some(query) = usage.query {
                     self.scan.dynamic_usages.push(DynamicUsage {
                         namespace: String::new(),
+                        namespace_unknown: true,
                         path: query.path,
                         line: query.line,
                         possible_keys: usage.keys,
@@ -6385,6 +6707,7 @@ impl SourceUsageCollector {
                 } else {
                     self.scan.dynamic_usages.push(DynamicUsage {
                         namespace: String::new(),
+                        namespace_unknown: true,
                         path: self.path.clone(),
                         line: self.line_number(opening.span.start),
                         possible_keys: usage.keys,
@@ -6845,6 +7168,44 @@ impl SourceUsageCollector {
     }
 }
 
+fn summarized_dynamic_key_spans(file: &SourceFileIndex) -> BTreeSet<(usize, usize)> {
+    let mut spans = BTreeSet::new();
+    let mut add_helper = |summary: &HelperSummary| {
+        spans.extend(
+            summary
+                .param_usages
+                .iter()
+                .filter_map(|usage| usage.query.as_ref())
+                .map(|query| (query.key_start, query.key_end)),
+        );
+    };
+    for summary in file.helpers.values() {
+        add_helper(summary);
+    }
+    if let Some(summary) = &file.default_export {
+        add_helper(summary);
+    }
+
+    let mut add_component = |summary: &JsxComponentSummary| {
+        spans.extend(
+            summary
+                .usages
+                .iter()
+                .filter_map(|usage| usage.query.as_ref())
+                .map(|query| (query.key_start, query.key_end)),
+        );
+    };
+    for (name, summary) in &file.jsx_components {
+        if name.chars().next().is_some_and(char::is_uppercase) {
+            add_component(summary);
+        }
+    }
+    if let Some(summary) = &file.default_jsx_export {
+        add_component(summary);
+    }
+    spans
+}
+
 impl<'a> Visit<'a> for SourceUsageCollector {
     fn enter_scope(&mut self, _flags: ScopeFlags, _scope_id: &Cell<Option<ScopeId>>) {
         if self.scope_depth > 0 {
@@ -6879,10 +7240,16 @@ impl<'a> Visit<'a> for SourceUsageCollector {
 
     fn visit_formal_parameter(&mut self, parameter: &oxc_ast::ast::FormalParameter<'a>) {
         self.mask_binding_pattern(&parameter.pattern);
+        self.track_destructured_translator_bindings(&parameter.pattern);
         if let Some(annotation) = &parameter.type_annotation {
             self.bind_pattern_type_domains(&parameter.pattern, &annotation.type_annotation);
         }
         walk::walk_formal_parameter(self, parameter);
+    }
+
+    fn visit_catch_parameter(&mut self, parameter: &CatchParameter<'a>) {
+        self.mask_binding_pattern(&parameter.pattern);
+        walk::walk_catch_parameter(self, parameter);
     }
 
     fn visit_import_declaration(&mut self, declaration: &ImportDeclaration<'a>) {
@@ -6910,6 +7277,8 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     }
 
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        let outer_environment = (function.r#type == FunctionType::FunctionExpression)
+            .then(|| self.binding_environment());
         if let Some(id) = &function.id {
             self.mask_binding_name(id.name.as_str());
             if let Some(param_index) = message_key_helper_from_function(function) {
@@ -6918,10 +7287,14 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             }
         }
         walk::walk_function(self, function, flags);
+        if let Some(environment) = outer_environment {
+            self.restore_binding_environment(environment);
+        }
     }
 
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
         self.mask_binding_pattern(&declarator.id);
+        self.track_destructured_translator_bindings(&declarator.id);
         if declarator.kind == VariableDeclarationKind::Const {
             if let Some(init) = &declarator.init {
                 if let Some(records) = self.finite_record_from_expression(init) {
@@ -7068,12 +7441,17 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 }
             }
         } else if self.is_unbound_translator_call(&call.callee) {
-            if let Some(keys) = call
-                .arguments
-                .first()
-                .and_then(|argument| self.finite_strings_from_argument(argument))
-            {
-                self.scan.used_key_suffixes.extend(keys);
+            let argument = call.arguments.first();
+            match argument.and_then(|argument| self.finite_strings_from_argument(argument)) {
+                Some(keys) => self.scan.used_key_suffixes.extend(keys),
+                None => {
+                    if self.is_tracked_unbound_translator_call(&call.callee)
+                        && !argument
+                            .is_some_and(|argument| self.dynamic_argument_is_summarized(argument))
+                    {
+                        self.record_unknown_dynamic_key_usage(call.span.start, argument);
+                    }
+                }
             }
         }
 
@@ -7258,6 +7636,131 @@ mod tests {
     }
 
     #[test]
+    fn helper_key_parameters_shadow_outer_finite_constants() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const key = 'save';
+            function render(translate, key: string) {
+              return translate(key);
+            }
+            const t = useTranslations('common');
+            render(t, runtimeKey);
+            "#,
+        );
+
+        assert!(!scan.used_ids.contains("common.save"));
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn helper_block_bindings_restore_outer_finite_constants() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const key = 'save';
+            function render(translate) {
+              if (condition) {
+                const key = 'cancel';
+                translate(key);
+              }
+              translate(key);
+            }
+            const t = useTranslations('common');
+            render(t);
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.cancel"));
+        assert!(scan.used_ids.contains("common.save"));
+    }
+
+    #[test]
+    fn helper_callback_parameters_shadow_outer_finite_constants() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const key = 'save';
+            function render(translate, items) {
+              items.forEach((key) => translate(key));
+            }
+            const t = useTranslations('common');
+            render(t, items);
+            "#,
+        );
+
+        assert!(!scan.used_ids.contains("common.save"));
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn catch_parameters_shadow_outer_finite_constants() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const key = 'save';
+            const t = useTranslations('common');
+            try {
+              run();
+            } catch (key) {
+              t(key);
+            }
+            "#,
+        );
+
+        assert!(!scan.used_ids.contains("common.save"));
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn unbound_dynamic_translator_calls_are_conservatively_protected() {
+        let scan = scan(
+            r#"
+            function render({t}, key) {
+              return t(key);
+            }
+            render(controller, runtimeKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace_unknown)
+        );
+    }
+
+    #[test]
+    fn named_function_expressions_do_not_mask_outer_translators() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('common');
+            const wrapper = function t() {};
+            t(runtimeKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
     fn unbound_translator_helpers_protect_finite_key_suffixes() {
         let scan = scan(
             r#"
@@ -7285,6 +7788,7 @@ mod tests {
     fn ts_checker_queries_include_unscoped_dynamic_key_usage() {
         let queries = ts_checker_queries(&[DynamicUsage {
             namespace: String::new(),
+            namespace_unknown: false,
             path: PathBuf::from("/tmp/sample.tsx"),
             line: 1,
             possible_keys: None,
@@ -7296,6 +7800,32 @@ mod tests {
         assert_eq!(queries[0].namespace, "");
         assert_eq!(queries[0].start, 10);
         assert_eq!(queries[0].end, 20);
+    }
+
+    #[test]
+    fn checker_results_for_unknown_jsx_namespaces_protect_suffixes() {
+        let mut scan = scan(
+            r#"
+            function Child({tSettings}) {
+              return tSettings(runtimeKey);
+            }
+            <Child {...props} />;
+            "#,
+        );
+        let usage = scan.dynamic_usages.first().expect("dynamic JSX usage");
+        assert!(usage.namespace_unknown);
+
+        apply_ts_checker_results(
+            &mut scan,
+            vec![TsCheckerResult {
+                index: 0,
+                keys: vec!["navigation.title".to_string()],
+            }],
+        );
+
+        assert!(scan.used_key_suffixes.contains("navigation.title"));
+        assert!(!scan.used_ids.contains("navigation.title"));
+        assert!(scan.dynamic_usages.is_empty());
     }
 
     #[test]
