@@ -206,6 +206,37 @@ struct HelperForward {
     fallback_params: ParamIndexes,
 }
 
+fn remap_helper_forward(
+    forward: &HelperForward,
+    mapping_safe: bool,
+    mut remap_index: impl FnMut(usize) -> ParamIndexes,
+) -> HelperForward {
+    let bindings = forward
+        .argument_array
+        .bindings
+        .iter()
+        .map(|indexes| {
+            indexes
+                .iter()
+                .flat_map(|index| remap_index(*index))
+                .collect()
+        })
+        .collect();
+    let fallback_params = forward
+        .fallback_params
+        .iter()
+        .flat_map(|index| remap_index(*index))
+        .collect();
+    HelperForward {
+        callee: forward.callee.clone(),
+        argument_array: ParamArgumentArray {
+            bindings,
+            safe_layout: forward.argument_array.safe_layout && mapping_safe,
+        },
+        fallback_params,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct JsxComponentSummary {
     usages: Vec<JsxPropUsage>,
@@ -2038,7 +2069,11 @@ fn bound_helper_summary_from_call(
                     })
                 })
                 .collect(),
-            forwards: Vec::new(),
+            forwards: summary
+                .forwards
+                .iter()
+                .map(|forward| remap_helper_forward(forward, true, |index| (0..=index).collect()))
+                .collect(),
         });
     }
     let bound_count = call.arguments.len().saturating_sub(1);
@@ -2054,7 +2089,18 @@ fn bound_helper_summary_from_call(
                 translator_like: usage.translator_like,
             })
             .collect(),
-        forwards: Vec::new(),
+        forwards: summary
+            .forwards
+            .iter()
+            .map(|forward| {
+                remap_helper_forward(forward, true, |index| {
+                    (index >= bound_count)
+                        .then_some(index - bound_count)
+                        .into_iter()
+                        .collect()
+                })
+            })
+            .collect(),
     })
 }
 
@@ -4591,6 +4637,15 @@ impl HelperBodyCollector {
             for usage in &summary.param_usages {
                 self.record_helper_usage_for_params(&indexes, usage);
             }
+            self.forwards
+                .extend(summary.forwards.iter().map(|forward| HelperForward {
+                    callee: forward.callee.clone(),
+                    argument_array: ParamArgumentArray {
+                        bindings: Vec::new(),
+                        safe_layout: false,
+                    },
+                    fallback_params: indexes.clone(),
+                }));
             return;
         }
         for usage in &summary.param_usages {
@@ -4599,6 +4654,15 @@ impl HelperBodyCollector {
             };
             self.record_helper_usage_for_params(indexes, usage);
         }
+        self.forwards.extend(summary.forwards.iter().map(|forward| {
+            remap_helper_forward(forward, true, |index| {
+                argument_array
+                    .bindings
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+        }));
     }
 
     fn visit_callback_arguments(&mut self, call: &CallExpression<'_>) {
@@ -9037,6 +9101,61 @@ mod tests {
     }
 
     #[test]
+    fn bound_helpers_preserve_forward_declared_parameter_usages() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function middle(prefix, translate, key) {
+              return inner(translate, key);
+            }
+            function outer(translate, key) {
+              const bound = middle.bind(null, 'prefix');
+              return bound(translate, key);
+            }
+            function inner(translate, key) {
+              return translate(key);
+            }
+            const t = useTranslations('common');
+            outer(t, runtimeKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn spread_bound_helpers_preserve_forward_declared_parameter_usages() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function middle(prefix, translate, key) {
+              return inner(translate, key);
+            }
+            function outer(translate, key) {
+              const prefix = ['prefix'] as const;
+              const bound = middle.bind(null, ...prefix);
+              return bound(translate, key);
+            }
+            function inner(translate, key) {
+              return translate(key);
+            }
+            const t = useTranslations('common');
+            outer(t, runtimeKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
     fn spread_bound_helpers_preserve_remaining_parameter_usages() {
         let scan = scan(
             r#"
@@ -9093,6 +9212,32 @@ mod tests {
             import {useTranslations} from 'next-intl';
             function outer(translate, key) {
               return inner(translate, key);
+            }
+            function inner(translate, key) {
+              return translate(key);
+            }
+            const t = useTranslations('common');
+            outer(t, runtimeKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn nested_helpers_preserve_forward_declared_parameter_usages() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function middle(translate, key) {
+              return inner(translate, key);
+            }
+            function outer(translate, key) {
+              return middle(translate, key);
             }
             function inner(translate, key) {
               return translate(key);
