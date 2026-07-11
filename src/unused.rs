@@ -134,7 +134,7 @@ struct TranslatorBinding {
 #[derive(Debug, Clone, Default)]
 struct TranslatorObjectBinding {
     bindings: BTreeMap<String, TranslatorBinding>,
-    unknown_properties: bool,
+    unknown_paths: BTreeSet<String>,
     resolved_properties: BTreeSet<String>,
 }
 
@@ -150,6 +150,85 @@ impl TranslatorObjectBinding {
                     .strip_prefix(property)
                     .is_some_and(|remaining| remaining.starts_with('.'))
         });
+        self.unknown_paths.retain(|path| {
+            path.is_empty()
+                || (path != property
+                    && !path
+                        .strip_prefix(property)
+                        .is_some_and(|remaining| remaining.starts_with('.')))
+        });
+        self.resolved_properties.retain(|path| {
+            path != property
+                && !path
+                    .strip_prefix(property)
+                    .is_some_and(|remaining| remaining.starts_with('.'))
+        });
+    }
+
+    fn path_is_unknown(&self, path: &str) -> bool {
+        self.unknown_paths.iter().any(|unknown| {
+            let applies = unknown.is_empty()
+                || path
+                    .strip_prefix(unknown)
+                    .is_some_and(|remaining| remaining.starts_with('.'));
+            applies
+                && !self.resolved_properties.iter().any(|resolved| {
+                    resolved != unknown
+                        && (unknown.is_empty()
+                            || resolved
+                                .strip_prefix(unknown)
+                                .is_some_and(|remaining| remaining.starts_with('.')))
+                        && (path == resolved
+                            || path
+                                .strip_prefix(resolved)
+                                .is_some_and(|remaining| remaining.starts_with('.')))
+                })
+        })
+    }
+
+    fn mark_unknown(&mut self, container: &str) {
+        self.unknown_paths.insert(container.to_string());
+        self.resolved_properties.retain(|path| {
+            if container.is_empty() {
+                return false;
+            }
+            path != container
+                && !path
+                    .strip_prefix(container)
+                    .is_some_and(|remaining| remaining.starts_with('.'))
+        });
+    }
+
+    fn subobject(&self, property: &str) -> Option<Self> {
+        let prefix = format!("{property}.");
+        let mut result = Self::default();
+        result
+            .bindings
+            .extend(self.bindings.iter().filter_map(|(path, binding)| {
+                path.strip_prefix(&prefix)
+                    .map(|path| (path.to_string(), binding.clone()))
+            }));
+        result
+            .unknown_paths
+            .extend(self.unknown_paths.iter().filter_map(|path| {
+                if path == property {
+                    Some(String::new())
+                } else {
+                    path.strip_prefix(&prefix).map(ToOwned::to_owned)
+                }
+            }));
+        if self.path_is_unknown(property) {
+            result.unknown_paths.insert(String::new());
+        }
+        result.resolved_properties.extend(
+            self.resolved_properties
+                .iter()
+                .filter_map(|path| path.strip_prefix(&prefix).map(ToOwned::to_owned)),
+        );
+        (!result.bindings.is_empty()
+            || !result.unknown_paths.is_empty()
+            || !result.resolved_properties.is_empty())
+        .then_some(result)
     }
 }
 
@@ -3479,9 +3558,54 @@ fn assignment_target_member_object_name<'a>(target: &'a AssignmentTarget<'a>) ->
         AssignmentTarget::ComputedMemberExpression(member) => &member.object,
         _ => return None,
     };
-    object
-        .get_identifier_reference()
-        .map(|identifier| identifier.name.as_str())
+    expression_member_root_name(object)
+}
+
+fn expression_member_root_name<'a>(expression: &'a Expression<'a>) -> Option<&'a str> {
+    match expression.get_inner_expression() {
+        Expression::Identifier(identifier) => Some(identifier.name.as_str()),
+        Expression::StaticMemberExpression(member) => expression_member_root_name(&member.object),
+        Expression::ComputedMemberExpression(member) => expression_member_root_name(&member.object),
+        _ => None,
+    }
+}
+
+fn expression_static_member_path<'a>(
+    expression: &'a Expression<'a>,
+    path: &mut Vec<String>,
+) -> Option<&'a str> {
+    match expression.get_inner_expression() {
+        Expression::Identifier(identifier) => Some(identifier.name.as_str()),
+        Expression::StaticMemberExpression(member) => {
+            let root = expression_static_member_path(&member.object, path)?;
+            path.push(member.property.name.to_string());
+            Some(root)
+        }
+        _ => None,
+    }
+}
+
+fn assignment_target_static_member_path<'a>(
+    target: &'a AssignmentTarget<'a>,
+) -> Option<(&'a str, Vec<String>)> {
+    let AssignmentTarget::StaticMemberExpression(member) = target else {
+        return None;
+    };
+    let mut path = Vec::new();
+    let root = expression_static_member_path(&member.object, &mut path)?;
+    path.push(member.property.name.to_string());
+    Some((root, path))
+}
+
+fn assignment_target_unknown_container_path<'a>(
+    target: &'a AssignmentTarget<'a>,
+) -> Option<(&'a str, Vec<String>)> {
+    let AssignmentTarget::ComputedMemberExpression(member) = target else {
+        return None;
+    };
+    let mut path = Vec::new();
+    let root = expression_static_member_path(&member.object, &mut path)?;
+    Some((root, path))
 }
 
 fn singularize_constant_word(word: &str) -> String {
@@ -8941,12 +9065,12 @@ impl SourceUsageCollector {
                         .is_none_or(|properties| properties.contains(property))
                         .then(|| binding.clone())
                 }));
-                if bindings.unknown_properties
+                if !bindings.unknown_paths.is_empty()
                     && !bindings.bindings.is_empty()
                     && property_names.as_ref().is_none_or(|properties| {
                         properties
                             .iter()
-                            .any(|property| !bindings.resolved_properties.contains(property))
+                            .any(|property| bindings.path_is_unknown(property))
                     })
                 {
                     candidates.push(translator_binding_from_namespace_arg(NamespaceArg::Dynamic));
@@ -8966,6 +9090,12 @@ impl SourceUsageCollector {
             }
         } else if let Some(bindings) = self.translator_object_bindings_from_expression(object) {
             let has_known_binding = !bindings.bindings.is_empty();
+            let unknown_property = !bindings.unknown_paths.is_empty()
+                && property_names.as_ref().is_none_or(|properties| {
+                    properties
+                        .iter()
+                        .any(|property| bindings.path_is_unknown(property))
+                });
             candidates.extend(
                 bindings
                     .bindings
@@ -8977,14 +9107,7 @@ impl SourceUsageCollector {
                             .then_some(binding)
                     }),
             );
-            if bindings.unknown_properties
-                && has_known_binding
-                && property_names.as_ref().is_none_or(|properties| {
-                    properties
-                        .iter()
-                        .any(|property| !bindings.resolved_properties.contains(property))
-                })
-            {
+            if unknown_property && has_known_binding {
                 candidates.push(translator_binding_from_namespace_arg(NamespaceArg::Dynamic));
             }
         }
@@ -9016,7 +9139,7 @@ impl SourceUsageCollector {
                     match property {
                         ObjectPropertyKind::ObjectProperty(property) => {
                             let Some(name) = property.key.static_name() else {
-                                result.unknown_properties = true;
+                                result.unknown_paths.insert(String::new());
                                 result.resolved_properties.clear();
                                 continue;
                             };
@@ -9039,9 +9162,15 @@ impl SourceUsageCollector {
                                         .into_iter()
                                         .map(|(path, binding)| (format!("{name}.{path}"), binding)),
                                 );
-                                if nested.unknown_properties {
-                                    result.unknown_properties = true;
-                                }
+                                result
+                                    .unknown_paths
+                                    .extend(nested.unknown_paths.into_iter().map(|path| {
+                                        if path.is_empty() {
+                                            name.clone()
+                                        } else {
+                                            format!("{name}.{path}")
+                                        }
+                                    }));
                                 result.resolved_properties.extend(
                                     nested
                                         .resolved_properties
@@ -9054,8 +9183,7 @@ impl SourceUsageCollector {
                             if let Some(spread_result) =
                                 self.translator_object_bindings_from_expression(&spread.argument)
                             {
-                                if spread_result.unknown_properties {
-                                    result.unknown_properties = true;
+                                if spread_result.unknown_paths.contains("") {
                                     result.resolved_properties.clear();
                                 }
                                 for property in &spread_result.resolved_properties {
@@ -9063,12 +9191,59 @@ impl SourceUsageCollector {
                                     result.resolved_properties.insert(property.clone());
                                 }
                                 result.bindings.extend(spread_result.bindings);
+                                result.unknown_paths.extend(spread_result.unknown_paths);
                             } else {
-                                result.unknown_properties = true;
+                                result.unknown_paths.insert(String::new());
                                 result.resolved_properties.clear();
                             }
                         }
                     }
+                }
+                Some(result)
+            }
+            Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_) => {
+                let member = expression.get_member_expr()?;
+                let properties = member
+                    .static_property_name()
+                    .map(|property| finite_string(property.to_string()))
+                    .or_else(|| match expression.get_inner_expression() {
+                        Expression::ComputedMemberExpression(member) => {
+                            self.finite_strings_from_expression(&member.expression)
+                        }
+                        _ => None,
+                    })?;
+                let object = self.translator_object_bindings_from_expression(member.object())?;
+                let mut result: Option<TranslatorObjectBinding> = None;
+                let mut unresolved = false;
+                for property in properties {
+                    let Some(subobject) = object.subobject(&property) else {
+                        unresolved = true;
+                        continue;
+                    };
+                    if let Some(result) = result.as_mut() {
+                        for (path, binding) in subobject.bindings {
+                            result
+                                .bindings
+                                .entry(path)
+                                .and_modify(|current| {
+                                    *current = merge_translator_bindings(current, &binding)
+                                })
+                                .or_insert(binding);
+                        }
+                        result.unknown_paths.extend(subobject.unknown_paths);
+                        result.resolved_properties = result
+                            .resolved_properties
+                            .intersection(&subobject.resolved_properties)
+                            .cloned()
+                            .collect();
+                    } else {
+                        result = Some(subobject);
+                    }
+                }
+                let mut result = result?;
+                if unresolved {
+                    result.unknown_paths.insert(String::new());
+                    result.resolved_properties.clear();
                 }
                 Some(result)
             }
@@ -9090,7 +9265,7 @@ impl SourceUsageCollector {
                                 })
                                 .or_insert(alternate_binding);
                         }
-                        result.unknown_properties |= alternate.unknown_properties;
+                        result.unknown_paths.extend(alternate.unknown_paths);
                         result.resolved_properties = result
                             .resolved_properties
                             .intersection(&alternate.resolved_properties)
@@ -9108,7 +9283,7 @@ impl SourceUsageCollector {
                         Expression::ObjectExpression(object) if object.properties.is_empty()
                     )
                 }) {
-                    result.unknown_properties = true;
+                    result.unknown_paths.insert(String::new());
                     result.resolved_properties.clear();
                 }
                 Some(result)
@@ -9498,9 +9673,9 @@ impl SourceUsageCollector {
                     if let Some(binding) = bindings.bindings.get(&joined_path) {
                         return Some(binding.clone());
                     }
-                    if bindings.unknown_properties
+                    if !bindings.unknown_paths.is_empty()
                         && !bindings.bindings.is_empty()
-                        && !bindings.resolved_properties.contains(&joined_path)
+                        && bindings.path_is_unknown(&joined_path)
                     {
                         return Some(translator_binding_from_namespace_arg(NamespaceArg::Dynamic));
                     }
@@ -9514,6 +9689,14 @@ impl SourceUsageCollector {
                     .bindings
                     .get(index)?
                     .clone()
+            }
+            Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_) => {
+                let joined_path = path.join(".");
+                let bindings = self.translator_object_bindings_from_expression(expression)?;
+                bindings.bindings.get(&joined_path).cloned().or_else(|| {
+                    (!bindings.bindings.is_empty() && bindings.path_is_unknown(&joined_path))
+                        .then(|| translator_binding_from_namespace_arg(NamespaceArg::Dynamic))
+                })
             }
             Expression::ConditionalExpression(conditional) => {
                 let consequent =
@@ -9895,9 +10078,7 @@ impl SourceUsageCollector {
                         continue;
                     };
                     if let Some(binding) = bindings.bindings.get(prop_name).cloned() {
-                        let unknown = unknown_later_override
-                            || (bindings.unknown_properties
-                                && !bindings.resolved_properties.contains(prop_name));
+                        let unknown = unknown_later_override || bindings.path_is_unknown(prop_name);
                         return (
                             Some(if unknown {
                                 merge_translator_bindings(
@@ -9914,7 +10095,7 @@ impl SourceUsageCollector {
                     if bindings.resolved_properties.contains(prop_name) {
                         return (None, false, unknown_later_override);
                     }
-                    if bindings.unknown_properties {
+                    if bindings.path_is_unknown(prop_name) {
                         unknown_later_override = true;
                     }
                 }
@@ -11198,14 +11379,55 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             if let Some(array) = self.translator_argument_arrays.get_mut(name) {
                 array.safe_layout = false;
             }
-            if self
+        }
+        let assigned_binding = self.translator_binding_from_expression(&expression.right);
+        let assigned_object = self.translator_object_bindings_from_expression(&expression.right);
+        if let Some((name, path)) = assignment_target_static_member_path(&expression.left) {
+            let property = path.join(".");
+            let bindings = self
                 .translator_object_bindings
-                .remove(name)
-                .is_some_and(|bindings| !bindings.bindings.is_empty())
-            {
-                self.record_dynamic_usage(None, expression.span.start);
+                .entry(name.to_string())
+                .or_default();
+            bindings.remove_property(&property);
+            bindings.resolved_properties.insert(property.clone());
+            if let Some(binding) = assigned_binding {
+                bindings.bindings.insert(property, binding);
+            } else if let Some(assigned) = assigned_object {
+                bindings.bindings.extend(
+                    assigned.bindings.into_iter().map(|(nested_path, binding)| {
+                        (format!("{property}.{nested_path}"), binding)
+                    }),
+                );
+                bindings
+                    .unknown_paths
+                    .extend(assigned.unknown_paths.into_iter().map(|nested_path| {
+                        if nested_path.is_empty() {
+                            property.clone()
+                        } else {
+                            format!("{property}.{nested_path}")
+                        }
+                    }));
+                bindings.resolved_properties.extend(
+                    assigned
+                        .resolved_properties
+                        .into_iter()
+                        .map(|nested_path| format!("{property}.{nested_path}")),
+                );
             }
-            if let Some(binding) = self.translator_binding_from_expression(&expression.right) {
+        } else if let Some((name, path)) =
+            assignment_target_unknown_container_path(&expression.left)
+        {
+            if let Some(bindings) = self.translator_object_bindings.get_mut(name) {
+                bindings.mark_unknown(&path.join("."));
+            }
+            if let Some(binding) = assigned_binding {
+                self.record_dynamic_key_for_binding(&binding, expression.span.start, None);
+            }
+        } else if let Some(name) = assignment_target_member_object_name(&expression.left) {
+            if let Some(bindings) = self.translator_object_bindings.get_mut(name) {
+                bindings.mark_unknown("");
+            }
+            if let Some(binding) = assigned_binding {
                 self.record_dynamic_key_for_binding(&binding, expression.span.start, None);
             }
         }
@@ -11784,7 +12006,7 @@ mod tests {
     }
 
     #[test]
-    fn translator_functions_assigned_to_objects_are_conservatively_dynamic() {
+    fn translator_functions_assigned_to_static_object_properties_are_tracked_exactly() {
         let scan = scan(
             r#"
             import {useTranslations} from 'next-intl';
@@ -11795,11 +12017,8 @@ mod tests {
             "#,
         );
 
-        assert!(
-            scan.dynamic_usages
-                .iter()
-                .any(|usage| usage.namespace == "common")
-        );
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.dynamic_usages.is_empty());
     }
 
     #[test]
@@ -14103,6 +14322,75 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
         );
 
         assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn nested_translator_aggregates_survive_member_access() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const bundle = {options: {format: common}};
+            Object.values(bundle.options).forEach(format => format('title'));
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn unrelated_static_mutations_preserve_translator_object_bindings() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const bundle = {format: common};
+            bundle.label = 'runtime';
+            bundle.format('title');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn nested_unknown_spreads_do_not_make_root_members_dynamic() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const bundle = {format: common, options: {...runtimeOptions}};
+            bundle.run(runtimeValue);
+            bundle.format('title');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn computed_nested_mutations_only_invalidate_the_nested_object() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const bundle = {options: {format: common}, root: common};
+            bundle.options[runtimeKey] = runtimeValue;
+            bundle.options.format('nested');
+            bundle.root('exact');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.exact"));
+        assert!(!scan.used_ids.contains("common.nested"));
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace.is_empty())
+        );
     }
 
     #[test]
