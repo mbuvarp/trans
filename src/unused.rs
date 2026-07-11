@@ -8513,6 +8513,14 @@ impl SourceUsageCollector {
         }
     }
 
+    fn add_translator_array_content_binding(&mut self, name: &str, binding: &TranslatorBinding) {
+        for alias in self.translator_array_alias_group(name) {
+            if let Some(array) = self.translator_argument_arrays.get_mut(&alias) {
+                array.bindings.push(Some(binding.clone()));
+            }
+        }
+    }
+
     fn file_binding_is_react_import(&self, name: &str) -> bool {
         self.file_index.as_ref().is_some_and(|file| {
             file.namespace_imports
@@ -9863,6 +9871,46 @@ impl SourceUsageCollector {
                 }
             }
             _ => None,
+        }
+    }
+
+    fn translator_argument_array_alias_sources(
+        &self,
+        expression: &Expression<'_>,
+    ) -> BTreeSet<String> {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier)
+                if self
+                    .translator_argument_arrays
+                    .contains_key(identifier.name.as_str()) =>
+            {
+                BTreeSet::from([identifier.name.to_string()])
+            }
+            Expression::ConditionalExpression(conditional) => {
+                let mut sources =
+                    self.translator_argument_array_alias_sources(&conditional.consequent);
+                sources
+                    .extend(self.translator_argument_array_alias_sources(&conditional.alternate));
+                sources
+            }
+            Expression::LogicalExpression(logical) => match logical.operator {
+                LogicalOperator::And => {
+                    self.translator_argument_array_alias_sources(&logical.right)
+                }
+                LogicalOperator::Or | LogicalOperator::Coalesce => {
+                    let left = self.translator_argument_array_from_expression(&logical.left);
+                    if left.as_ref().is_some_and(|array| !array.optional) {
+                        self.translator_argument_array_alias_sources(&logical.left)
+                    } else {
+                        let mut sources =
+                            self.translator_argument_array_alias_sources(&logical.left);
+                        sources
+                            .extend(self.translator_argument_array_alias_sources(&logical.right));
+                        sources
+                    }
+                }
+            },
+            _ => BTreeSet::new(),
         }
     }
 
@@ -12106,14 +12154,14 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             .then(|| declarator.init.as_ref())
             .flatten()
             .and_then(|init| self.translator_argument_array_from_expression(init));
-        let translator_argument_array_alias = declarator
+        let translator_argument_array_aliases = declarator
             .init
             .as_ref()
             .filter(|_| binding_identifier_name(&declarator.id).is_some())
-            .and_then(|init| init.get_inner_expression().get_identifier_reference())
-            .map(|identifier| identifier.name.to_string());
+            .map(|init| self.translator_argument_array_alias_sources(init))
+            .unwrap_or_default();
         let translator_argument_array = translator_argument_array.map(|mut array| {
-            array.safe_layout &= translator_argument_array_alias.is_none();
+            array.safe_layout &= translator_argument_array_aliases.is_empty();
             array
         });
         self.mask_binding_pattern(&declarator.id);
@@ -12151,7 +12199,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         ) {
             self.translator_argument_arrays
                 .insert(name.to_string(), bindings);
-            if let Some(source) = &translator_argument_array_alias {
+            for source in &translator_argument_array_aliases {
                 self.register_translator_array_alias(name, source);
             }
         }
@@ -12260,6 +12308,29 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         {
             let name = identifier.name.as_str();
             if ARRAY_CONTENT_WRITING_METHODS.contains(&method) {
+                let offset = match method.as_ref() {
+                    "fill" => 0,
+                    "splice" => 2,
+                    "push" | "unshift" => 0,
+                    _ => call.arguments.len(),
+                };
+                if let Some(binding) = merge_translator_binding_iter(
+                    call.arguments
+                        .iter()
+                        .skip(offset)
+                        .filter_map(|argument| match argument {
+                            Argument::SpreadElement(spread) => self
+                                .translator_argument_array_from_expression(&spread.argument)
+                                .and_then(|array| {
+                                    merge_translator_binding_iter(
+                                        array.bindings.into_iter().flatten(),
+                                    )
+                                }),
+                            _ => self.translator_binding_from_argument(argument),
+                        }),
+                ) {
+                    self.add_translator_array_content_binding(name, &binding);
+                }
                 self.mark_translator_array_contents_unknown(name);
             } else {
                 self.mark_translator_array_layout_unsafe(name);
@@ -12446,12 +12517,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             let object_bindings =
                 self.translator_object_bindings_from_expression(&expression.right);
             let argument_array = self.translator_argument_array_from_expression(&expression.right);
-            let argument_array_alias = argument_array.as_ref().and_then(|_| {
-                expression
-                    .right
-                    .get_identifier_reference()
-                    .map(|source| source.name.to_string())
-            });
+            let argument_array_aliases = argument_array
+                .as_ref()
+                .map(|_| self.translator_argument_array_alias_sources(&expression.right))
+                .unwrap_or_default();
             let name = identifier.name.as_str();
             self.mask_binding_name(name);
             if let Some(binding) = translator {
@@ -12465,16 +12534,19 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 array.safe_layout = false;
                 self.translator_argument_arrays
                     .insert(name.to_string(), array);
-                if let Some(source) = &argument_array_alias {
+                for source in &argument_array_aliases {
                     self.register_translator_array_alias(name, source);
                 }
             }
         }
-        if let Some(name) = assignment_target_member_object_name(&expression.left) {
-            self.mark_translator_array_contents_unknown(name);
-        }
         let assigned_binding = self.translator_binding_from_expression(&expression.right);
         let assigned_object = self.translator_object_bindings_from_expression(&expression.right);
+        if let Some(name) = assignment_target_member_object_name(&expression.left) {
+            if let Some(binding) = &assigned_binding {
+                self.add_translator_array_content_binding(name, binding);
+            }
+            self.mark_translator_array_contents_unknown(name);
+        }
         if let Some((name, path)) = assignment_target_static_member_path(&expression.left) {
             let property = path.join(".");
             let bindings = self
@@ -13199,6 +13271,104 @@ mod tests {
         );
 
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 9));
+    }
+
+    #[test]
+    fn translator_writes_seed_previously_empty_arrays() {
+        let method_write = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const translators = [];
+            translators.push(common);
+            translators[0]('pushed');
+            "#,
+        );
+
+        assert!(
+            method_write
+                .dynamic_usages
+                .iter()
+                .any(|usage| usage.line == 6)
+        );
+
+        let member_write = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const translators = [];
+            translators[0] = common;
+            translators[0]('assigned');
+            "#,
+        );
+
+        assert!(
+            member_write
+                .dynamic_usages
+                .iter()
+                .any(|usage| usage.line == 6)
+        );
+
+        let spread_write = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const source = [common];
+            const translators = [];
+            translators.push(...source);
+            translators[0]('spread');
+            "#,
+        );
+
+        assert!(
+            spread_write
+                .dynamic_usages
+                .iter()
+                .any(|usage| usage.line == 7)
+        );
+    }
+
+    #[test]
+    fn conditional_and_logical_array_aliases_taint_possible_sources() {
+        let conditional = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const commonArray = [common];
+            const settingsArray = [settings];
+            const alias = enabled ? commonArray : settingsArray;
+            alias.fill(runtimeTranslator);
+            commonArray[0]('common');
+            settingsArray[0]('settings');
+            "#,
+        );
+
+        assert!(
+            conditional
+                .dynamic_usages
+                .iter()
+                .any(|usage| usage.line == 9)
+        );
+        assert!(
+            conditional
+                .dynamic_usages
+                .iter()
+                .any(|usage| usage.line == 10)
+        );
+
+        let logical = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const commonArray = [common];
+            const alias = enabled && commonArray;
+            alias.fill(runtimeTranslator);
+            commonArray[0]('logical');
+            "#,
+        );
+
+        assert!(logical.dynamic_usages.iter().any(|usage| usage.line == 7));
     }
 
     #[test]
