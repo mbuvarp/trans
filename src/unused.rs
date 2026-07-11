@@ -1233,7 +1233,7 @@ impl ProjectIndex {
                 active.remove(&edge);
                 continue;
             };
-            let cache_key = (child_path.clone(), forward.component_name.clone());
+            let cache_key = edge.clone();
             let child_summary = if let Some(summary) = cache.get(&cache_key) {
                 summary.clone()
             } else {
@@ -1793,6 +1793,7 @@ struct SourceUsageCollector {
     scope_depth: usize,
     injected_bindings: BTreeSet<String>,
     summarized_dynamic_key_spans: BTreeSet<(usize, usize)>,
+    pending_var_bindings: Option<BTreeSet<String>>,
     scan: UsageScan,
 }
 
@@ -1964,7 +1965,13 @@ fn helper_summary_from_body_with_context(
         jsx_forwards: Vec::new(),
         binding_scopes: Vec::new(),
         injected_bindings: BTreeSet::new(),
+        pending_var_bindings: None,
     };
+    for name in function_var_bindings(body) {
+        if !collector.param_names.contains_key(&name) {
+            collector.mask_binding_name(&name);
+        }
+    }
     for statement in &body.statements {
         collector.visit_statement(statement);
     }
@@ -2025,10 +2032,16 @@ fn jsx_component_summary_from_body(
         jsx_forwards: Vec::new(),
         binding_scopes: Vec::new(),
         injected_bindings: BTreeSet::new(),
+        pending_var_bindings: None,
     };
     let parameter_names = collector.param_names.keys().cloned().collect::<Vec<_>>();
     for name in parameter_names {
         collector.mask_outer_binding_name(&name);
+    }
+    for name in function_var_bindings(body) {
+        if !collector.param_names.contains_key(&name) {
+            collector.mask_binding_name(&name);
+        }
     }
     for statement in &body.statements {
         collector.visit_statement(statement);
@@ -3804,6 +3817,7 @@ struct HelperBodyCollector {
     jsx_forwards: Vec<HelperJsxForward>,
     binding_scopes: Vec<HelperScopeFrame>,
     injected_bindings: BTreeSet<String>,
+    pending_var_bindings: Option<BTreeSet<String>>,
 }
 
 struct HelperScopeFrame {
@@ -3832,6 +3846,38 @@ struct HelperJsxForward {
 struct MessageKeyHelperCollector {
     param_names: BTreeMap<String, usize>,
     param_indexes: BTreeSet<usize>,
+}
+
+#[derive(Default)]
+struct FunctionVarBindingCollector {
+    names: BTreeSet<String>,
+}
+
+impl<'a> Visit<'a> for FunctionVarBindingCollector {
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        if declaration.kind == VariableDeclarationKind::Var {
+            for declarator in &declaration.declarations {
+                self.names.extend(
+                    declarator
+                        .id
+                        .get_binding_identifiers()
+                        .into_iter()
+                        .map(|identifier| identifier.name.to_string()),
+                );
+            }
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+
+    fn visit_arrow_function_expression(&mut self, _arrow: &ArrowFunctionExpression<'a>) {}
+}
+
+fn function_var_bindings(body: &FunctionBody<'_>) -> BTreeSet<String> {
+    let mut collector = FunctionVarBindingCollector::default();
+    collector.visit_function_body(body);
+    collector.names
 }
 
 impl<'a> Visit<'a> for MessageKeyHelperCollector {
@@ -4037,6 +4083,9 @@ impl HelperBodyCollector {
                         bindings: BTreeMap::new(),
                         enum_domains: BTreeMap::new(),
                     });
+                    for name in function_var_bindings(&arrow.body) {
+                        self.mask_binding_name(&name);
+                    }
                     for parameter in &arrow.params.items {
                         self.mask_binding_pattern(&parameter.pattern);
                     }
@@ -4054,6 +4103,11 @@ impl HelperBodyCollector {
                     });
                     if let Some(id) = &function.id {
                         self.mask_binding_name(id.name.as_str());
+                    }
+                    if let Some(body) = &function.body {
+                        for name in function_var_bindings(body) {
+                            self.mask_binding_name(&name);
+                        }
                     }
                     for parameter in &function.params.items {
                         self.mask_binding_pattern(&parameter.pattern);
@@ -4226,6 +4280,7 @@ impl HelperBodyCollector {
                     return false;
                 };
                 self.with_finite_constant(param, values, |collector| {
+                    collector.pending_var_bindings = Some(function_var_bindings(&arrow.body));
                     walk::walk_arrow_function_expression(collector, arrow);
                 });
                 true
@@ -4240,6 +4295,10 @@ impl HelperBodyCollector {
                     return false;
                 };
                 self.with_finite_constant(param, values, |collector| {
+                    collector.pending_var_bindings = function
+                        .body
+                        .as_ref()
+                        .map(|body| function_var_bindings(body));
                     walk::walk_function(collector, function, ScopeFlags::Function);
                 });
                 true
@@ -4283,6 +4342,7 @@ impl HelperBodyCollector {
                     return false;
                 };
                 self.with_finite_record_constant(param, values, |collector| {
+                    collector.pending_var_bindings = Some(function_var_bindings(&arrow.body));
                     walk::walk_arrow_function_expression(collector, arrow);
                 });
                 true
@@ -4297,6 +4357,10 @@ impl HelperBodyCollector {
                     return false;
                 };
                 self.with_finite_record_constant(param, values, |collector| {
+                    collector.pending_var_bindings = function
+                        .body
+                        .as_ref()
+                        .map(|body| function_var_bindings(body));
                     walk::walk_function(collector, function, ScopeFlags::Function);
                 });
                 true
@@ -4344,6 +4408,13 @@ impl<'a> Visit<'a> for HelperBodyCollector {
             bindings: BTreeMap::new(),
             enum_domains: BTreeMap::new(),
         });
+        if let Some(bindings) = self.pending_var_bindings.take() {
+            for name in bindings {
+                if !self.injected_bindings.contains(&name) {
+                    self.mask_binding_name(&name);
+                }
+            }
+        }
     }
 
     fn leave_scope(&mut self) {
@@ -4355,6 +4426,11 @@ impl<'a> Visit<'a> for HelperBodyCollector {
     fn visit_formal_parameter(&mut self, parameter: &oxc_ast::ast::FormalParameter<'a>) {
         self.mask_binding_pattern(&parameter.pattern);
         walk::walk_formal_parameter(self, parameter);
+    }
+
+    fn visit_catch_parameter(&mut self, parameter: &CatchParameter<'a>) {
+        self.mask_binding_pattern(&parameter.pattern);
+        walk::walk_catch_parameter(self, parameter);
     }
 
     fn visit_jsx_opening_element(&mut self, opening: &JSXOpeningElement<'a>) {
@@ -5590,6 +5666,7 @@ impl SourceUsageCollector {
             scope_depth: 0,
             injected_bindings: BTreeSet::new(),
             summarized_dynamic_key_spans,
+            pending_var_bindings: None,
             scan: UsageScan::default(),
         }
     }
@@ -7002,6 +7079,7 @@ impl SourceUsageCollector {
                     return false;
                 };
                 self.with_finite_constant(param, values, |collector| {
+                    collector.pending_var_bindings = Some(function_var_bindings(&arrow.body));
                     walk::walk_arrow_function_expression(collector, arrow);
                 });
                 true
@@ -7016,6 +7094,10 @@ impl SourceUsageCollector {
                     return false;
                 };
                 self.with_finite_constant(param, values, |collector| {
+                    collector.pending_var_bindings = function
+                        .body
+                        .as_ref()
+                        .map(|body| function_var_bindings(body));
                     walk::walk_function(collector, function, ScopeFlags::Function);
                 });
                 true
@@ -7059,6 +7141,7 @@ impl SourceUsageCollector {
                     return false;
                 };
                 self.with_finite_record_constant(param, values, |collector| {
+                    collector.pending_var_bindings = Some(function_var_bindings(&arrow.body));
                     walk::walk_arrow_function_expression(collector, arrow);
                 });
                 true
@@ -7073,6 +7156,10 @@ impl SourceUsageCollector {
                     return false;
                 };
                 self.with_finite_record_constant(param, values, |collector| {
+                    collector.pending_var_bindings = function
+                        .body
+                        .as_ref()
+                        .map(|body| function_var_bindings(body));
                     walk::walk_function(collector, function, ScopeFlags::Function);
                 });
                 true
@@ -7212,6 +7299,13 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             self.binding_scopes.push(self.binding_environment());
         }
         self.scope_depth += 1;
+        if let Some(bindings) = self.pending_var_bindings.take() {
+            for name in bindings {
+                if !self.injected_bindings.contains(&name) {
+                    self.mask_binding_name(&name);
+                }
+            }
+        }
     }
 
     fn leave_scope(&mut self) {
@@ -7286,10 +7380,19 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     .insert(id.name.to_string(), param_index);
             }
         }
+        self.pending_var_bindings = function
+            .body
+            .as_ref()
+            .map(|body| function_var_bindings(body));
         walk::walk_function(self, function, flags);
         if let Some(environment) = outer_environment {
             self.restore_binding_environment(environment);
         }
+    }
+
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+        self.pending_var_bindings = Some(function_var_bindings(&arrow.body));
+        walk::walk_arrow_function_expression(self, arrow);
     }
 
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
@@ -7725,6 +7828,81 @@ mod tests {
     }
 
     #[test]
+    fn helper_catch_parameters_shadow_outer_finite_constants() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const key = 'save';
+            function render(translate) {
+              try {
+                run();
+              } catch (key) {
+                translate(key);
+              }
+            }
+            const t = useTranslations('common');
+            render(t);
+            "#,
+        );
+
+        assert!(!scan.used_ids.contains("common.save"));
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn helper_var_bindings_are_hoisted_out_of_nested_blocks() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const key = 'save';
+            function render(translate) {
+              if (condition) {
+                var key = runtimeKey;
+              }
+              return translate(key);
+            }
+            const t = useTranslations('common');
+            render(t);
+            "#,
+        );
+
+        assert!(!scan.used_ids.contains("common.save"));
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn source_var_bindings_are_hoisted_out_of_nested_blocks() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const key = 'save';
+            const t = useTranslations('common');
+            function Page() {
+              if (condition) {
+                var key = runtimeKey;
+              }
+              return t(key);
+            }
+            "#,
+        );
+
+        assert!(!scan.used_ids.contains("common.save"));
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
     fn unbound_dynamic_translator_calls_are_conservatively_protected() {
         let scan = scan(
             r#"
@@ -7826,6 +8004,135 @@ mod tests {
         assert!(scan.used_key_suffixes.contains("navigation.title"));
         assert!(!scan.used_ids.contains("navigation.title"));
         assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn jsx_forward_cache_distinguishes_same_alias_from_different_parents() {
+        fn forward(prop_name: &str, component_name: &str, target_prop: &str) -> JsxPropForward {
+            JsxPropForward {
+                prop_name: prop_name.to_string(),
+                component_name: component_name.to_string(),
+                target_prop: target_prop.to_string(),
+            }
+        }
+
+        fn usage(prop_name: &str) -> JsxPropUsage {
+            JsxPropUsage {
+                prop_name: prop_name.to_string(),
+                keys: None,
+                query: None,
+                translator_like: false,
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root.tsx");
+        let a = dir.path().join("a.tsx");
+        let b = dir.path().join("b.tsx");
+        let children = dir.path().join("children.tsx");
+        for path in [&root, &a, &b, &children] {
+            fs::write(path, "").expect("create source file");
+        }
+        let import = |source: &str, imported: &str| ImportTarget {
+            source: source.to_string(),
+            imported: ImportedName::Named(imported.to_string()),
+        };
+
+        let project = ProjectIndex {
+            files: BTreeMap::from([
+                (
+                    root.clone(),
+                    SourceFileIndex {
+                        imports: BTreeMap::from([
+                            ("A".to_string(), import("./a", "A")),
+                            ("B".to_string(), import("./b", "B")),
+                        ]),
+                        jsx_components: BTreeMap::from([(
+                            "Root".to_string(),
+                            JsxComponentSummary {
+                                usages: Vec::new(),
+                                forwards: vec![
+                                    forward("fooFn", "A", "fooFn"),
+                                    forward("barFn", "B", "barFn"),
+                                ],
+                            },
+                        )]),
+                        ..SourceFileIndex::default()
+                    },
+                ),
+                (
+                    a.clone(),
+                    SourceFileIndex {
+                        imports: BTreeMap::from([(
+                            "Child".to_string(),
+                            import("./children", "Foo"),
+                        )]),
+                        named_jsx_exports: BTreeMap::from([(
+                            "A".to_string(),
+                            JsxComponentSummary {
+                                usages: Vec::new(),
+                                forwards: vec![forward("fooFn", "Child", "fooTranslator")],
+                            },
+                        )]),
+                        ..SourceFileIndex::default()
+                    },
+                ),
+                (
+                    b.clone(),
+                    SourceFileIndex {
+                        imports: BTreeMap::from([(
+                            "Child".to_string(),
+                            import("./children", "Bar"),
+                        )]),
+                        named_jsx_exports: BTreeMap::from([(
+                            "B".to_string(),
+                            JsxComponentSummary {
+                                usages: Vec::new(),
+                                forwards: vec![forward("barFn", "Child", "barTranslator")],
+                            },
+                        )]),
+                        ..SourceFileIndex::default()
+                    },
+                ),
+                (
+                    children.clone(),
+                    SourceFileIndex {
+                        named_jsx_exports: BTreeMap::from([
+                            (
+                                "Foo".to_string(),
+                                JsxComponentSummary {
+                                    usages: vec![usage("fooTranslator")],
+                                    forwards: Vec::new(),
+                                },
+                            ),
+                            (
+                                "Bar".to_string(),
+                                JsxComponentSummary {
+                                    usages: vec![usage("barTranslator")],
+                                    forwards: Vec::new(),
+                                },
+                            ),
+                        ]),
+                        ..SourceFileIndex::default()
+                    },
+                ),
+            ]),
+            source_files: BTreeSet::from([root.clone(), a, b, children]),
+            ..ProjectIndex::default()
+        };
+
+        let summary = project
+            .jsx_component_for_name(&root, "Root")
+            .expect("expanded root summary");
+        let props = summary
+            .usages
+            .into_iter()
+            .map(|usage| usage.prop_name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            props,
+            BTreeSet::from(["barFn".to_string(), "fooFn".to_string()])
+        );
     }
 
     #[test]
