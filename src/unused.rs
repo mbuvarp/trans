@@ -54,6 +54,7 @@ const ARRAY_MUTATING_METHODS: &[&str] = &[
     "splice",
     "unshift",
 ];
+const ARRAY_CONTENT_WRITING_METHODS: &[&str] = &["fill", "push", "splice", "unshift"];
 const MAX_FINITE_STRINGS: usize = 128;
 
 fn is_translator_like_name(name: &str) -> bool {
@@ -325,6 +326,7 @@ struct TranslatorArgumentArray {
     bindings: Vec<Option<TranslatorBinding>>,
     safe_layout: bool,
     optional: bool,
+    unknown_contents: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3561,6 +3563,7 @@ fn merge_translator_argument_arrays(
         bindings,
         safe_layout: same_length && left.safe_layout && right.safe_layout,
         optional: left.optional || right.optional,
+        unknown_contents: left.unknown_contents || right.unknown_contents,
     }
 }
 
@@ -6335,9 +6338,8 @@ impl<'a> Visit<'a> for HelperBodyCollector {
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if let Some(member) = call.callee.get_member_expr() {
-            if member
-                .static_property_name()
-                .is_some_and(|method| ARRAY_MUTATING_METHODS.contains(&method.as_ref()))
+            if let Some(method) = member.static_property_name()
+                && ARRAY_MUTATING_METHODS.contains(&method.as_ref())
             {
                 if let Some(identifier) = member.object().get_identifier_reference() {
                     if let Some(array) =
@@ -9262,6 +9264,9 @@ impl SourceUsageCollector {
                         .flatten()
                     },
                 ));
+                if array.unknown_contents && array.bindings.iter().any(Option::is_some) {
+                    candidates.push(translator_binding_from_namespace_arg(NamespaceArg::Dynamic));
+                }
             }
         } else if let Some(bindings) = self.translator_object_bindings_from_expression(object) {
             let has_known_binding = !bindings.bindings.is_empty();
@@ -9752,6 +9757,7 @@ impl SourceUsageCollector {
                     (Some(mut array), None) | (None, Some(mut array)) => {
                         array.safe_layout = false;
                         array.optional = true;
+                        array.unknown_contents = true;
                         Some(array)
                     }
                     (None, None) => None,
@@ -9779,11 +9785,13 @@ impl SourceUsageCollector {
                         }
                         (Some(mut left), None) => {
                             left.safe_layout = false;
+                            left.unknown_contents = true;
                             Some(left)
                         }
                         (None, Some(mut right)) => {
                             right.safe_layout = false;
                             right.optional = true;
+                            right.unknown_contents = true;
                             Some(right)
                         }
                         (None, None) => None,
@@ -9800,6 +9808,7 @@ impl SourceUsageCollector {
     ) -> TranslatorArgumentArray {
         let mut bindings = Vec::new();
         let mut safe_layout = true;
+        let mut unknown_contents = false;
         for element in &array.elements {
             match element {
                 ArrayExpressionElement::SpreadElement(spread) => {
@@ -9808,8 +9817,10 @@ impl SourceUsageCollector {
                     {
                         bindings.extend(spread_array.bindings);
                         safe_layout &= spread_array.safe_layout;
+                        unknown_contents |= spread_array.unknown_contents;
                     } else {
                         safe_layout = false;
+                        unknown_contents = true;
                     }
                 }
                 _ => bindings.push(self.translator_binding_from_array_element(element)),
@@ -9819,6 +9830,7 @@ impl SourceUsageCollector {
             bindings,
             safe_layout,
             optional: false,
+            unknown_contents,
         }
     }
 
@@ -9829,6 +9841,7 @@ impl SourceUsageCollector {
     ) -> TranslatorArgumentArray {
         let mut bindings = Vec::new();
         let mut safe_layout = true;
+        let mut unknown_contents = false;
         for argument in arguments.iter().skip(offset) {
             match argument {
                 Argument::SpreadElement(spread) => {
@@ -9837,8 +9850,10 @@ impl SourceUsageCollector {
                     {
                         bindings.extend(spread_array.bindings);
                         safe_layout &= spread_array.safe_layout;
+                        unknown_contents |= spread_array.unknown_contents;
                     } else {
                         safe_layout = false;
+                        unknown_contents = true;
                     }
                 }
                 _ => bindings.push(self.translator_binding_from_argument(argument)),
@@ -9848,6 +9863,7 @@ impl SourceUsageCollector {
             bindings,
             safe_layout,
             optional: false,
+            unknown_contents,
         }
     }
 
@@ -9867,6 +9883,7 @@ impl SourceUsageCollector {
             for name in referenced_identifier_names(expression) {
                 if let Some(array) = self.translator_argument_arrays.get_mut(&name) {
                     array.safe_layout = false;
+                    array.unknown_contents = true;
                 }
             }
         }
@@ -11514,6 +11531,7 @@ impl SourceUsageCollector {
                     },
                     safe_layout: array.safe_layout,
                     optional: false,
+                    unknown_contents: array.unknown_contents,
                 },
             );
         }
@@ -11859,6 +11877,7 @@ impl SourceUsageCollector {
                         },
                         safe_layout: array.safe_layout,
                         optional: false,
+                        unknown_contents: array.unknown_contents,
                     },
                 );
             }
@@ -12175,20 +12194,16 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if let Some(member) = call.callee.get_member_expr() {
-            if member
-                .static_property_name()
-                .is_some_and(|method| ARRAY_MUTATING_METHODS.contains(&method.as_ref()))
-            {
-                if let Some(identifier) = member.object().get_identifier_reference() {
-                    if let Some(array) = self
-                        .translator_argument_arrays
-                        .get_mut(identifier.name.as_str())
-                    {
-                        array.safe_layout = false;
-                    }
-                }
-            }
+        if let Some(member) = call.callee.get_member_expr()
+            && let Some(method) = member.static_property_name()
+            && ARRAY_MUTATING_METHODS.contains(&method)
+            && let Some(identifier) = member.object().get_identifier_reference()
+            && let Some(array) = self
+                .translator_argument_arrays
+                .get_mut(identifier.name.as_str())
+        {
+            array.safe_layout = false;
+            array.unknown_contents |= ARRAY_CONTENT_WRITING_METHODS.contains(&method);
         }
 
         self.invalidate_escaped_translator_argument_arrays(call);
@@ -12309,6 +12324,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                             bindings: Vec::new(),
                             safe_layout: false,
                             optional: true,
+                            unknown_contents: true,
                         });
                     self.apply_helper_summary_from_bindings(
                         &argument_array,
@@ -12393,10 +12409,11 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     .insert(name.to_string(), array);
             }
         }
-        if let Some(name) = assignment_target_member_object_name(&expression.left) {
-            if let Some(array) = self.translator_argument_arrays.get_mut(name) {
-                array.safe_layout = false;
-            }
+        if let Some(name) = assignment_target_member_object_name(&expression.left)
+            && let Some(array) = self.translator_argument_arrays.get_mut(name)
+        {
+            array.safe_layout = false;
+            array.unknown_contents = true;
         }
         let assigned_binding = self.translator_binding_from_expression(&expression.right);
         let assigned_object = self.translator_object_bindings_from_expression(&expression.right);
@@ -13079,6 +13096,33 @@ mod tests {
         assert!(scan.used_ids.contains("settings.aliased"));
         assert!(scan.used_ids.contains("common.original"));
         assert!(scan.used_ids.contains("settings.original"));
+    }
+
+    #[test]
+    fn escaped_and_content_mutated_array_members_become_dynamic() {
+        let escaped = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const translators = [common];
+            runtimeConsumer(translators);
+            translators[0]('escaped');
+            "#,
+        );
+
+        assert!(escaped.dynamic_usages.iter().any(|usage| usage.line == 6));
+
+        let mutated = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const translators = [common];
+            translators.fill(runtimeTranslator);
+            translators[0]('mutated');
+            "#,
+        );
+
+        assert!(mutated.dynamic_usages.iter().any(|usage| usage.line == 6));
     }
 
     #[test]
