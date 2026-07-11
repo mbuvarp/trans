@@ -2809,6 +2809,32 @@ struct BindingEnvironment {
     next_intl_server_namespaces: BTreeSet<String>,
 }
 
+struct CallbackTranslatorReturnCollector<'collector> {
+    source: &'collector SourceUsageCollector,
+    param: Option<String>,
+    input_binding: Option<TranslatorBinding>,
+    bindings: Vec<TranslatorBinding>,
+}
+
+impl<'a> Visit<'a> for CallbackTranslatorReturnCollector<'_> {
+    fn visit_return_statement(&mut self, statement: &ReturnStatement<'a>) {
+        let Some(argument) = &statement.argument else {
+            return;
+        };
+        if let Some(binding) = self.source.translator_binding_from_callback_result(
+            argument,
+            self.param.as_deref(),
+            self.input_binding.as_ref(),
+        ) {
+            self.bindings.push(binding);
+        }
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+
+    fn visit_arrow_function_expression(&mut self, _arrow: &ArrowFunctionExpression<'a>) {}
+}
+
 fn helper_summary_from_expression_with_context(
     expression: &Expression<'_>,
     helpers: &BTreeMap<String, HelperSummary>,
@@ -9882,6 +9908,16 @@ impl SourceUsageCollector {
     ) -> Option<TranslatorArgumentArray> {
         let member = call.callee.get_member_expr()?;
         let method = member.static_property_name()?;
+        if method == "values" && is_identifier_expression(member.object(), "Object") {
+            let source = call.arguments.first()?.as_expression()?;
+            let bindings = self.translator_object_bindings_from_expression(source)?;
+            return Some(TranslatorArgumentArray {
+                bindings: bindings.bindings.into_values().map(Some).collect(),
+                safe_layout: false,
+                optional: false,
+                unknown_contents: !bindings.unknown_paths.is_empty(),
+            });
+        }
         if method == "from" && is_identifier_expression(member.object(), "Array") {
             let source = call.arguments.first()?.as_expression()?;
             let mut array = self.translator_argument_array_from_expression(source)?;
@@ -9960,21 +9996,39 @@ impl SourceUsageCollector {
         callback: &Argument<'_>,
         input_binding: Option<&TranslatorBinding>,
     ) -> Option<TranslatorBinding> {
-        let Argument::ArrowFunctionExpression(arrow) = callback else {
-            return None;
+        let (params, body, expression) = match callback {
+            Argument::ArrowFunctionExpression(arrow) => {
+                (&arrow.params, Some(&arrow.body), arrow.expression)
+            }
+            Argument::FunctionExpression(function) => {
+                (&function.params, function.body.as_ref(), false)
+            }
+            _ => return None,
         };
-        if !arrow.expression {
-            return None;
-        }
-        let Statement::ExpressionStatement(statement) = arrow.body.statements.first()? else {
-            return None;
-        };
-        let param = arrow
-            .params
+        let param = params
             .items
             .first()
             .and_then(|param| binding_identifier_name(&param.pattern));
-        self.translator_binding_from_callback_result(&statement.expression, param, input_binding)
+        let body = body?;
+        if expression
+            && let Some(Statement::ExpressionStatement(statement)) = body.statements.first()
+        {
+            return self.translator_binding_from_callback_result(
+                &statement.expression,
+                param,
+                input_binding,
+            );
+        }
+        let mut collector = CallbackTranslatorReturnCollector {
+            source: self,
+            param: param.map(str::to_string),
+            input_binding: input_binding.cloned(),
+            bindings: Vec::new(),
+        };
+        for statement in &body.statements {
+            collector.visit_statement(statement);
+        }
+        merge_translator_binding_iter(collector.bindings)
     }
 
     fn translator_binding_from_callback_result(
@@ -10019,6 +10073,24 @@ impl SourceUsageCollector {
             "pop" if array.safe_layout => array.bindings.last().cloned().flatten(),
             "shift" | "pop" | "at" | "find" | "findLast" => {
                 merge_translator_binding_iter(array.bindings.iter().flatten().cloned())
+            }
+            "reduce" | "reduceRight" => {
+                let mut candidates = array.bindings.iter().flatten().cloned().collect::<Vec<_>>();
+                if let Some(initial) = call
+                    .arguments
+                    .get(1)
+                    .and_then(|argument| self.translator_binding_from_argument(argument))
+                {
+                    candidates.push(initial);
+                }
+                let input_binding = merge_translator_binding_iter(candidates.iter().cloned());
+                if let Some(callback) = call.arguments.first()
+                    && let Some(returned) = self
+                        .translator_binding_from_array_callback(callback, input_binding.as_ref())
+                {
+                    candidates.push(returned);
+                }
+                merge_translator_binding_iter(candidates)
             }
             _ => return None,
         };
@@ -11234,16 +11306,6 @@ impl SourceUsageCollector {
         expression: &Expression<'_>,
     ) -> Option<TranslatorBinding> {
         let mut bindings = Vec::new();
-        if let Some(array) = self.translator_argument_array_from_expression(expression) {
-            if !array.safe_layout {
-                return array
-                    .bindings
-                    .iter()
-                    .any(Option::is_some)
-                    .then(|| translator_binding_from_namespace_arg(NamespaceArg::Dynamic));
-            }
-            bindings.extend(array.bindings.into_iter().flatten());
-        }
         if let Expression::CallExpression(call) = expression.get_inner_expression()
             && let Some(member) = call.callee.get_member_expr()
             && member.static_property_name() == Some("values")
@@ -11254,6 +11316,15 @@ impl SourceUsageCollector {
             if let Some(binding) = object_bindings.aggregate_binding() {
                 bindings.push(binding);
             }
+        } else if let Some(array) = self.translator_argument_array_from_expression(expression) {
+            if !array.safe_layout {
+                return array
+                    .bindings
+                    .iter()
+                    .any(Option::is_some)
+                    .then(|| translator_binding_from_namespace_arg(NamespaceArg::Dynamic));
+            }
+            bindings.extend(array.bindings.into_iter().flatten());
         }
         merge_translator_binding_iter(bindings)
     }
@@ -13737,6 +13808,65 @@ mod tests {
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 18));
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 19));
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 20));
+    }
+
+    #[test]
+    fn block_and_function_callbacks_preserve_returned_translators() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const values = ['one'];
+            const mapped = values.map(() => { return common; });
+            const flattened = values.flatMap(function () { return [settings]; });
+            mapped[0]('mapped');
+            flattened[0]('flattened');
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 8));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 9));
+    }
+
+    #[test]
+    fn reducers_preserve_possible_translator_results() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const selected = [common, settings].reduce((accumulator) => accumulator);
+            const generated = [1].reduce(function () { return common; }, null);
+            selected('selected');
+            generated('generated');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.selected"));
+        assert!(scan.used_ids.contains("settings.selected"));
+        assert!(scan.used_ids.contains("common.generated"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn stored_object_values_preserve_translator_arrays() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const bundle = {common, settings};
+            const values = Object.values(bundle);
+            values[0]('indexed');
+            const [render] = values;
+            render('destructured');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.indexed"));
+        assert!(scan.used_ids.contains("settings.indexed"));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 9));
     }
 
     #[test]
