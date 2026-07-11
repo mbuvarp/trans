@@ -3161,6 +3161,7 @@ struct SourceUsageCollector {
     translator_callback_returns: BTreeMap<String, TranslatorBinding>,
     potential_translators: BTreeSet<String>,
     potential_wrapper_values: BTreeSet<String>,
+    potential_wrapper_callables: BTreeSet<String>,
     shadowed_react_bindings: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
     binding_scopes: Vec<BindingEnvironment>,
@@ -3198,6 +3199,7 @@ struct BindingEnvironment {
     translator_callback_returns: BTreeMap<String, TranslatorBinding>,
     potential_translators: BTreeSet<String>,
     potential_wrapper_values: BTreeSet<String>,
+    potential_wrapper_callables: BTreeSet<String>,
     shadowed_react_bindings: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
     next_intl_namespaces: BTreeSet<String>,
@@ -3864,10 +3866,22 @@ fn finite_record_return_summary_from_function_with_context(
     record_iterables: &FiniteRecordBindings,
     record_maps: &FiniteRecordMaps,
     enum_member_domains: &TypeDomains,
-    react_use_memo_identifiers: BTreeSet<String>,
-    react_namespaces: BTreeSet<String>,
+    mut react_use_memo_identifiers: BTreeSet<String>,
+    mut react_namespaces: BTreeSet<String>,
 ) -> Option<FiniteRecords> {
     let body = function.body.as_ref()?;
+    for parameter in &function.params.items {
+        for identifier in parameter.pattern.get_binding_identifiers() {
+            react_use_memo_identifiers.remove(identifier.name.as_str());
+            react_namespaces.remove(identifier.name.as_str());
+        }
+    }
+    if let Some(rest) = &function.params.rest {
+        for identifier in rest.rest.argument.get_binding_identifiers() {
+            react_use_memo_identifiers.remove(identifier.name.as_str());
+            react_namespaces.remove(identifier.name.as_str());
+        }
+    }
     finite_record_return_summary_from_body(
         body,
         constants.clone(),
@@ -7542,6 +7556,11 @@ impl ReturnRecordCollector {
 
 impl<'a> Visit<'a> for ReturnRecordCollector {
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        for identifier in declarator.id.get_binding_identifiers() {
+            self.react_use_memo_identifiers
+                .remove(identifier.name.as_str());
+            self.react_namespaces.remove(identifier.name.as_str());
+        }
         if declarator.kind == VariableDeclarationKind::Const {
             if let Some(name) = binding_identifier_name(&declarator.id) {
                 if let Some(init) = &declarator.init {
@@ -7609,7 +7628,13 @@ impl<'a> Visit<'a> for ReturnRecordCollector {
         }
     }
 
-    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
+        if let Some(identifier) = &function.id {
+            self.react_use_memo_identifiers
+                .remove(identifier.name.as_str());
+            self.react_namespaces.remove(identifier.name.as_str());
+        }
+    }
 
     fn visit_arrow_function_expression(&mut self, _arrow: &ArrowFunctionExpression<'a>) {}
 }
@@ -10145,6 +10170,7 @@ impl SourceUsageCollector {
             translator_callback_returns: BTreeMap::new(),
             potential_translators: BTreeSet::new(),
             potential_wrapper_values: BTreeSet::new(),
+            potential_wrapper_callables: BTreeSet::new(),
             shadowed_react_bindings: BTreeSet::new(),
             message_key_helpers: BTreeMap::new(),
             binding_scopes: Vec::new(),
@@ -10183,6 +10209,7 @@ impl SourceUsageCollector {
             translator_callback_returns: self.translator_callback_returns.clone(),
             potential_translators: self.potential_translators.clone(),
             potential_wrapper_values: self.potential_wrapper_values.clone(),
+            potential_wrapper_callables: self.potential_wrapper_callables.clone(),
             shadowed_react_bindings: self.shadowed_react_bindings.clone(),
             message_key_helpers: self.message_key_helpers.clone(),
             next_intl_namespaces: self.next_intl_namespaces.clone(),
@@ -10216,6 +10243,7 @@ impl SourceUsageCollector {
         self.translator_callback_returns = environment.translator_callback_returns;
         self.potential_translators = environment.potential_translators;
         self.potential_wrapper_values = environment.potential_wrapper_values;
+        self.potential_wrapper_callables = environment.potential_wrapper_callables;
         self.shadowed_react_bindings = environment.shadowed_react_bindings;
         self.message_key_helpers = environment.message_key_helpers;
         self.next_intl_namespaces = environment.next_intl_namespaces;
@@ -10249,6 +10277,7 @@ impl SourceUsageCollector {
         self.translator_callback_returns.remove(name);
         self.potential_translators.remove(name);
         self.potential_wrapper_values.remove(name);
+        self.potential_wrapper_callables.remove(name);
         self.message_key_helpers.remove(name);
         self.next_intl_namespaces.remove(name);
         self.next_intl_server_namespaces.remove(name);
@@ -11054,12 +11083,107 @@ impl SourceUsageCollector {
             .is_some_and(|name| self.potential_translators.contains(name))
     }
 
+    fn is_potential_translator_value_name(name: &str) -> bool {
+        is_translator_like_name(name)
+            || matches!(
+                name.to_ascii_lowercase().as_str(),
+                "render" | "renderer" | "formatter" | "formatmessage" | "format_message"
+            )
+    }
+
+    fn expression_is_potential_wrapper_value(&self, expression: &Expression<'_>) -> bool {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => self
+                .potential_wrapper_values
+                .contains(identifier.name.as_str()),
+            Expression::ConditionalExpression(conditional) => {
+                self.expression_is_potential_wrapper_value(&conditional.consequent)
+                    || self.expression_is_potential_wrapper_value(&conditional.alternate)
+            }
+            Expression::LogicalExpression(logical) => {
+                self.expression_is_potential_wrapper_value(&logical.left)
+                    || self.expression_is_potential_wrapper_value(&logical.right)
+            }
+            Expression::NewExpression(new_expression)
+                if is_identifier_expression(&new_expression.callee, "Map") =>
+            {
+                new_expression
+                    .arguments
+                    .first()
+                    .and_then(Argument::as_expression)
+                    .is_some_and(|expression| {
+                        self.expression_is_potential_wrapper_value(expression)
+                    })
+            }
+            Expression::CallExpression(call) => {
+                call.callee.get_member_expr().is_some_and(|member| {
+                    matches!(
+                        member.static_property_name(),
+                        Some(
+                            "slice"
+                                | "filter"
+                                | "concat"
+                                | "toReversed"
+                                | "toSorted"
+                                | "toSpliced"
+                                | "with"
+                        )
+                    ) && self.expression_is_potential_wrapper_value(member.object())
+                })
+            }
+            _ => false,
+        }
+    }
+
+    fn expression_is_potential_wrapper_callable(&self, expression: &Expression<'_>) -> bool {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => self
+                .potential_wrapper_callables
+                .contains(identifier.name.as_str()),
+            Expression::ComputedMemberExpression(member) => member
+                .object
+                .get_identifier_reference()
+                .is_some_and(|identifier| {
+                    self.potential_wrapper_values
+                        .contains(identifier.name.as_str())
+                }),
+            Expression::CallExpression(call) => {
+                call.callee.get_member_expr().is_some_and(|member| {
+                    matches!(member.static_property_name(), Some("get" | "at"))
+                        && self.expression_is_potential_wrapper_value(member.object())
+                })
+            }
+            Expression::ConditionalExpression(conditional) => {
+                self.expression_is_potential_wrapper_callable(&conditional.consequent)
+                    || self.expression_is_potential_wrapper_callable(&conditional.alternate)
+            }
+            Expression::LogicalExpression(logical) => {
+                self.expression_is_potential_wrapper_callable(&logical.left)
+                    || self.expression_is_potential_wrapper_callable(&logical.right)
+            }
+            _ => false,
+        }
+    }
+
     fn is_potential_wrapper_translator_call(&self, expression: &Expression<'_>) -> bool {
         match expression.get_inner_expression() {
             Expression::Identifier(identifier) => {
-                self.potential_wrapper_values
+                self.potential_wrapper_callables
                     .contains(identifier.name.as_str())
-                    && is_translator_like_name(identifier.name.as_str())
+                    || (self
+                        .potential_wrapper_values
+                        .contains(identifier.name.as_str())
+                        && Self::is_potential_translator_value_name(identifier.name.as_str()))
+            }
+            Expression::StaticMemberExpression(member) => {
+                member
+                    .object
+                    .get_identifier_reference()
+                    .is_some_and(|identifier| {
+                        self.potential_wrapper_values
+                            .contains(identifier.name.as_str())
+                    })
+                    && Self::is_potential_translator_value_name(member.property.name.as_str())
             }
             Expression::ComputedMemberExpression(member) => member
                 .object
@@ -11072,14 +11196,8 @@ impl SourceUsageCollector {
                 let Some(member) = call.callee.get_member_expr() else {
                     return false;
                 };
-                member.static_property_name() == Some("get")
-                    && member
-                        .object()
-                        .get_identifier_reference()
-                        .is_some_and(|identifier| {
-                            self.potential_wrapper_values
-                                .contains(identifier.name.as_str())
-                        })
+                matches!(member.static_property_name(), Some("get" | "at"))
+                    && self.expression_is_potential_wrapper_value(member.object())
             }
             _ => false,
         }
@@ -15006,16 +15124,35 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     }
 
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
-        let potential_wrapper_binding = binding_identifier_name(&declarator.id).filter(|_| {
-            declarator
-                .init
-                .as_ref()
-                .and_then(|init| match init.get_inner_expression() {
-                    Expression::CallExpression(call) => Some(call),
-                    _ => None,
-                })
-                .is_some_and(|call| self.call_is_react_callback_wrapper(call, "useMemo"))
+        let init = declarator.init.as_ref();
+        let init_call = init.and_then(|init| match init.get_inner_expression() {
+            Expression::CallExpression(call) => Some(call),
+            _ => None,
         });
+        let direct_memo_wrapper =
+            init_call.is_some_and(|call| self.call_is_react_callback_wrapper(call, "useMemo"));
+        let direct_state_wrapper =
+            init_call.is_some_and(|call| self.call_is_react_callback_wrapper(call, "useState"));
+        let inherited_wrapper_value =
+            init.is_some_and(|init| self.expression_is_potential_wrapper_value(init));
+        let inherited_wrapper_callable =
+            init.is_some_and(|init| self.expression_is_potential_wrapper_callable(init));
+        let potential_wrapper_binding = binding_identifier_name(&declarator.id)
+            .filter(|_| direct_memo_wrapper || inherited_wrapper_value);
+        let potential_callable_binding =
+            binding_identifier_name(&declarator.id).filter(|_| inherited_wrapper_callable);
+        let destructured_wrapper_callables =
+            (!matches!(declarator.id, BindingPattern::BindingIdentifier(_))
+                && (direct_memo_wrapper || inherited_wrapper_value))
+                .then(|| {
+                    declarator
+                        .id
+                        .get_binding_identifiers()
+                        .into_iter()
+                        .map(|identifier| identifier.name.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
         let mut callback_return_bindings = Vec::new();
         if let Some(Expression::CallExpression(call)) = declarator
             .init
@@ -15072,11 +15209,11 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         let mut state_object_unresolved = false;
         let mut state_binding_unresolved = false;
         if state_name.is_some()
+            && direct_state_wrapper
             && let Some(Expression::CallExpression(call)) = declarator
                 .init
                 .as_ref()
                 .map(|init| init.get_inner_expression())
-            && self.call_is_react_callback_wrapper(call, "useState")
             && let Some(callback) = call.arguments.first()
         {
             for_each_callback_return_expression(self, callback, |result, local| {
@@ -15271,11 +15408,18 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             if let Some(binding) = merge_translator_binding_iter(state_bindings) {
                 self.translators.insert(name.to_string(), binding);
             }
-            self.potential_wrapper_values.insert(name.to_string());
+            if direct_state_wrapper {
+                self.potential_wrapper_values.insert(name.to_string());
+            }
         }
         if let Some(name) = potential_wrapper_binding {
             self.potential_wrapper_values.insert(name.to_string());
         }
+        if let Some(name) = potential_callable_binding {
+            self.potential_wrapper_callables.insert(name.to_string());
+        }
+        self.potential_wrapper_callables
+            .extend(destructured_wrapper_callables);
         if let (Some(name), Some(binding)) =
             (binding_identifier_name(&declarator.id), callback_return)
         {
@@ -15739,6 +15883,30 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 .map(|_| self.translator_argument_array_alias_sources(&expression.right))
                 .unwrap_or_default();
             let name = identifier.name.as_str();
+            let right_potential_wrapper =
+                self.expression_is_potential_wrapper_value(&expression.right);
+            let right_potential_callable =
+                self.expression_is_potential_wrapper_callable(&expression.right);
+            let current_potential_wrapper = self.potential_wrapper_values.contains(name);
+            let current_potential_callable = self.potential_wrapper_callables.contains(name);
+            let potential_wrapper = match expression.operator {
+                AssignmentOperator::Assign | AssignmentOperator::LogicalAnd => {
+                    right_potential_wrapper
+                }
+                AssignmentOperator::LogicalOr | AssignmentOperator::LogicalNullish => {
+                    current_potential_wrapper || right_potential_wrapper
+                }
+                _ => false,
+            };
+            let potential_callable = match expression.operator {
+                AssignmentOperator::Assign | AssignmentOperator::LogicalAnd => {
+                    right_potential_callable
+                }
+                AssignmentOperator::LogicalOr | AssignmentOperator::LogicalNullish => {
+                    current_potential_callable || right_potential_callable
+                }
+                _ => false,
+            };
             let current_translator = self.translators.get(name).cloned();
             let current_object_bindings = self.translator_object_bindings.get(name).cloned();
             let current_argument_array = self.translator_argument_arrays.get(name).cloned();
@@ -15869,6 +16037,12 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             if let Some(entries) = translator_map_entries {
                 self.translator_map_entries
                     .insert(name.to_string(), entries);
+            }
+            if potential_wrapper {
+                self.potential_wrapper_values.insert(name.to_string());
+            }
+            if potential_callable {
+                self.potential_wrapper_callables.insert(name.to_string());
             }
         }
         let assigned_binding = self.translator_binding_from_expression(&expression.right);
@@ -17685,6 +17859,83 @@ mod tests {
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 6));
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 7));
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 8));
+    }
+
+    #[test]
+    fn ordinary_array_destructuring_is_not_a_wrapper_value() {
+        let scan = scan(
+            r#"
+            const [value] = items;
+            value[0]('ordinary-call');
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn deferred_wrapper_provenance_flows_through_aliases() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const source = useMemo(() => runtimeValues(), []);
+            const alias = source;
+            const render = alias[0];
+            render('extracted-alias');
+            let assigned;
+            assigned = alias;
+            assigned.at(0)('assigned-alias');
+            const mapped = new Map(source);
+            mapped.get('format')('constructed-map');
+            const [destructured] = source;
+            destructured('destructured-alias');
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 6));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 9));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 11));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 13));
+    }
+
+    #[test]
+    fn deferred_wrapper_object_and_direct_calls_stay_dynamic() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const handlers = useMemo(() => runtimeHandlers(), []);
+            handlers.format('object-member');
+            const render = useMemo(() => runtimeRender(), []);
+            render('direct-render');
+            const values = useMemo(() => runtimeValues(), []);
+            values.at(0)('array-at');
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 4));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 6));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 8));
+    }
+
+    #[test]
+    fn memoized_record_summaries_respect_parameter_shadowing() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            import {useTranslations} from 'next-intl';
+            const ITEMS = [{labelKey: 'common.home'}];
+            function useRuntimeRows(useMemo) {
+              const rows = useMemo(() => ITEMS, []);
+              return {rows};
+            }
+            const t = useTranslations();
+            const {rows} = useRuntimeRows(runtimeMemo);
+            rows.forEach(row => t(row.labelKey));
+            "#,
+        );
+
+        assert!(!scan.used_ids.contains("common.home"));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 11));
     }
 
     #[test]
