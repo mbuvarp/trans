@@ -2576,6 +2576,7 @@ struct SourceUsageCollector {
     translator_object_bindings: TranslatorObjectBindings,
     translator_argument_arrays: BTreeMap<String, TranslatorArgumentArray>,
     potential_translators: BTreeSet<String>,
+    shadowed_react_bindings: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
     binding_scopes: Vec<BindingEnvironment>,
     scope_depth: usize,
@@ -2602,6 +2603,7 @@ struct BindingEnvironment {
     translator_object_bindings: TranslatorObjectBindings,
     translator_argument_arrays: BTreeMap<String, TranslatorArgumentArray>,
     potential_translators: BTreeSet<String>,
+    shadowed_react_bindings: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
     next_intl_namespaces: BTreeSet<String>,
     next_intl_server_namespaces: BTreeSet<String>,
@@ -3348,6 +3350,69 @@ fn module_export_name<'a>(name: &'a ModuleExportName<'a>) -> Option<&'a str> {
         ModuleExportName::IdentifierReference(identifier) => Some(identifier.name.as_str()),
         ModuleExportName::StringLiteral(literal) => Some(literal.value.as_str()),
     }
+}
+
+fn commonjs_require_source(expression: &Expression<'_>) -> Option<String> {
+    let Expression::CallExpression(call) = expression.get_inner_expression() else {
+        return None;
+    };
+    let callee = call
+        .callee
+        .get_inner_expression()
+        .get_identifier_reference()?;
+    if callee.name.as_str() != "require" {
+        return None;
+    }
+    let source = call
+        .arguments
+        .first()?
+        .as_expression()?
+        .get_inner_expression();
+    let Expression::StringLiteral(source) = source else {
+        return None;
+    };
+    Some(source.value.to_string())
+}
+
+fn commonjs_member_import(expression: &Expression<'_>) -> Option<(String, String)> {
+    let member = expression.get_member_expr()?;
+    let imported = member.static_property_name()?.to_string();
+    let source = commonjs_require_source(member.object())?;
+    Some((source, imported))
+}
+
+fn commonjs_declarator_imports(
+    declarator: &VariableDeclarator<'_>,
+) -> Vec<(String, Option<String>, String)> {
+    let Some(init) = &declarator.init else {
+        return Vec::new();
+    };
+    if let Some(source) = commonjs_require_source(init) {
+        return match &declarator.id {
+            BindingPattern::BindingIdentifier(identifier) => {
+                vec![(source, None, identifier.name.to_string())]
+            }
+            BindingPattern::ObjectPattern(object) => object
+                .properties
+                .iter()
+                .filter_map(|property| {
+                    if property.computed {
+                        return None;
+                    }
+                    let imported = property.key.static_name()?.to_string();
+                    let local = binding_identifier_name(&property.value)?.to_string();
+                    Some((source.clone(), Some(imported), local))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+    }
+    let Some((source, imported)) = commonjs_member_import(init) else {
+        return Vec::new();
+    };
+    binding_identifier_name(&declarator.id)
+        .map(|local| vec![(source, Some(imported), local.to_string())])
+        .unwrap_or_default()
 }
 
 fn ts_type_name_identifier<'a>(name: &'a TSTypeName<'a>) -> Option<&'a str> {
@@ -7757,6 +7822,23 @@ impl<'a> Visit<'a> for SourceIndexCollector {
     }
 
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        for (source, imported, local) in commonjs_declarator_imports(declarator) {
+            if source != "next-intl" && source != "next-intl/server" {
+                continue;
+            }
+            match imported.as_deref() {
+                Some("useTranslations" | "getTranslations") => {
+                    self.translation_factories.insert(local);
+                }
+                None if source == "next-intl" => {
+                    self.next_intl_namespaces.insert(local);
+                }
+                None => {
+                    self.next_intl_server_namespaces.insert(local);
+                }
+                _ => {}
+            }
+        }
         if let Some(name) = binding_identifier_name(&declarator.id) {
             if let Some(init) = &declarator.init {
                 if declarator.kind == VariableDeclarationKind::Const {
@@ -7973,6 +8055,7 @@ impl SourceUsageCollector {
             translator_object_bindings: BTreeMap::new(),
             translator_argument_arrays: BTreeMap::new(),
             potential_translators: BTreeSet::new(),
+            shadowed_react_bindings: BTreeSet::new(),
             message_key_helpers: BTreeMap::new(),
             binding_scopes: Vec::new(),
             scope_depth: 0,
@@ -8000,6 +8083,7 @@ impl SourceUsageCollector {
             translator_object_bindings: self.translator_object_bindings.clone(),
             translator_argument_arrays: self.translator_argument_arrays.clone(),
             potential_translators: self.potential_translators.clone(),
+            shadowed_react_bindings: self.shadowed_react_bindings.clone(),
             message_key_helpers: self.message_key_helpers.clone(),
             next_intl_namespaces: self.next_intl_namespaces.clone(),
             next_intl_server_namespaces: self.next_intl_server_namespaces.clone(),
@@ -8022,12 +8106,16 @@ impl SourceUsageCollector {
         self.translator_object_bindings = environment.translator_object_bindings;
         self.translator_argument_arrays = environment.translator_argument_arrays;
         self.potential_translators = environment.potential_translators;
+        self.shadowed_react_bindings = environment.shadowed_react_bindings;
         self.message_key_helpers = environment.message_key_helpers;
         self.next_intl_namespaces = environment.next_intl_namespaces;
         self.next_intl_server_namespaces = environment.next_intl_server_namespaces;
     }
 
     fn mask_binding_name(&mut self, name: &str) {
+        if self.file_binding_is_react_import(name) {
+            self.shadowed_react_bindings.insert(name.to_string());
+        }
         self.finite_constants.remove(name);
         self.finite_iterables.remove(name);
         self.finite_object_maps.remove(name);
@@ -8044,6 +8132,18 @@ impl SourceUsageCollector {
         self.message_key_helpers.remove(name);
         self.next_intl_namespaces.remove(name);
         self.next_intl_server_namespaces.remove(name);
+    }
+
+    fn file_binding_is_react_import(&self, name: &str) -> bool {
+        self.file_index.as_ref().is_some_and(|file| {
+            file.namespace_imports
+                .get(name)
+                .is_some_and(|source| source == "react")
+                || file
+                    .imports
+                    .get(name)
+                    .is_some_and(|target| target.source == "react")
+        })
     }
 
     fn mask_binding_pattern(&mut self, pattern: &BindingPattern<'_>) {
@@ -9222,7 +9322,7 @@ impl SourceUsageCollector {
         };
         match expression.get_inner_expression() {
             Expression::ObjectExpression(object) => {
-                let mut bindings = Vec::new();
+                let mut unknown_later_override = false;
                 for item in object.properties.iter().rev() {
                     match item {
                         ObjectPropertyKind::ObjectProperty(item)
@@ -9233,20 +9333,45 @@ impl SourceUsageCollector {
                             if let Some(binding) =
                                 self.translator_binding_from_expression_path(&item.value, remaining)
                             {
-                                bindings.push(binding);
+                                return Some(if unknown_later_override {
+                                    merge_translator_bindings(
+                                        &binding,
+                                        &translator_binding_from_namespace_arg(
+                                            NamespaceArg::Dynamic,
+                                        ),
+                                    )
+                                } else {
+                                    binding
+                                });
                             }
+                            return None;
                         }
                         ObjectPropertyKind::SpreadProperty(spread) => {
                             if let Some(binding) =
                                 self.translator_binding_from_expression_path(&spread.argument, path)
                             {
-                                bindings.push(binding);
+                                return Some(if unknown_later_override {
+                                    merge_translator_bindings(
+                                        &binding,
+                                        &translator_binding_from_namespace_arg(
+                                            NamespaceArg::Dynamic,
+                                        ),
+                                    )
+                                } else {
+                                    binding
+                                });
                             }
+                            unknown_later_override = true;
+                        }
+                        ObjectPropertyKind::ObjectProperty(item)
+                            if item.key.static_name().is_none() =>
+                        {
+                            unknown_later_override = true;
                         }
                         _ => {}
                     }
                 }
-                merge_translator_binding_iter(bindings)
+                None
             }
             Expression::ArrayExpression(array) => {
                 if array
@@ -9787,6 +9912,9 @@ impl SourceUsageCollector {
         };
         let react_hook = self.file_index.as_ref().is_some_and(|file| {
             if let Some(callee) = self.callee_identifier(&call.callee) {
+                if self.shadowed_react_bindings.contains(callee) {
+                    return false;
+                }
                 return file.imports.get(callee).is_some_and(|target| {
                     target.source == "react"
                         && matches!(&target.imported, ImportedName::Named(name) if is_react_hook(name))
@@ -9801,6 +9929,12 @@ impl SourceUsageCollector {
             let Some(method) = member.static_property_name() else {
                 return false;
             };
+            if self
+                .shadowed_react_bindings
+                .contains(object.name.as_str())
+            {
+                return false;
+            }
             is_react_hook(method)
                 && (file.namespace_imports.get(object.name.as_str()).is_some_and(|source| source == "react")
                     || file.imports.get(object.name.as_str()).is_some_and(|target| {
@@ -10585,6 +10719,20 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             array
         });
         self.mask_binding_pattern(&declarator.id);
+        for (source, imported, local) in commonjs_declarator_imports(declarator) {
+            if source != "next-intl" && source != "next-intl/server" {
+                continue;
+            }
+            match imported {
+                Some(imported) => self.record_import(&source, &imported, &local),
+                None if source == "next-intl" => {
+                    self.next_intl_namespaces.insert(local);
+                }
+                None => {
+                    self.next_intl_server_namespaces.insert(local);
+                }
+            }
+        }
         self.track_destructured_translator_bindings(&declarator.id);
         if let Some(bindings) = translator_object_bindings {
             self.bind_pattern_translator_properties(&declarator.id, &bindings);
@@ -13573,6 +13721,40 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
     }
 
     #[test]
+    fn unknown_later_spreads_make_destructured_translators_dynamic() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function consume({formatter}) {
+              formatter('title');
+            }
+            const common = useTranslations('common');
+            consume({formatter: common, ...runtimeProps});
+            "#,
+        );
+
+        assert!(!scan.used_ids.contains("common.title"));
+        assert!(!scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn later_explicit_destructured_translators_override_unknown_spreads() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function consume({formatter}) {
+              formatter('title');
+            }
+            const common = useTranslations('common');
+            consume({...runtimeProps, formatter: common});
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
     fn array_destructured_helper_paths_resolve_translators() {
         let scan = scan(
             r#"
@@ -13641,6 +13823,40 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
                 .iter()
                 .any(|usage| usage.namespace == "common")
         );
+    }
+
+    #[test]
+    fn shadowed_react_hook_imports_do_not_bypass_translator_protection() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            import {useMemo as reactMemo} from 'react';
+            const t = useTranslations('common');
+            function Page(reactMemo) {
+              reactMemo({t});
+            }
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn commonjs_translation_factory_aliases_create_bindings() {
+        let scan = scan(
+            r#"
+            const {useTranslations: makeTranslator} = require('next-intl');
+            const intl = makeTranslator('common');
+            intl('title');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.dynamic_usages.is_empty());
     }
 
     #[test]

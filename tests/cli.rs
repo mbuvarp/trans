@@ -1193,7 +1193,7 @@ fn unused_scans_mjs_and_cjs_modules() {
     .expect("write mjs source");
     std::fs::write(
         dir.path().join("cjs-usage.cjs"),
-        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('fromCjs');\n",
+        "const nextIntl = require('next-intl');\nconst intl = nextIntl.useTranslations('app');\nintl('fromCjs');\n",
     )
     .expect("write cjs source");
 
