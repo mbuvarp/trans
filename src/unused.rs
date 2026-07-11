@@ -1882,8 +1882,48 @@ fn helper_summary_from_expression_with_context(
             enum_member_domains,
             source_context,
         ),
+        Expression::CallExpression(call) => bound_helper_summary_from_call(call, helpers),
         _ => None,
     }
+}
+
+fn bound_helper_summary_from_call(
+    call: &CallExpression<'_>,
+    helpers: &BTreeMap<String, HelperSummary>,
+) -> Option<HelperSummary> {
+    let member = call.callee.get_member_expr()?;
+    if member.static_property_name().as_deref() != Some("bind") {
+        return None;
+    }
+    let helper_name = member
+        .object()
+        .get_inner_expression()
+        .get_identifier_reference()?
+        .name
+        .as_str();
+    let summary = helpers.get(helper_name)?;
+    if call
+        .arguments
+        .iter()
+        .skip(1)
+        .any(|argument| matches!(argument, Argument::SpreadElement(_)))
+    {
+        return None;
+    }
+    let bound_count = call.arguments.len().saturating_sub(1);
+    Some(HelperSummary {
+        param_usages: summary
+            .param_usages
+            .iter()
+            .filter(|usage| usage.param_index >= bound_count)
+            .map(|usage| HelperParamUsage {
+                param_index: usage.param_index - bound_count,
+                keys: usage.keys.clone(),
+                query: usage.query.clone(),
+                translator_like: usage.translator_like,
+            })
+            .collect(),
+    })
 }
 
 fn helper_summary_from_arrow_with_context(
@@ -4231,6 +4271,57 @@ impl HelperBodyCollector {
         }
     }
 
+    fn param_argument_array_from_arguments(
+        &self,
+        arguments: &[Argument<'_>],
+        offset: usize,
+    ) -> ParamArgumentArray {
+        let mut bindings = Vec::new();
+        let mut safe_layout = true;
+        for argument in arguments.iter().skip(offset) {
+            match argument {
+                Argument::SpreadElement(spread) => {
+                    if let Some(spread_array) =
+                        self.param_argument_array_from_expression(&spread.argument)
+                    {
+                        bindings.extend(spread_array.bindings);
+                        safe_layout &= spread_array.safe_layout;
+                    } else {
+                        safe_layout = false;
+                    }
+                }
+                _ => bindings.push(self.param_indexes_from_argument(argument)),
+            }
+        }
+        ParamArgumentArray {
+            bindings,
+            safe_layout,
+        }
+    }
+
+    fn invalidate_escaped_param_argument_arrays(&mut self, call: &CallExpression<'_>) {
+        let safe_apply_index = call.callee.get_member_expr().and_then(|member| {
+            (member.static_property_name().as_deref() == Some("apply")
+                && self.helper_summary_for_callee(member.object()).is_some())
+            .then_some(1)
+        });
+        for (index, argument) in call.arguments.iter().enumerate() {
+            if safe_apply_index == Some(index) {
+                continue;
+            }
+            let Some(identifier) = argument
+                .as_expression()
+                .map(Expression::get_inner_expression)
+                .and_then(Expression::get_identifier_reference)
+            else {
+                continue;
+            };
+            if let Some(array) = self.param_argument_arrays.get_mut(identifier.name.as_str()) {
+                array.safe_layout = false;
+            }
+        }
+    }
+
     fn record_helper_usage_for_params(&mut self, indexes: &ParamIndexes, usage: &HelperParamUsage) {
         for param_index in indexes {
             self.usages.push(HelperParamUsage {
@@ -4248,13 +4339,8 @@ impl HelperBodyCollector {
         summary: &HelperSummary,
         offset: usize,
     ) {
-        for usage in &summary.param_usages {
-            let Some(argument) = call.arguments.get(usage.param_index + offset) else {
-                continue;
-            };
-            let indexes = self.param_indexes_from_argument(argument);
-            self.record_helper_usage_for_params(&indexes, usage);
-        }
+        let argument_array = self.param_argument_array_from_arguments(&call.arguments, offset);
+        self.apply_helper_summary_from_param_array(&argument_array, summary);
     }
 
     fn apply_helper_summary_from_param_array(
@@ -4675,6 +4761,12 @@ impl<'a> Visit<'a> for HelperBodyCollector {
             .as_ref()
             .and_then(Expression::get_identifier_reference)
             .and_then(|source| self.param_names.get(source.name.as_str()).copied());
+        let bound_helper = declarator.init.as_ref().and_then(|init| {
+            let Expression::CallExpression(call) = init.get_inner_expression() else {
+                return None;
+            };
+            bound_helper_summary_from_call(call, &self.helpers)
+        });
         let param_argument_array = (declarator.kind == VariableDeclarationKind::Const)
             .then(|| declarator.init.as_ref())
             .flatten()
@@ -4699,6 +4791,10 @@ impl<'a> Visit<'a> for HelperBodyCollector {
                 self.param_names
                     .insert(identifier.name.to_string(), param_index);
             }
+        }
+        if let (Some(name), Some(summary)) = (binding_identifier_name(&declarator.id), bound_helper)
+        {
+            self.helpers.insert(name.to_string(), summary);
         }
         if let (Some(name), Some(bindings)) = (
             binding_identifier_name(&declarator.id),
@@ -4777,6 +4873,8 @@ impl<'a> Visit<'a> for HelperBodyCollector {
                 }
             }
         }
+
+        self.invalidate_escaped_param_argument_arrays(call);
 
         if self.visit_finite_record_iteration_call(call) {
             if let Some(member) = call.callee.get_member_expr() {
@@ -6876,6 +6974,60 @@ impl SourceUsageCollector {
         }
     }
 
+    fn translator_argument_array_from_arguments(
+        &self,
+        arguments: &[Argument<'_>],
+        offset: usize,
+    ) -> TranslatorArgumentArray {
+        let mut bindings = Vec::new();
+        let mut safe_layout = true;
+        for argument in arguments.iter().skip(offset) {
+            match argument {
+                Argument::SpreadElement(spread) => {
+                    if let Some(spread_array) =
+                        self.translator_argument_array_from_expression(&spread.argument)
+                    {
+                        bindings.extend(spread_array.bindings);
+                        safe_layout &= spread_array.safe_layout;
+                    } else {
+                        safe_layout = false;
+                    }
+                }
+                _ => bindings.push(self.translator_binding_from_argument(argument)),
+            }
+        }
+        TranslatorArgumentArray {
+            bindings,
+            safe_layout,
+        }
+    }
+
+    fn invalidate_escaped_translator_argument_arrays(&mut self, call: &CallExpression<'_>) {
+        let safe_apply_index = call.callee.get_member_expr().and_then(|member| {
+            (member.static_property_name().as_deref() == Some("apply")
+                && self.helper_summary_for_callee(member.object()).is_some())
+            .then_some(1)
+        });
+        for (index, argument) in call.arguments.iter().enumerate() {
+            if safe_apply_index == Some(index) {
+                continue;
+            }
+            let Some(identifier) = argument
+                .as_expression()
+                .map(Expression::get_inner_expression)
+                .and_then(Expression::get_identifier_reference)
+            else {
+                continue;
+            };
+            if let Some(array) = self
+                .translator_argument_arrays
+                .get_mut(identifier.name.as_str())
+            {
+                array.safe_layout = false;
+            }
+        }
+    }
+
     fn maybe_extraction_call(&self, call: &CallExpression<'_>) -> bool {
         let Some(callee) = self.callee_identifier(&call.callee) else {
             return false;
@@ -7062,15 +7214,8 @@ impl SourceUsageCollector {
         summary: &HelperSummary,
         offset: usize,
     ) {
-        for usage in &summary.param_usages {
-            let Some(argument) = call.arguments.get(usage.param_index + offset) else {
-                continue;
-            };
-            let Some(binding) = self.translator_binding_from_argument(argument) else {
-                continue;
-            };
-            self.record_helper_usage_for_binding(usage, &binding, call.span.start);
-        }
+        let argument_array = self.translator_argument_array_from_arguments(&call.arguments, offset);
+        self.apply_helper_summary_from_bindings(&argument_array, summary, call.span.start);
     }
 
     fn record_helper_usage_for_binding(
@@ -7925,6 +8070,8 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             }
         }
 
+        self.invalidate_escaped_translator_argument_arrays(call);
+
         if self.maybe_extraction_call(call) {
             self.record_extraction_usage();
         }
@@ -8569,6 +8716,72 @@ mod tests {
     }
 
     #[test]
+    fn helper_calls_expand_finite_spread_arguments() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function label(prefix, translate) {
+              return translate('title');
+            }
+            const t = useTranslations('common');
+            const args = [prefix, t] as const;
+            label(...args);
+            label.call(null, ...args);
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+    }
+
+    #[test]
+    fn nested_helper_calls_propagate_finite_spread_arguments() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function inner(translate, key) {
+              return translate(key);
+            }
+            function outer(translate, key) {
+              const args = [translate, key] as const;
+              return inner(...args);
+            }
+            const t = useTranslations('common');
+            outer(t, runtimeKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn partially_bound_helpers_preserve_remaining_parameter_usages() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function inner(prefix, translate, key) {
+              return translate(key);
+            }
+            function outer(translate, key) {
+              const bound = inner.bind(null, 'prefix');
+              return bound(translate, key);
+            }
+            const t = useTranslations('common');
+            outer(t, runtimeKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
     fn helper_apply_resolves_constant_argument_arrays() {
         let scan = scan(
             r#"
@@ -8618,6 +8831,31 @@ mod tests {
             const t = useTranslations('common');
             const args = [t];
             args.unshift(first, second);
+            label.apply(null, args);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace.is_empty())
+        );
+    }
+
+    #[test]
+    fn escaped_helper_apply_arrays_are_conservatively_dynamic() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function label(translate) {
+              return translate('title');
+            }
+            function prepareArguments(args) {
+              args.reverse();
+            }
+            const t = useTranslations('common');
+            const args = [t];
+            prepareArguments(args);
             label.apply(null, args);
             "#,
         );
