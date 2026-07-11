@@ -369,6 +369,7 @@ struct SourceFileIndex {
     return_record_helpers: BTreeMap<String, FiniteRecords>,
     translator_return_helpers: BTreeMap<String, TranslatorBinding>,
     translator_array_return_helpers: BTreeMap<String, TranslatorBinding>,
+    translator_array_return_params: BTreeMap<String, ParamIndexes>,
     translator_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     translator_return_export_locals: BTreeMap<String, String>,
     named_exports: BTreeMap<String, HelperSummary>,
@@ -379,6 +380,7 @@ struct SourceFileIndex {
     named_record_return_exports: BTreeMap<String, FiniteRecords>,
     named_translator_return_exports: BTreeMap<String, TranslatorBinding>,
     named_translator_array_return_exports: BTreeMap<String, TranslatorBinding>,
+    named_translator_array_return_params: BTreeMap<String, ParamIndexes>,
     default_export: Option<HelperSummary>,
     default_jsx_export: Option<JsxComponentSummary>,
     default_local_export: Option<String>,
@@ -388,6 +390,7 @@ struct SourceFileIndex {
     default_record_return_export: Option<FiniteRecords>,
     default_translator_return_export: Option<TranslatorBinding>,
     default_translator_array_return_export: Option<TranslatorBinding>,
+    default_translator_array_return_params: ParamIndexes,
     default_translator_return_forwards: BTreeSet<TranslatorReturnForward>,
 }
 
@@ -1506,6 +1509,44 @@ impl ProjectIndex {
         }
     }
 
+    fn translator_array_return_params_for_forward(
+        &self,
+        path: &Path,
+        forward: &TranslatorReturnForward,
+        depth: usize,
+    ) -> ParamIndexes {
+        let Some(file) = self.files.get(path) else {
+            return BTreeSet::new();
+        };
+        match forward {
+            TranslatorReturnForward::Local(name) => file
+                .imports
+                .get(name)
+                .map(|target| {
+                    self.translator_array_return_params_for_import_at_depth(path, target, depth + 1)
+                })
+                .unwrap_or_else(|| {
+                    self.translator_array_return_params_for_local_at_depth(path, name, depth + 1)
+                }),
+            TranslatorReturnForward::NamespaceMember { namespace, name } => file
+                .namespace_imports
+                .get(namespace)
+                .map(|source| {
+                    self.translator_array_return_params_for_import_at_depth(
+                        path,
+                        &ImportTarget {
+                            source: source.clone(),
+                            imported: ImportedName::Named(name.clone()),
+                        },
+                        depth + 1,
+                    )
+                })
+                .unwrap_or_default(),
+            TranslatorReturnForward::ParameterCall { .. }
+            | TranslatorReturnForward::ForwardCall { .. } => BTreeSet::new(),
+        }
+    }
+
     fn translator_return_parameter_calls_for_local(
         &self,
         path: &Path,
@@ -1951,6 +1992,104 @@ impl ProjectIndex {
                         self.translator_array_return_for_import_at_depth(&path, target, depth + 1)
                     })
                 }),
+        }
+    }
+
+    fn translator_array_return_params_for_local(&self, path: &Path, name: &str) -> ParamIndexes {
+        self.translator_array_return_params_for_local_at_depth(path, name, 0)
+    }
+
+    fn translator_array_return_params_for_local_at_depth(
+        &self,
+        path: &Path,
+        name: &str,
+        depth: usize,
+    ) -> ParamIndexes {
+        if depth > 16 {
+            return BTreeSet::new();
+        }
+        let Some(file) = self.files.get(path) else {
+            return BTreeSet::new();
+        };
+        let mut indexes = file
+            .translator_array_return_params
+            .get(name)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(forwards) = file.translator_return_forwards.get(name) {
+            for forward in forwards {
+                indexes.extend(self.translator_array_return_params_for_forward(
+                    path,
+                    forward,
+                    depth + 1,
+                ));
+            }
+        }
+        indexes
+    }
+
+    fn translator_array_return_params_for_import(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+    ) -> ParamIndexes {
+        self.translator_array_return_params_for_import_at_depth(from, target, 0)
+    }
+
+    fn translator_array_return_params_for_import_at_depth(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+        depth: usize,
+    ) -> ParamIndexes {
+        if depth > 16 {
+            return BTreeSet::new();
+        }
+        let Some(path) = self.resolve_module(from, &target.source) else {
+            return BTreeSet::new();
+        };
+        let Some(file) = self.files.get(&path) else {
+            return BTreeSet::new();
+        };
+        match &target.imported {
+            ImportedName::Named(name) => file
+                .translator_return_export_locals
+                .get(name)
+                .map(|local| {
+                    self.translator_array_return_params_for_local_at_depth(&path, local, depth + 1)
+                })
+                .or_else(|| file.named_translator_array_return_params.get(name).cloned())
+                .or_else(|| {
+                    file.re_exports.get(name).map(|target| {
+                        self.translator_array_return_params_for_import_at_depth(
+                            &path,
+                            target,
+                            depth + 1,
+                        )
+                    })
+                })
+                .or_else(|| {
+                    file.star_re_exports.iter().find_map(|source| {
+                        let indexes = self.translator_array_return_params_for_import_at_depth(
+                            &path,
+                            &ImportTarget {
+                                source: source.clone(),
+                                imported: ImportedName::Named(name.clone()),
+                            },
+                            depth + 1,
+                        );
+                        (!indexes.is_empty()).then_some(indexes)
+                    })
+                })
+                .unwrap_or_default(),
+            ImportedName::Default => file
+                .default_local_export
+                .as_ref()
+                .map(|local| {
+                    self.translator_array_return_params_for_local_at_depth(&path, local, depth + 1)
+                })
+                .filter(|indexes| !indexes.is_empty())
+                .unwrap_or_else(|| file.default_translator_array_return_params.clone()),
         }
     }
 
@@ -7096,9 +7235,11 @@ struct TranslatorReturnCollector {
     server_namespaces: BTreeSet<String>,
     bindings: Vec<TranslatorBinding>,
     array_bindings: Vec<TranslatorBinding>,
+    array_param_indexes: ParamIndexes,
     forwards: BTreeSet<TranslatorReturnForward>,
     local_bindings: BTreeMap<String, TranslatorBinding>,
     local_array_bindings: BTreeMap<String, TranslatorBinding>,
+    local_array_params: BTreeMap<String, ParamIndexes>,
     local_parameter_calls: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     dynamic_callables: BTreeSet<String>,
     parameter_callables: BTreeMap<String, usize>,
@@ -7116,6 +7257,7 @@ struct TranslatorReturnNameState {
     server_namespace: bool,
     local_binding: Option<TranslatorBinding>,
     local_array_binding: Option<TranslatorBinding>,
+    local_array_params: Option<ParamIndexes>,
     local_parameter_calls: Option<BTreeSet<TranslatorReturnForward>>,
     dynamic_callable: bool,
     parameter_callable: Option<usize>,
@@ -7383,21 +7525,199 @@ impl TranslatorReturnCollector {
                 self.array_binding_from_expression(&logical.left),
                 self.array_binding_from_expression(&logical.right),
             ),
-            Expression::CallExpression(call)
-                if {
-                    let Some(member) = call.callee.get_member_expr() else {
-                        return None;
-                    };
-                    member.static_property_name() == Some("all")
-                        && is_identifier_expression(member.object(), "Promise")
-                } =>
-            {
-                call.arguments
-                    .first()
-                    .and_then(Argument::as_expression)
-                    .and_then(|expression| self.array_binding_from_expression(expression))
+            Expression::CallExpression(call) => {
+                let member = call.callee.get_member_expr()?;
+                let method = member.static_property_name()?;
+                if method == "all" && is_identifier_expression(member.object(), "Promise") {
+                    return call
+                        .arguments
+                        .first()
+                        .and_then(Argument::as_expression)
+                        .and_then(|expression| self.array_binding_from_expression(expression));
+                }
+                if method == "of" && is_identifier_expression(member.object(), "Array") {
+                    return merge_translator_binding_iter(call.arguments.iter().filter_map(
+                        |argument| {
+                            argument.as_expression().and_then(|expression| {
+                                self.binding_from_expression(expression)
+                                    .or_else(|| self.array_binding_from_expression(expression))
+                            })
+                        },
+                    ));
+                }
+                if method == "from" && is_identifier_expression(member.object(), "Array") {
+                    let source = call
+                        .arguments
+                        .first()
+                        .and_then(Argument::as_expression)
+                        .and_then(|expression| self.array_binding_from_expression(expression));
+                    let callback = call
+                        .arguments
+                        .get(1)
+                        .and_then(|callback| self.callback_binding_from_argument(callback));
+                    return merge_translator_binding_iter(source.into_iter().chain(callback));
+                }
+                if method == "values" && is_identifier_expression(member.object(), "Object") {
+                    return call
+                        .arguments
+                        .first()
+                        .and_then(Argument::as_expression)
+                        .and_then(|expression| self.object_binding_from_expression(expression));
+                }
+                let receiver = self.array_binding_from_expression(member.object());
+                match method.as_ref() {
+                    "concat" => {
+                        let arguments = call.arguments.iter().filter_map(|argument| {
+                            argument.as_expression().and_then(|expression| {
+                                self.binding_from_expression(expression)
+                                    .or_else(|| self.array_binding_from_expression(expression))
+                            })
+                        });
+                        merge_translator_binding_iter(receiver.into_iter().chain(arguments))
+                    }
+                    "map" | "flatMap" => {
+                        let callback = call
+                            .arguments
+                            .first()
+                            .and_then(|callback| self.callback_binding_from_argument(callback));
+                        merge_translator_binding_iter(receiver.into_iter().chain(callback))
+                    }
+                    "slice" | "filter" | "splice" | "copyWithin" | "fill" | "reverse" | "sort" => {
+                        receiver
+                    }
+                    _ => None,
+                }
             }
             _ => None,
+        }
+    }
+
+    fn callback_binding_from_argument(&self, callback: &Argument<'_>) -> Option<TranslatorBinding> {
+        let Argument::ArrowFunctionExpression(arrow) = callback else {
+            return None;
+        };
+        if !arrow.expression {
+            return None;
+        }
+        let Statement::ExpressionStatement(statement) = arrow.body.statements.first()? else {
+            return None;
+        };
+        self.binding_from_expression(&statement.expression)
+            .or_else(|| self.array_binding_from_expression(&statement.expression))
+    }
+
+    fn object_binding_from_expression(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<TranslatorBinding> {
+        let Expression::ObjectExpression(object) = expression.get_inner_expression() else {
+            return None;
+        };
+        merge_translator_binding_iter(object.properties.iter().filter_map(|property| {
+            match property {
+                ObjectPropertyKind::ObjectProperty(property) => self
+                    .binding_from_expression(&property.value)
+                    .or_else(|| self.array_binding_from_expression(&property.value))
+                    .or_else(|| self.object_binding_from_expression(&property.value)),
+                ObjectPropertyKind::SpreadProperty(spread) => {
+                    self.object_binding_from_expression(&spread.argument)
+                }
+            }
+        }))
+    }
+
+    fn array_params_from_expression(&self, expression: &Expression<'_>) -> ParamIndexes {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => self
+                .local_array_params
+                .get(identifier.name.as_str())
+                .cloned()
+                .or_else(|| {
+                    self.parameter_callables
+                        .get(identifier.name.as_str())
+                        .copied()
+                        .map(|index| BTreeSet::from([index]))
+                })
+                .unwrap_or_default(),
+            Expression::ArrayExpression(array) => {
+                let mut indexes = BTreeSet::new();
+                for element in &array.elements {
+                    let expression = match element {
+                        ArrayExpressionElement::SpreadElement(spread) => &spread.argument,
+                        _ => {
+                            let Some(expression) = element.as_expression() else {
+                                continue;
+                            };
+                            expression
+                        }
+                    };
+                    indexes.extend(self.array_params_from_expression(expression));
+                }
+                indexes
+            }
+            Expression::AwaitExpression(await_expression) => {
+                self.array_params_from_expression(&await_expression.argument)
+            }
+            Expression::ConditionalExpression(conditional) => {
+                let mut indexes = self.array_params_from_expression(&conditional.consequent);
+                indexes.extend(self.array_params_from_expression(&conditional.alternate));
+                indexes
+            }
+            Expression::LogicalExpression(logical) => {
+                let mut indexes = self.array_params_from_expression(&logical.left);
+                indexes.extend(self.array_params_from_expression(&logical.right));
+                indexes
+            }
+            Expression::CallExpression(call) => {
+                let Some(member) = call.callee.get_member_expr() else {
+                    return BTreeSet::new();
+                };
+                let Some(method) = member.static_property_name() else {
+                    return BTreeSet::new();
+                };
+                let recognized = (is_identifier_expression(member.object(), "Promise")
+                    && method == "all")
+                    || (is_identifier_expression(member.object(), "Array")
+                        && matches!(method, "from" | "of"))
+                    || (is_identifier_expression(member.object(), "Object") && method == "values")
+                    || matches!(
+                        method,
+                        "concat"
+                            | "map"
+                            | "flatMap"
+                            | "slice"
+                            | "filter"
+                            | "splice"
+                            | "copyWithin"
+                            | "fill"
+                            | "reverse"
+                            | "sort"
+                    );
+                if !recognized {
+                    return BTreeSet::new();
+                }
+                let mut indexes = self.array_params_from_expression(member.object());
+                for argument in &call.arguments {
+                    if let Some(expression) = argument.as_expression() {
+                        indexes.extend(self.array_params_from_expression(expression));
+                    }
+                }
+                indexes
+            }
+            Expression::ArrowFunctionExpression(arrow)
+                if arrow.expression
+                    && matches!(
+                        arrow.body.statements.first(),
+                        Some(Statement::ExpressionStatement(_))
+                    ) =>
+            {
+                let Some(Statement::ExpressionStatement(statement)) = arrow.body.statements.first()
+                else {
+                    return BTreeSet::new();
+                };
+                self.array_params_from_expression(&statement.expression)
+            }
+            _ => BTreeSet::new(),
         }
     }
 
@@ -7408,6 +7728,7 @@ impl TranslatorReturnCollector {
             server_namespace: self.server_namespaces.contains(name),
             local_binding: self.local_bindings.get(name).cloned(),
             local_array_binding: self.local_array_bindings.get(name).cloned(),
+            local_array_params: self.local_array_params.get(name).cloned(),
             local_parameter_calls: self.local_parameter_calls.get(name).cloned(),
             dynamic_callable: self.dynamic_callables.contains(name),
             parameter_callable: self.parameter_callables.get(name).copied(),
@@ -7420,6 +7741,7 @@ impl TranslatorReturnCollector {
         self.server_namespaces.remove(name);
         self.local_bindings.remove(name);
         self.local_array_bindings.remove(name);
+        self.local_array_params.remove(name);
         self.local_parameter_calls.remove(name);
         self.dynamic_callables.remove(name);
         self.parameter_callables.remove(name);
@@ -7431,6 +7753,7 @@ impl TranslatorReturnCollector {
         self.server_namespaces.remove(name);
         self.local_bindings.remove(name);
         self.local_array_bindings.remove(name);
+        self.local_array_params.remove(name);
         self.local_parameter_calls.remove(name);
         self.dynamic_callables.remove(name);
         self.parameter_callables.remove(name);
@@ -7454,6 +7777,7 @@ impl TranslatorReturnCollector {
         TranslatorReturnSummary {
             binding: merge_translator_binding_iter(self.bindings),
             array_binding: merge_translator_binding_iter(self.array_bindings),
+            array_param_indexes: self.array_param_indexes,
             forwards: self.forwards,
         }
     }
@@ -7463,6 +7787,7 @@ impl TranslatorReturnCollector {
 struct TranslatorReturnSummary {
     binding: Option<TranslatorBinding>,
     array_binding: Option<TranslatorBinding>,
+    array_param_indexes: ParamIndexes,
     forwards: BTreeSet<TranslatorReturnForward>,
 }
 
@@ -7500,6 +7825,11 @@ impl<'a> Visit<'a> for TranslatorReturnCollector {
                 } else {
                     self.local_array_bindings.remove(&name);
                 }
+                if let Some(indexes) = state.local_array_params {
+                    self.local_array_params.insert(name.clone(), indexes);
+                } else {
+                    self.local_array_params.remove(&name);
+                }
                 if let Some(calls) = state.local_parameter_calls {
                     self.local_parameter_calls.insert(name.clone(), calls);
                 } else {
@@ -7528,6 +7858,10 @@ impl<'a> Visit<'a> for TranslatorReturnCollector {
             .argument
             .as_ref()
             .and_then(|argument| self.array_binding_from_expression(argument));
+        if let Some(argument) = &statement.argument {
+            self.array_param_indexes
+                .extend(self.array_params_from_expression(argument));
+        }
         let unresolved = binding.is_none() && array_binding.is_none();
         if let Some(binding) = binding {
             self.bindings.push(binding);
@@ -7565,6 +7899,7 @@ impl<'a> Visit<'a> for TranslatorReturnCollector {
             let binding = self.binding_from_expression(init);
             let has_binding = binding.is_some();
             let array_binding = self.array_binding_from_expression(init);
+            let array_params = self.array_params_from_expression(init);
             let parameter_calls = self.parameter_calls_from_expression(init);
             if declarator.kind == VariableDeclarationKind::Var {
                 if let Some(binding) = binding {
@@ -7596,6 +7931,14 @@ impl<'a> Visit<'a> for TranslatorReturnCollector {
                 } else {
                     self.local_array_bindings.remove(name);
                 }
+                if array_params.is_empty() {
+                    self.local_array_params.remove(name);
+                } else {
+                    self.local_array_params
+                        .entry(name.to_string())
+                        .or_default()
+                        .extend(array_params);
+                }
             } else {
                 self.mask_name(name);
                 if let Some(binding) = binding {
@@ -7603,6 +7946,10 @@ impl<'a> Visit<'a> for TranslatorReturnCollector {
                 }
                 if let Some(binding) = array_binding {
                     self.local_array_bindings.insert(name.to_string(), binding);
+                }
+                if !array_params.is_empty() {
+                    self.local_array_params
+                        .insert(name.to_string(), array_params);
                 }
                 if !parameter_calls.is_empty() {
                     self.local_parameter_calls
@@ -7622,6 +7969,7 @@ impl<'a> Visit<'a> for TranslatorReturnCollector {
             let name = identifier.name.as_str();
             let binding = self.binding_from_expression(&expression.right);
             let array_binding = self.array_binding_from_expression(&expression.right);
+            let array_params = self.array_params_from_expression(&expression.right);
             let parameter_calls = self.parameter_calls_from_expression(&expression.right);
             if let Some(binding) = binding {
                 self.local_bindings
@@ -7652,6 +8000,14 @@ impl<'a> Visit<'a> for TranslatorReturnCollector {
             } else {
                 self.local_array_bindings.remove(name);
             }
+            if array_params.is_empty() {
+                self.local_array_params.remove(name);
+            } else {
+                self.local_array_params
+                    .entry(name.to_string())
+                    .or_default()
+                    .extend(array_params);
+            }
         }
         walk::walk_assignment_expression(self, expression);
     }
@@ -7679,6 +8035,7 @@ struct SourceIndexCollector {
     return_record_helpers: BTreeMap<String, FiniteRecords>,
     translator_return_helpers: BTreeMap<String, TranslatorBinding>,
     translator_array_return_helpers: BTreeMap<String, TranslatorBinding>,
+    translator_array_return_params: BTreeMap<String, ParamIndexes>,
     translator_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     enum_member_domains: TypeDomains,
     translation_factories: BTreeSet<String>,
@@ -7694,6 +8051,7 @@ struct SourceIndexCollector {
     default_record_return_summary: Option<FiniteRecords>,
     default_translator_return_summary: Option<TranslatorBinding>,
     default_translator_array_return_summary: Option<TranslatorBinding>,
+    default_translator_array_return_params: ParamIndexes,
     default_translator_return_forwards: BTreeSet<TranslatorReturnForward>,
     binding_scopes: Vec<IndexBindingEnvironment>,
     scope_depth: usize,
@@ -7714,6 +8072,7 @@ struct IndexBindingEnvironment {
     return_record_helpers: BTreeMap<String, FiniteRecords>,
     translator_return_helpers: BTreeMap<String, TranslatorBinding>,
     translator_array_return_helpers: BTreeMap<String, TranslatorBinding>,
+    translator_array_return_params: BTreeMap<String, ParamIndexes>,
     translator_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     enum_member_domains: TypeDomains,
 }
@@ -7735,6 +8094,10 @@ impl SourceIndexCollector {
             self.translator_array_return_helpers
                 .insert(name.to_string(), binding);
         }
+        if !summary.array_param_indexes.is_empty() {
+            self.translator_array_return_params
+                .insert(name.to_string(), summary.array_param_indexes);
+        }
         if !summary.forwards.is_empty() {
             self.translator_return_forwards
                 .insert(name.to_string(), summary.forwards);
@@ -7751,9 +8114,11 @@ impl SourceIndexCollector {
             server_namespaces: self.next_intl_server_namespaces.clone(),
             bindings: Vec::new(),
             array_bindings: Vec::new(),
+            array_param_indexes: BTreeSet::new(),
             forwards: BTreeSet::new(),
             local_bindings: BTreeMap::new(),
             local_array_bindings: BTreeMap::new(),
+            local_array_params: BTreeMap::new(),
             local_parameter_calls: BTreeMap::new(),
             dynamic_callables: BTreeSet::new(),
             parameter_callables: BTreeMap::new(),
@@ -7815,12 +8180,14 @@ impl SourceIndexCollector {
         {
             let binding = collector.binding_from_expression(&statement.expression);
             let array_binding = collector.array_binding_from_expression(&statement.expression);
+            let array_param_indexes = collector.array_params_from_expression(&statement.expression);
             let forwards = (binding.is_none() && array_binding.is_none())
                 .then(|| collector.forwards_from_expression(&statement.expression))
                 .unwrap_or_default();
             return TranslatorReturnSummary {
                 binding,
                 array_binding,
+                array_param_indexes,
                 forwards,
             };
         }
@@ -7838,6 +8205,7 @@ impl SourceIndexCollector {
         let mut named_record_return_exports = BTreeMap::new();
         let mut named_translator_return_exports = BTreeMap::new();
         let mut named_translator_array_return_exports = BTreeMap::new();
+        let mut named_translator_array_return_params = BTreeMap::new();
         for (exported, local) in self.export_locals {
             if let Some(summary) = self.helpers.get(&local) {
                 named_exports.insert(exported.clone(), summary.clone());
@@ -7861,7 +8229,10 @@ impl SourceIndexCollector {
                 named_translator_return_exports.insert(exported.clone(), binding.clone());
             }
             if let Some(binding) = self.translator_array_return_helpers.get(&local) {
-                named_translator_array_return_exports.insert(exported, binding.clone());
+                named_translator_array_return_exports.insert(exported.clone(), binding.clone());
+            }
+            if let Some(indexes) = self.translator_array_return_params.get(&local) {
+                named_translator_array_return_params.insert(exported.clone(), indexes.clone());
             }
         }
 
@@ -7909,6 +8280,15 @@ impl SourceIndexCollector {
                     .as_ref()
                     .and_then(|name| self.translator_array_return_helpers.get(name).cloned())
             });
+        let default_translator_array_return_params =
+            if self.default_translator_array_return_params.is_empty() {
+                default_local
+                    .as_ref()
+                    .and_then(|name| self.translator_array_return_params.get(name).cloned())
+                    .unwrap_or_default()
+            } else {
+                self.default_translator_array_return_params
+            };
 
         SourceFileIndex {
             imports: self.imports,
@@ -7925,6 +8305,7 @@ impl SourceIndexCollector {
             return_record_helpers: self.return_record_helpers,
             translator_return_helpers: self.translator_return_helpers,
             translator_array_return_helpers: self.translator_array_return_helpers,
+            translator_array_return_params: self.translator_array_return_params,
             translator_return_forwards: self.translator_return_forwards,
             translator_return_export_locals,
             named_exports,
@@ -7935,6 +8316,7 @@ impl SourceIndexCollector {
             named_record_return_exports,
             named_translator_return_exports,
             named_translator_array_return_exports,
+            named_translator_array_return_params,
             default_export,
             default_jsx_export,
             default_local_export,
@@ -7944,6 +8326,7 @@ impl SourceIndexCollector {
             default_record_return_export,
             default_translator_return_export,
             default_translator_array_return_export,
+            default_translator_array_return_params,
             default_translator_return_forwards: self.default_translator_return_forwards,
         }
     }
@@ -7963,6 +8346,7 @@ impl SourceIndexCollector {
             return_record_helpers: self.return_record_helpers.clone(),
             translator_return_helpers: self.translator_return_helpers.clone(),
             translator_array_return_helpers: self.translator_array_return_helpers.clone(),
+            translator_array_return_params: self.translator_array_return_params.clone(),
             translator_return_forwards: self.translator_return_forwards.clone(),
             enum_member_domains: self.enum_member_domains.clone(),
         }
@@ -7982,6 +8366,7 @@ impl SourceIndexCollector {
         self.return_record_helpers = environment.return_record_helpers;
         self.translator_return_helpers = environment.translator_return_helpers;
         self.translator_array_return_helpers = environment.translator_array_return_helpers;
+        self.translator_array_return_params = environment.translator_array_return_params;
         self.translator_return_forwards = environment.translator_return_forwards;
         self.enum_member_domains = environment.enum_member_domains;
     }
@@ -8234,6 +8619,8 @@ impl SourceIndexCollector {
                 self.default_translator_return_summary = translator_return.binding.clone();
                 self.default_translator_array_return_summary =
                     translator_return.array_binding.clone();
+                self.default_translator_array_return_params =
+                    translator_return.array_param_indexes.clone();
                 self.default_translator_return_forwards = translator_return.forwards.clone();
                 if let Some(id) = &function.id {
                     self.record_helper(
@@ -8287,6 +8674,7 @@ impl SourceIndexCollector {
                 let translator_return = self.translator_return_summary_from_arrow(arrow);
                 self.default_translator_return_summary = translator_return.binding;
                 self.default_translator_array_return_summary = translator_return.array_binding;
+                self.default_translator_array_return_params = translator_return.array_param_indexes;
                 self.default_translator_return_forwards = translator_return.forwards;
             }
             ExportDefaultDeclarationKind::FunctionExpression(function) => {
@@ -8333,6 +8721,7 @@ impl SourceIndexCollector {
                     .unwrap_or_default();
                 self.default_translator_return_summary = translator_return.binding;
                 self.default_translator_array_return_summary = translator_return.array_binding;
+                self.default_translator_array_return_params = translator_return.array_param_indexes;
                 self.default_translator_return_forwards = translator_return.forwards;
             }
             ExportDefaultDeclarationKind::ArrayExpression(array) => {
@@ -8660,6 +9049,7 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                         (!forwards.is_empty()).then_some(TranslatorReturnSummary {
                             binding: None,
                             array_binding: None,
+                            array_param_indexes: BTreeSet::new(),
                             forwards,
                         })
                     }
@@ -10261,33 +10651,58 @@ impl SourceUsageCollector {
             return self.translator_argument_array_from_expression(source);
         }
         if let (Some(file), Some(project)) = (&self.file_index, &self.project) {
-            let binding = if let Some(callee) = self.callee_identifier(&call.callee) {
-                project
-                    .translator_array_return_for_local(&self.path, callee)
-                    .or_else(|| {
-                        file.imports.get(callee).and_then(|target| {
-                            project.translator_array_return_for_import(&self.path, target)
-                        })
-                    })
-            } else if let Some(member) = call.callee.get_member_expr() {
-                member
-                    .object()
-                    .get_identifier_reference()
-                    .zip(member.static_property_name())
-                    .and_then(|(namespace, name)| {
-                        let source = file.namespace_imports.get(namespace.name.as_str())?;
-                        project.translator_array_return_for_import(
-                            &self.path,
-                            &ImportTarget {
+            let (binding, param_indexes) =
+                if let Some(callee) = self.callee_identifier(&call.callee) {
+                    if let Some(target) = file.imports.get(callee) {
+                        (
+                            project.translator_array_return_for_import(&self.path, target),
+                            project.translator_array_return_params_for_import(&self.path, target),
+                        )
+                    } else {
+                        (
+                            project.translator_array_return_for_local(&self.path, callee),
+                            project.translator_array_return_params_for_local(&self.path, callee),
+                        )
+                    }
+                } else if let Some(member) = call.callee.get_member_expr() {
+                    let target = member
+                        .object()
+                        .get_identifier_reference()
+                        .zip(member.static_property_name())
+                        .and_then(|(namespace, name)| {
+                            let source = file.namespace_imports.get(namespace.name.as_str())?;
+                            Some(ImportTarget {
                                 source: source.clone(),
                                 imported: ImportedName::Named(name.to_string()),
-                            },
+                            })
+                        });
+                    target.as_ref().map_or((None, BTreeSet::new()), |target| {
+                        (
+                            project.translator_array_return_for_import(&self.path, target),
+                            project.translator_array_return_params_for_import(&self.path, target),
                         )
                     })
-            } else {
-                None
-            };
-            if let Some(binding) = binding {
+                } else {
+                    (None, BTreeSet::new())
+                };
+            let mut bindings = binding.into_iter().collect::<Vec<_>>();
+            for index in param_indexes {
+                let Some(argument) = call.arguments.get(index) else {
+                    continue;
+                };
+                let binding = self.translator_binding_from_argument(argument).or_else(|| {
+                    let expression = match argument {
+                        Argument::SpreadElement(spread) => &spread.argument,
+                        _ => argument.as_expression()?,
+                    };
+                    self.translator_argument_array_from_expression(expression)
+                        .and_then(|array| {
+                            merge_translator_binding_iter(array.bindings.into_iter().flatten())
+                        })
+                });
+                bindings.extend(binding);
+            }
+            if let Some(binding) = merge_translator_binding_iter(bindings) {
                 return Some(TranslatorArgumentArray {
                     bindings: vec![Some(binding)],
                     safe_layout: false,
@@ -10298,6 +10713,9 @@ impl SourceUsageCollector {
         }
         let member = call.callee.get_member_expr()?;
         let method = member.static_property_name()?;
+        if method == "of" && is_identifier_expression(member.object(), "Array") {
+            return Some(self.translator_argument_array_from_arguments(&call.arguments, 0));
+        }
         if method == "values" && is_identifier_expression(member.object(), "Object") {
             let source = call.arguments.first()?.as_expression()?;
             let bindings = self.translator_object_bindings_from_expression(source)?;
@@ -11395,7 +11813,9 @@ impl SourceUsageCollector {
             };
             matches!(
                 (object.name.as_str(), member.static_property_name()),
-                ("Promise", Some("all" | "allSettled")) | ("Object", Some("values"))
+                ("Promise", Some("all" | "allSettled"))
+                    | ("Object", Some("values"))
+                    | ("Array", Some("from" | "of"))
             ) && self
                 .file_index
                 .as_ref()
@@ -14259,6 +14679,24 @@ mod tests {
     }
 
     #[test]
+    fn array_of_preserves_translator_layouts() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const translators = Array.of(common, settings);
+            translators[0]('common');
+            translators[1]('settings');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.common"));
+        assert!(scan.used_ids.contains("settings.settings"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
     fn imported_helpers_preserve_translator_array_returns() {
         let dir = tempfile::tempdir().expect("tempdir");
         let main = dir.path().join("main.ts");
@@ -14290,6 +14728,47 @@ mod tests {
             collect_usage_from_files(dir.path(), &[main, helper, barrel]).expect("scan project");
 
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 4));
+    }
+
+    #[test]
+    fn imported_helpers_preserve_transformed_and_parameter_array_returns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("main.ts");
+        let helper = dir.path().join("helper.ts");
+        fs::write(
+            &main,
+            r#"
+            import {useTranslations} from 'next-intl';
+            import {asArray, getTransformed, identity} from './helper';
+            const common = useTranslations('common');
+            const transformed = getTransformed();
+            const wrapped = asArray(common);
+            const forwarded = identity([common]);
+            transformed[0]('transformed');
+            wrapped[0]('wrapped');
+            forwarded[0]('forwarded');
+            "#,
+        )
+        .expect("write main source");
+        fs::write(
+            &helper,
+            r#"
+            import {getTranslations} from 'next-intl/server';
+            export const getTransformed = () =>
+              Array.of(getTranslations('settings')).slice();
+            export const asArray = format => [format];
+            export function identity(values) {
+              return values;
+            }
+            "#,
+        )
+        .expect("write helper source");
+
+        let scan = collect_usage_from_files(dir.path(), &[main, helper]).expect("scan project");
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 8));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 9));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 10));
     }
 
     #[test]
