@@ -3513,6 +3513,31 @@ fn merge_translator_binding_iter(
         .reduce(|left, right| merge_translator_bindings(&left, &right))
 }
 
+fn merge_translator_argument_arrays(
+    left: TranslatorArgumentArray,
+    right: TranslatorArgumentArray,
+) -> TranslatorArgumentArray {
+    let same_length = left.bindings.len() == right.bindings.len();
+    let length = left.bindings.len().max(right.bindings.len());
+    let mut bindings = Vec::with_capacity(length);
+    for index in 0..length {
+        let left = left.bindings.get(index).cloned().flatten();
+        let right = right.bindings.get(index).cloned().flatten();
+        bindings.push(match (left, right) {
+            (Some(left), Some(right)) => Some(merge_translator_bindings(&left, &right)),
+            (Some(binding), None) | (None, Some(binding)) => Some(merge_translator_bindings(
+                &binding,
+                &translator_binding_from_namespace_arg(NamespaceArg::Dynamic),
+            )),
+            (None, None) => None,
+        });
+    }
+    TranslatorArgumentArray {
+        bindings,
+        safe_layout: same_length && left.safe_layout && right.safe_layout,
+    }
+}
+
 fn module_export_name<'a>(name: &'a ModuleExportName<'a>) -> Option<&'a str> {
     match name {
         ModuleExportName::IdentifierName(identifier) => Some(identifier.name.as_str()),
@@ -9452,31 +9477,34 @@ impl SourceUsageCollector {
                 .cloned(),
             Expression::ConditionalExpression(conditional) => {
                 let consequent =
-                    self.translator_argument_array_from_expression(&conditional.consequent)?;
+                    self.translator_argument_array_from_expression(&conditional.consequent);
                 let alternate =
-                    self.translator_argument_array_from_expression(&conditional.alternate)?;
-                if consequent.bindings.len() != alternate.bindings.len() {
-                    return Some(TranslatorArgumentArray {
-                        bindings: Vec::new(),
-                        safe_layout: false,
-                    });
+                    self.translator_argument_array_from_expression(&conditional.alternate);
+                match (consequent, alternate) {
+                    (Some(consequent), Some(alternate)) => {
+                        Some(merge_translator_argument_arrays(consequent, alternate))
+                    }
+                    (Some(mut array), None) | (None, Some(mut array)) => {
+                        array.safe_layout = false;
+                        Some(array)
+                    }
+                    (None, None) => None,
                 }
-                let bindings = consequent
-                    .bindings
-                    .into_iter()
-                    .zip(alternate.bindings)
-                    .map(|(left, right)| match (left, right) {
-                        (Some(left), Some(right)) => Some(merge_translator_bindings(&left, &right)),
-                        (Some(_), None) | (None, Some(_)) => {
-                            Some(translator_binding_from_namespace_arg(NamespaceArg::Dynamic))
+            }
+            Expression::LogicalExpression(logical) => {
+                let left = self.translator_argument_array_from_expression(&logical.left);
+                let right = self.translator_argument_array_from_expression(&logical.right);
+                match logical.operator {
+                    LogicalOperator::And => right,
+                    LogicalOperator::Or | LogicalOperator::Coalesce => match (left, right) {
+                        (Some(left), _) => Some(left),
+                        (None, Some(mut right)) => {
+                            right.safe_layout = false;
+                            Some(right)
                         }
                         (None, None) => None,
-                    })
-                    .collect();
-                Some(TranslatorArgumentArray {
-                    bindings,
-                    safe_layout: consequent.safe_layout && alternate.safe_layout,
-                })
+                    },
+                }
             }
             _ => None,
         }
@@ -10938,7 +10966,7 @@ impl SourceUsageCollector {
     fn bind_pattern_translator_properties(
         &mut self,
         pattern: &BindingPattern<'_>,
-        bindings: &BTreeMap<String, TranslatorBinding>,
+        bindings: &TranslatorObjectBinding,
     ) {
         let BindingPattern::ObjectPattern(object) = pattern else {
             return;
@@ -10953,10 +10981,78 @@ impl SourceUsageCollector {
             let Some(binding_name) = binding_identifier_name(&property.value) else {
                 continue;
             };
-            if let Some(binding) = bindings.get(property_name.as_ref()) {
+            if let Some(binding) = bindings.bindings.get(property_name.as_ref()) {
                 self.translators
                     .insert(binding_name.to_string(), binding.clone());
             }
+        }
+        if let Some(rest) = &object.rest
+            && let Some(rest_name) = binding_identifier_name(&rest.argument)
+        {
+            let mut residual = bindings.clone();
+            for property in &object.properties {
+                if property.computed {
+                    continue;
+                }
+                if let Some(property_name) = property.key.static_name() {
+                    residual.remove_property(property_name.as_ref());
+                }
+            }
+            self.translator_object_bindings
+                .insert(rest_name.to_string(), residual);
+        }
+    }
+
+    fn bind_pattern_translator_array(
+        &mut self,
+        pattern: &BindingPattern<'_>,
+        array: &TranslatorArgumentArray,
+    ) {
+        let BindingPattern::ArrayPattern(pattern) = pattern else {
+            return;
+        };
+        let uncertain_binding = (!array.safe_layout)
+            .then(|| {
+                merge_translator_binding_iter(array.bindings.iter().flatten().cloned()).map(
+                    |binding| {
+                        merge_translator_bindings(
+                            &binding,
+                            &translator_binding_from_namespace_arg(NamespaceArg::Dynamic),
+                        )
+                    },
+                )
+            })
+            .flatten();
+        for (index, element) in pattern.elements.iter().enumerate() {
+            let Some(name) = element.as_ref().and_then(binding_identifier_name) else {
+                continue;
+            };
+            if let Some(binding) = uncertain_binding
+                .as_ref()
+                .or_else(|| array.bindings.get(index).and_then(Option::as_ref))
+            {
+                self.translators.insert(name.to_string(), binding.clone());
+            }
+        }
+        if let Some(rest) = &pattern.rest
+            && let Some(name) = binding_identifier_name(&rest.argument)
+        {
+            self.translator_argument_arrays.insert(
+                name.to_string(),
+                TranslatorArgumentArray {
+                    bindings: if array.safe_layout {
+                        array
+                            .bindings
+                            .iter()
+                            .skip(pattern.elements.len())
+                            .cloned()
+                            .collect()
+                    } else {
+                        array.bindings.clone()
+                    },
+                    safe_layout: array.safe_layout,
+                },
+            );
         }
     }
 }
@@ -11124,6 +11220,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         let translator_argument_array_alias = declarator
             .init
             .as_ref()
+            .filter(|_| binding_identifier_name(&declarator.id).is_some())
             .and_then(|init| init.get_inner_expression().get_identifier_reference())
             .map(|identifier| identifier.name.to_string());
         let translator_argument_array = translator_argument_array.map(|mut array| {
@@ -11152,11 +11249,14 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         }
         self.track_destructured_translator_bindings(&declarator.id);
         if let Some(bindings) = translator_object_bindings {
-            self.bind_pattern_translator_properties(&declarator.id, &bindings.bindings);
+            self.bind_pattern_translator_properties(&declarator.id, &bindings);
             if let Some(name) = binding_identifier_name(&declarator.id) {
                 self.translator_object_bindings
                     .insert(name.to_string(), bindings);
             }
+        }
+        if let Some(bindings) = &translator_argument_array {
+            self.bind_pattern_translator_array(&declarator.id, bindings);
         }
         if let (Some(name), Some(bindings)) = (
             binding_identifier_name(&declarator.id),
@@ -14441,6 +14541,63 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
 
         assert!(scan.used_ids.contains("common.conditional"));
         assert!(scan.used_ids.contains("common.fallback"));
+    }
+
+    #[test]
+    fn logical_expressions_preserve_translator_arrays() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const retained = [common] ?? runtimeList;
+            retained.forEach(format => format('retained'));
+            const conditional = enabled && [settings];
+            conditional.forEach(format => format('conditional'));
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.retained"));
+        assert!(scan.used_ids.contains("settings.conditional"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn array_destructuring_binds_translators_and_rest_arrays() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const translators = [common, settings];
+            const [primary, ...rest] = translators;
+            primary('primary');
+            rest.forEach(format => format('rest'));
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.primary"));
+        assert!(scan.used_ids.contains("settings.rest"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn object_rest_destructuring_preserves_residual_translators() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const translators = {common, settings};
+            const {common: primary, ...rest} = translators;
+            primary('primary');
+            Object.values(rest).forEach(format => format('rest'));
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.primary"));
+        assert!(scan.used_ids.contains("settings.rest"));
+        assert!(scan.dynamic_usages.is_empty());
     }
 
     #[test]
