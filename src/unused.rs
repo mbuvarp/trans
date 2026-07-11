@@ -188,6 +188,7 @@ enum ImportedName {
 #[derive(Debug, Clone, Default)]
 struct HelperSummary {
     param_usages: Vec<HelperParamUsage>,
+    forwards: Vec<HelperForward>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +197,13 @@ struct HelperParamUsage {
     keys: Option<FiniteStrings>,
     query: Option<HelperKeyQuery>,
     translator_like: bool,
+}
+
+#[derive(Debug, Clone)]
+struct HelperForward {
+    callee: String,
+    argument_array: ParamArgumentArray,
+    fallback_params: ParamIndexes,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1149,6 +1157,77 @@ impl ProjectIndex {
         self.helper_for_import_at_depth(from, target, 0)
     }
 
+    fn helper_for_local(&self, path: &Path, name: &str) -> Option<HelperSummary> {
+        self.helper_for_local_at_depth(path, name, 0)
+    }
+
+    fn helper_for_local_at_depth(
+        &self,
+        path: &Path,
+        name: &str,
+        depth: usize,
+    ) -> Option<HelperSummary> {
+        if depth > 16 {
+            return None;
+        }
+        let summary = self.files.get(path)?.helpers.get(name)?.clone();
+        Some(self.expand_helper_summary(path, summary, depth + 1))
+    }
+
+    fn expand_helper_summary(
+        &self,
+        path: &Path,
+        mut summary: HelperSummary,
+        depth: usize,
+    ) -> HelperSummary {
+        let forwards = std::mem::take(&mut summary.forwards);
+        for forward in forwards {
+            let target = if depth <= 16 {
+                self.files.get(path).and_then(|file| {
+                    if file.helpers.contains_key(&forward.callee) {
+                        self.helper_for_local_at_depth(path, &forward.callee, depth + 1)
+                    } else {
+                        file.imports.get(&forward.callee).and_then(|target| {
+                            self.helper_for_import_at_depth(path, target, depth + 1)
+                        })
+                    }
+                })
+            } else {
+                None
+            };
+
+            if forward.argument_array.safe_layout {
+                if let Some(target) = target {
+                    for usage in target.param_usages {
+                        let Some(indexes) = forward.argument_array.bindings.get(usage.param_index)
+                        else {
+                            continue;
+                        };
+                        for param_index in indexes {
+                            summary.param_usages.push(HelperParamUsage {
+                                param_index: *param_index,
+                                keys: usage.keys.clone(),
+                                query: usage.query.clone(),
+                                translator_like: usage.translator_like,
+                            });
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            for param_index in forward.fallback_params {
+                summary.param_usages.push(HelperParamUsage {
+                    param_index,
+                    keys: None,
+                    query: None,
+                    translator_like: true,
+                });
+            }
+        }
+        summary
+    }
+
     fn helper_for_import_at_depth(
         &self,
         from: &Path,
@@ -1161,12 +1240,19 @@ impl ProjectIndex {
         let path = self.resolve_module(from, &target.source)?;
         let file = self.files.get(&path)?;
         match &target.imported {
-            ImportedName::Named(name) => file.named_exports.get(name).cloned().or_else(|| {
-                file.re_exports
-                    .get(name)
-                    .and_then(|target| self.helper_for_import_at_depth(&path, target, depth + 1))
-            }),
-            ImportedName::Default => file.default_export.clone(),
+            ImportedName::Named(name) => {
+                if let Some(summary) = file.named_exports.get(name).cloned() {
+                    Some(self.expand_helper_summary(&path, summary, depth + 1))
+                } else {
+                    file.re_exports.get(name).and_then(|target| {
+                        self.helper_for_import_at_depth(&path, target, depth + 1)
+                    })
+                }
+            }
+            ImportedName::Default => file
+                .default_export
+                .clone()
+                .map(|summary| self.expand_helper_summary(&path, summary, depth + 1)),
         }
     }
 
@@ -1884,6 +1970,35 @@ fn helper_summary_from_expression_with_context(
             source_context,
         ),
         Expression::Identifier(identifier) => helpers.get(identifier.name.as_str()).cloned(),
+        Expression::ConditionalExpression(conditional) => {
+            let mut consequent = helper_summary_from_expression_with_context(
+                &conditional.consequent,
+                helpers,
+                finite_constants,
+                finite_iterables,
+                finite_object_maps,
+                finite_record_constants,
+                finite_record_iterables,
+                finite_record_maps,
+                enum_member_domains,
+                source_context,
+            )?;
+            let alternate = helper_summary_from_expression_with_context(
+                &conditional.alternate,
+                helpers,
+                finite_constants,
+                finite_iterables,
+                finite_object_maps,
+                finite_record_constants,
+                finite_record_iterables,
+                finite_record_maps,
+                enum_member_domains,
+                source_context,
+            )?;
+            consequent.param_usages.extend(alternate.param_usages);
+            consequent.forwards.extend(alternate.forwards);
+            Some(consequent)
+        }
         Expression::CallExpression(call) => bound_helper_summary_from_call(call, helpers),
         _ => None,
     }
@@ -1923,6 +2038,7 @@ fn bound_helper_summary_from_call(
                     })
                 })
                 .collect(),
+            forwards: Vec::new(),
         });
     }
     let bound_count = call.arguments.len().saturating_sub(1);
@@ -1938,6 +2054,7 @@ fn bound_helper_summary_from_call(
                 translator_like: usage.translator_like,
             })
             .collect(),
+        forwards: Vec::new(),
     })
 }
 
@@ -2048,6 +2165,7 @@ fn helper_summary_from_body_with_context(
         param_argument_arrays: BTreeMap::new(),
         source_context: source_context.cloned(),
         usages: Vec::new(),
+        forwards: Vec::new(),
         jsx_forwards: Vec::new(),
         binding_scopes: Vec::new(),
         injected_bindings: BTreeSet::new(),
@@ -2064,6 +2182,7 @@ fn helper_summary_from_body_with_context(
 
     HelperSummary {
         param_usages: collector.usages,
+        forwards: collector.forwards,
     }
 }
 
@@ -2116,6 +2235,7 @@ fn jsx_component_summary_from_body(
         param_argument_arrays: BTreeMap::new(),
         source_context: Some(source_context.clone()),
         usages: Vec::new(),
+        forwards: Vec::new(),
         jsx_forwards: Vec::new(),
         binding_scopes: Vec::new(),
         injected_bindings: BTreeSet::new(),
@@ -3946,6 +4066,7 @@ struct HelperBodyCollector {
     enum_member_domains: TypeDomains,
     param_argument_arrays: BTreeMap<String, ParamArgumentArray>,
     usages: Vec<HelperParamUsage>,
+    forwards: Vec<HelperForward>,
     jsx_forwards: Vec<HelperJsxForward>,
     binding_scopes: Vec<HelperScopeFrame>,
     injected_bindings: BTreeSet<String>,
@@ -3994,6 +4115,29 @@ impl<'a> Visit<'a> for IdentifierReferenceCollector {
 
 fn referenced_identifier_names(expression: &Expression<'_>) -> BTreeSet<String> {
     let mut collector = IdentifierReferenceCollector::default();
+    collector.visit_expression(expression);
+    collector.names
+}
+
+#[derive(Default)]
+struct ForwardedIdentifierCollector {
+    names: BTreeSet<String>,
+}
+
+impl<'a> Visit<'a> for ForwardedIdentifierCollector {
+    fn visit_identifier_reference(&mut self, identifier: &IdentifierReference<'a>) {
+        self.names.insert(identifier.name.to_string());
+    }
+
+    fn visit_call_expression(&mut self, _call: &CallExpression<'a>) {}
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+
+    fn visit_arrow_function_expression(&mut self, _arrow: &ArrowFunctionExpression<'a>) {}
+}
+
+fn forwarded_identifier_names(expression: &Expression<'_>) -> BTreeSet<String> {
+    let mut collector = ForwardedIdentifierCollector::default();
     collector.visit_expression(expression);
     collector.names
 }
@@ -4359,6 +4503,70 @@ impl HelperBodyCollector {
                 keys: usage.keys.clone(),
                 query: usage.query.clone(),
                 translator_like: usage.translator_like,
+            });
+        }
+    }
+
+    fn record_unresolved_helper_argument_usages(&mut self, call: &CallExpression<'_>) {
+        if let Some(callee) = call
+            .callee
+            .get_inner_expression()
+            .get_identifier_reference()
+            .map(|identifier| identifier.name.to_string())
+        {
+            let argument_array = self.param_argument_array_from_arguments(&call.arguments, 0);
+            let fallback_params = if argument_array.safe_layout {
+                argument_array
+                    .bindings
+                    .iter()
+                    .flat_map(|indexes| indexes.iter().copied())
+                    .collect()
+            } else {
+                self.param_names.values().copied().collect()
+            };
+            self.forwards.push(HelperForward {
+                callee,
+                argument_array,
+                fallback_params,
+            });
+            return;
+        }
+
+        let mut indexes = BTreeSet::new();
+        for argument in &call.arguments {
+            match argument {
+                Argument::SpreadElement(spread) => {
+                    if let Some(array) = self.param_argument_array_from_expression(&spread.argument)
+                    {
+                        if array.safe_layout {
+                            for element in array.bindings {
+                                indexes.extend(element);
+                            }
+                        } else {
+                            indexes.extend(self.param_names.values().copied());
+                        }
+                    } else {
+                        indexes.extend(self.param_names.values().copied());
+                    }
+                }
+                _ => {
+                    let Some(expression) = argument.as_expression() else {
+                        continue;
+                    };
+                    for name in forwarded_identifier_names(expression) {
+                        if let Some(index) = self.param_names.get(&name) {
+                            indexes.insert(*index);
+                        }
+                    }
+                }
+            }
+        }
+        for param_index in indexes {
+            self.usages.push(HelperParamUsage {
+                param_index,
+                keys: None,
+                query: None,
+                translator_like: true,
             });
         }
     }
@@ -4934,9 +5142,12 @@ impl<'a> Visit<'a> for HelperBodyCollector {
             let summary = self.helper_summary_for_callee(member.object())?;
             Some((method.to_string(), summary))
         });
-        if let Some((method, summary)) = member_helper {
+        let helper_usage_resolved = if let Some((method, summary)) = member_helper {
             match method.as_str() {
-                "call" | "bind" => self.apply_helper_summary_with_offset(call, &summary, 1),
+                "call" | "bind" => {
+                    self.apply_helper_summary_with_offset(call, &summary, 1);
+                    true
+                }
                 "apply" => {
                     let argument_array = call
                         .arguments
@@ -4950,11 +5161,18 @@ impl<'a> Visit<'a> for HelperBodyCollector {
                             safe_layout: false,
                         });
                     self.apply_helper_summary_from_param_array(&argument_array, &summary);
+                    true
                 }
-                _ => {}
+                _ => false,
             }
         } else if let Some(summary) = self.helper_summary_for_callee(&call.callee) {
             self.apply_helper_summary_with_offset(call, &summary, 0);
+            true
+        } else {
+            false
+        };
+        if !helper_usage_resolved {
+            self.record_unresolved_helper_argument_usages(call);
         }
 
         if let Some(param_index) = self.callee_param_index(&call.callee) {
@@ -7115,8 +7333,11 @@ impl SourceUsageCollector {
     fn helper_summary_for_callee(&self, expression: &Expression<'_>) -> Option<HelperSummary> {
         let callee = self.callee_identifier(expression)?;
         if let Some(file_index) = &self.file_index {
-            if let Some(summary) = file_index.helper_for_local(callee) {
-                return Some(summary);
+            if file_index.helpers.contains_key(callee) {
+                if let Some(project) = &self.project {
+                    return project.helper_for_local(&self.path, callee);
+                }
+                return file_index.helper_for_local(callee);
             }
             if let Some(target) = file_index.imports.get(callee) {
                 if let Some(project) = &self.project {
@@ -8852,6 +9073,93 @@ mod tests {
               const bound = inner.bind(null, 'prefix');
               const alias = bound;
               return alias(translate, key);
+            }
+            const t = useTranslations('common');
+            outer(t, runtimeKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn forward_declared_helpers_preserve_wrapper_parameter_usages() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function outer(translate, key) {
+              return inner(translate, key);
+            }
+            function inner(translate, key) {
+              return translate(key);
+            }
+            const t = useTranslations('common');
+            outer(t, runtimeKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn imported_helpers_preserve_wrapper_parameter_usages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("main.ts");
+        let helper = dir.path().join("helper.ts");
+        fs::write(
+            &main,
+            r#"
+            import {useTranslations} from 'next-intl';
+            import {inner} from './helper';
+            function outer(translate, key) {
+              return inner(translate, key);
+            }
+            const t = useTranslations('common');
+            outer(t, runtimeKey);
+            "#,
+        )
+        .expect("write main source");
+        fs::write(
+            &helper,
+            r#"
+            export function inner(translate, key) {
+              return translate(key);
+            }
+            "#,
+        )
+        .expect("write helper source");
+
+        let scan = collect_usage_from_files(dir.path(), &[main, helper]).expect("scan project");
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn conditional_helper_aliases_merge_parameter_usages() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function shortLabel(translate, key) {
+              return translate(key);
+            }
+            function longLabel(translate, key) {
+              return translate(key);
+            }
+            function outer(translate, key) {
+              const label = compact ? shortLabel : longLabel;
+              label(translate, key);
             }
             const t = useTranslations('common');
             outer(t, runtimeKey);
