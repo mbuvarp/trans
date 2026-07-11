@@ -13,11 +13,11 @@ use oxc_ast::ast::{
     ExportDefaultDeclarationKind, ExportNamedDeclaration, Expression, ForOfStatement,
     ForStatementLeft, Function, FunctionBody, FunctionType, IdentifierReference, ImportDeclaration,
     ImportDeclarationSpecifier, JSXAttributeItem, JSXAttributeName, JSXAttributeValue,
-    JSXElementName, JSXExpression, JSXOpeningElement, ModuleExportName, ObjectExpression,
-    ObjectPropertyKind, PropertyKind, ReturnStatement, Statement, StaticMemberExpression,
-    TSInterfaceDeclaration, TSLiteral, TSSignature, TSType, TSTypeAliasDeclaration, TSTypeName,
-    TSTypeOperatorOperator, TSTypeQueryExprName, TemplateLiteral, VariableDeclaration,
-    VariableDeclarationKind, VariableDeclarator,
+    JSXElementName, JSXExpression, JSXMemberExpressionObject, JSXOpeningElement, ModuleExportName,
+    ObjectExpression, ObjectPropertyKind, PropertyKind, ReturnStatement, Statement,
+    StaticMemberExpression, TSInterfaceDeclaration, TSLiteral, TSSignature, TSType,
+    TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator, TSTypeQueryExprName,
+    TemplateLiteral, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -154,6 +154,7 @@ struct ProjectIndex {
 #[derive(Debug, Clone, Default)]
 struct SourceFileIndex {
     imports: BTreeMap<String, ImportTarget>,
+    namespace_imports: BTreeMap<String, String>,
     re_exports: BTreeMap<String, ImportTarget>,
     star_re_exports: Vec<String>,
     dependency_sources: BTreeSet<String>,
@@ -1315,6 +1316,25 @@ impl ProjectIndex {
         } else {
             self.jsx_component_target_for_import(from, file.imports.get(name)?, 0)?
         };
+        self.expand_jsx_component_summary(&path, summary, 0)
+    }
+
+    fn jsx_component_for_namespace_member(
+        &self,
+        from: &Path,
+        namespace: &str,
+        name: &str,
+    ) -> Option<JsxComponentSummary> {
+        let file = self.files.get(from)?;
+        let source = file.namespace_imports.get(namespace)?;
+        let (path, summary) = self.jsx_component_target_for_import(
+            from,
+            &ImportTarget {
+                source: source.clone(),
+                imported: ImportedName::Named(name.to_string()),
+            },
+            0,
+        )?;
         self.expand_jsx_component_summary(&path, summary, 0)
     }
 
@@ -2715,6 +2735,14 @@ fn merge_translator_bindings(
     } else {
         translator_binding_from_namespace_arg(NamespaceArg::Finite(namespaces))
     }
+}
+
+fn merge_translator_binding_iter(
+    bindings: impl IntoIterator<Item = TranslatorBinding>,
+) -> Option<TranslatorBinding> {
+    bindings
+        .into_iter()
+        .reduce(|left, right| merge_translator_bindings(&left, &right))
 }
 
 fn module_export_name<'a>(name: &'a ModuleExportName<'a>) -> Option<&'a str> {
@@ -5666,6 +5694,7 @@ impl<'a> Visit<'a> for ReturnValueCollector {
 struct SourceIndexCollector {
     source_context: SourceQueryContext,
     imports: BTreeMap<String, ImportTarget>,
+    namespace_imports: BTreeMap<String, String>,
     re_exports: BTreeMap<String, ImportTarget>,
     star_re_exports: Vec<String>,
     dependency_sources: BTreeSet<String>,
@@ -5777,6 +5806,7 @@ impl SourceIndexCollector {
 
         SourceFileIndex {
             imports: self.imports,
+            namespace_imports: self.namespace_imports,
             re_exports: self.re_exports,
             star_re_exports: self.star_re_exports,
             dependency_sources: self.dependency_sources,
@@ -6222,7 +6252,10 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                                 },
                             );
                         }
-                        ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => {}
+                        ImportDeclarationSpecifier::ImportNamespaceSpecifier(specifier) => {
+                            self.namespace_imports
+                                .insert(specifier.local.name.to_string(), source.to_string());
+                        }
                     }
                 }
             }
@@ -7201,39 +7234,7 @@ impl SourceUsageCollector {
     }
 
     fn maybe_translator_call(&self, expression: &Expression<'_>) -> Option<TranslatorBinding> {
-        if let Some(name) = self.callee_identifier(expression) {
-            return self.translators.get(name).cloned();
-        }
-
-        let member = expression.get_member_expr()?;
-        let property = member.static_property_name()?;
-        let property: &str = property.as_ref();
-        if let Some(object) = member.object().get_identifier_reference() {
-            let name = object.name.as_str();
-            if TRANSLATOR_METHODS.contains(&property)
-                && let Some(binding) = self.translators.get(name)
-            {
-                return Some(binding.clone());
-            }
-            if let Some(binding) = self
-                .translator_object_bindings
-                .get(name)
-                .and_then(|bindings| bindings.get(property))
-            {
-                return Some(binding.clone());
-            }
-            if let Ok(index) = property.parse::<usize>() {
-                return self
-                    .translator_argument_arrays
-                    .get(name)
-                    .filter(|array| array.safe_layout)
-                    .and_then(|array| array.bindings.get(index))
-                    .and_then(Clone::clone);
-            }
-        }
-        self.translator_object_bindings_from_expression(member.object())?
-            .get(property)
-            .cloned()
+        self.translator_binding_from_expression(expression)
     }
 
     fn maybe_translation_factory(&self, expression: &Expression<'_>) -> Option<bool> {
@@ -7299,8 +7300,82 @@ impl SourceUsageCollector {
             Expression::AwaitExpression(await_expression) => {
                 self.translator_binding_from_expression(&await_expression.argument)
             }
+            Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_) => {
+                self.translator_binding_from_member_expression(expression)
+            }
             _ => None,
         }
+    }
+
+    fn translator_binding_from_member_expression(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<TranslatorBinding> {
+        let member = expression.get_member_expr()?;
+        let property_names = member
+            .static_property_name()
+            .map(|property| finite_string(property.to_string()))
+            .or_else(|| match expression.get_inner_expression() {
+                Expression::ComputedMemberExpression(member) => {
+                    self.finite_strings_from_expression(&member.expression)
+                }
+                _ => None,
+            });
+        let object = member.object();
+        let mut candidates = Vec::new();
+
+        if let Some(identifier) = object.get_identifier_reference() {
+            let name = identifier.name.as_str();
+            if property_names.as_ref().is_none_or(|properties| {
+                properties
+                    .iter()
+                    .any(|property| TRANSLATOR_METHODS.contains(&property.as_str()))
+            }) && let Some(binding) = self.translators.get(name)
+            {
+                candidates.push(binding.clone());
+            }
+            if let Some(bindings) = self.translator_object_bindings.get(name) {
+                candidates.extend(bindings.iter().filter_map(|(property, binding)| {
+                    property_names
+                        .as_ref()
+                        .is_none_or(|properties| properties.contains(property))
+                        .then(|| binding.clone())
+                }));
+            }
+            if let Some(array) = self
+                .translator_argument_arrays
+                .get(name)
+                .filter(|array| array.safe_layout)
+            {
+                candidates.extend(array.bindings.iter().enumerate().filter_map(
+                    |(index, binding)| {
+                        property_names
+                            .as_ref()
+                            .is_none_or(|properties| properties.contains(&index.to_string()))
+                            .then(|| binding.clone())
+                            .flatten()
+                    },
+                ));
+            }
+        } else if let Some(bindings) = self.translator_object_bindings_from_expression(object) {
+            candidates.extend(bindings.into_iter().filter_map(|(property, binding)| {
+                property_names
+                    .as_ref()
+                    .is_none_or(|properties| properties.contains(&property))
+                    .then_some(binding)
+            }));
+        }
+
+        if property_names.as_ref().is_some_and(|properties| {
+            properties
+                .iter()
+                .any(|property| TRANSLATOR_METHODS.contains(&property.as_str()))
+        }) && let Some(binding) = self.translator_binding_from_expression(object)
+        {
+            candidates.push(binding);
+        }
+
+        merge_translator_binding_iter(candidates)
     }
 
     fn translator_object_bindings_from_expression(
@@ -7635,13 +7710,29 @@ impl SourceUsageCollector {
     }
 
     fn translator_binding_from_call(&self, call: &CallExpression<'_>) -> Option<TranslatorBinding> {
-        if !self.is_translation_factory_callee(&call.callee) {
-            return None;
+        if self.is_translation_factory_callee(&call.callee) {
+            return Some(translator_binding_from_namespace_arg(
+                self.call_namespace(call),
+            ));
         }
+        let member = call.callee.get_member_expr()?;
+        (member.static_property_name().as_deref() == Some("bind"))
+            .then(|| self.translator_binding_from_expression(member.object()))
+            .flatten()
+    }
 
-        Some(translator_binding_from_namespace_arg(
-            self.call_namespace(call),
-        ))
+    fn translator_invocation_for_call(
+        &self,
+        call: &CallExpression<'_>,
+    ) -> Option<(String, TranslatorBinding)> {
+        let member = call.callee.get_member_expr()?;
+        let method = member.static_property_name()?;
+        matches!(method.as_ref(), "call" | "apply" | "bind")
+            .then(|| {
+                self.translator_binding_from_expression(member.object())
+                    .map(|binding| (method.to_string(), binding))
+            })
+            .flatten()
     }
 
     fn record_used_key_for_binding(&mut self, binding: &TranslatorBinding, key: &str) {
@@ -7702,6 +7793,22 @@ impl SourceUsageCollector {
             self.record_dynamic_key_usage(binding.namespace.as_deref(), start, argument);
         } else {
             self.record_dynamic_usage(binding.namespace.as_deref(), start);
+        }
+    }
+
+    fn record_translator_keys(
+        &mut self,
+        binding: &TranslatorBinding,
+        keys: Option<FiniteStrings>,
+        start: u32,
+    ) {
+        match keys {
+            Some(keys) if !binding.dynamic_namespace => {
+                for key in keys {
+                    self.record_used_key_for_binding(binding, &key);
+                }
+            }
+            _ => self.record_dynamic_key_for_binding(binding, start, None),
         }
     }
 
@@ -7779,12 +7886,29 @@ impl SourceUsageCollector {
     }
 
     fn apply_jsx_component_summary(&mut self, opening: &JSXOpeningElement<'_>) {
-        let component_name = match &opening.name {
-            JSXElementName::Identifier(identifier) => identifier.name.as_str(),
-            JSXElementName::IdentifierReference(identifier) => identifier.name.as_str(),
-            _ => return,
+        let summary = match &opening.name {
+            JSXElementName::Identifier(identifier) => {
+                self.jsx_component_summary(identifier.name.as_str())
+            }
+            JSXElementName::IdentifierReference(identifier) => {
+                self.jsx_component_summary(identifier.name.as_str())
+            }
+            JSXElementName::MemberExpression(member) => {
+                let JSXMemberExpressionObject::IdentifierReference(namespace) = &member.object
+                else {
+                    return;
+                };
+                self.project.as_ref().and_then(|project| {
+                    project.jsx_component_for_namespace_member(
+                        &self.path,
+                        namespace.name.as_str(),
+                        member.property.name.as_str(),
+                    )
+                })
+            }
+            _ => None,
         };
-        let Some(summary) = self.jsx_component_summary(component_name) else {
+        let Some(summary) = summary else {
             return;
         };
 
@@ -7803,10 +7927,10 @@ impl SourceUsageCollector {
                 else {
                     return None;
                 };
-                let JSXExpression::Identifier(identifier) = &container.expression else {
+                if matches!(&container.expression, JSXExpression::EmptyExpression(_)) {
                     return None;
-                };
-                self.translators.get(identifier.name.as_str()).cloned()
+                }
+                self.translator_binding_from_expression(container.expression.to_expression())
             });
             let Some(binding) = binding else {
                 if !usage.translator_like {
@@ -8294,6 +8418,31 @@ impl SourceUsageCollector {
             }
         }
     }
+
+    fn bind_pattern_translator_properties(
+        &mut self,
+        pattern: &BindingPattern<'_>,
+        bindings: &BTreeMap<String, TranslatorBinding>,
+    ) {
+        let BindingPattern::ObjectPattern(object) = pattern else {
+            return;
+        };
+        for property in &object.properties {
+            if property.computed {
+                continue;
+            }
+            let Some(property_name) = property.key.static_name() else {
+                continue;
+            };
+            let Some(binding_name) = binding_identifier_name(&property.value) else {
+                continue;
+            };
+            if let Some(binding) = bindings.get(property_name.as_ref()) {
+                self.translators
+                    .insert(binding_name.to_string(), binding.clone());
+            }
+        }
+    }
 }
 
 fn summarized_dynamic_key_spans(file: &SourceFileIndex) -> BTreeSet<(usize, usize)> {
@@ -8472,12 +8621,12 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         });
         self.mask_binding_pattern(&declarator.id);
         self.track_destructured_translator_bindings(&declarator.id);
-        if let (Some(name), Some(bindings)) = (
-            binding_identifier_name(&declarator.id),
-            translator_object_bindings,
-        ) {
-            self.translator_object_bindings
-                .insert(name.to_string(), bindings);
+        if let Some(bindings) = translator_object_bindings {
+            self.bind_pattern_translator_properties(&declarator.id, &bindings);
+            if let Some(name) = binding_identifier_name(&declarator.id) {
+                self.translator_object_bindings
+                    .insert(name.to_string(), bindings);
+            }
         }
         if let (Some(name), Some(bindings)) = (
             binding_identifier_name(&declarator.id),
@@ -8622,7 +8771,25 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             return;
         }
 
-        if let Some(binding) = self.maybe_translator_call(&call.callee) {
+        if let Some((method, binding)) = self.translator_invocation_for_call(call) {
+            match method.as_str() {
+                "call" | "bind" => {
+                    if let Some(argument) = call.arguments.get(1) {
+                        let keys = self.finite_strings_from_argument(argument);
+                        self.record_translator_keys(&binding, keys, call.span.start);
+                    }
+                }
+                "apply" => {
+                    if let Some(argument_array) =
+                        call.arguments.get(1).and_then(Argument::as_expression)
+                    {
+                        let keys = self.finite_iterable_from_expression(argument_array);
+                        self.record_translator_keys(&binding, keys, call.span.start);
+                    }
+                }
+                _ => {}
+            }
+        } else if let Some(binding) = self.maybe_translator_call(&call.callee) {
             let keys = call
                 .arguments
                 .first()
@@ -9238,6 +9405,50 @@ mod tests {
         );
 
         assert!(scan.used_ids.contains("common.title"));
+    }
+
+    #[test]
+    fn translator_object_members_remain_reusable_bindings() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const tCommon = useTranslations('common');
+            const tSettings = useTranslations('settings');
+            const translators = {common: tCommon, settings: tSettings};
+            const common = translators.common;
+            const {settings} = translators;
+            common('alias');
+            settings('destructured');
+            translators.common.raw('raw');
+            translators[runtimeNamespace]('dynamic');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.alias"));
+        assert!(scan.used_ids.contains("settings.destructured"));
+        assert!(scan.used_ids.contains("common.raw"));
+        assert!(scan.used_ids.contains("common.dynamic"));
+        assert!(scan.used_ids.contains("settings.dynamic"));
+    }
+
+    #[test]
+    fn translator_call_apply_and_bind_forms_preserve_used_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('common');
+            t.call(null, 'called');
+            t.apply(null, ['applied']);
+            const bound = t.bind(null);
+            bound('bound');
+            t.bind(null, 'prebound');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.called"));
+        assert!(scan.used_ids.contains("common.applied"));
+        assert!(scan.used_ids.contains("common.bound"));
+        assert!(scan.used_ids.contains("common.prebound"));
     }
 
     #[test]

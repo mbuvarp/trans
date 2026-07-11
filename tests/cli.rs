@@ -926,6 +926,35 @@ fn unused_traces_translator_props_into_imported_jsx_components() {
 }
 
 #[test]
+fn unused_traces_member_translator_props_into_namespace_jsx_components() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.noDescription", "No description"),
+            ("projects.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("card.tsx"),
+        "export function Card({format}) { return <p>{format('noDescription')}</p>; }\n",
+    )
+    .expect("write component");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport * as Components from './card';\nconst tProjects = useTranslations('projects');\nconst translators = {projects: tProjects};\nexport default function Page() { return <Components.Card format={translators.projects} />; }\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("projects.unused\n");
+}
+
+#[test]
 fn unused_traces_jsx_component_through_star_re_export() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(
