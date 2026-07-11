@@ -199,6 +199,70 @@ impl TranslatorObjectBinding {
         });
     }
 
+    fn merge_alternative(mut self, alternate: Self) -> Self {
+        for (path, binding) in alternate.bindings {
+            self.bindings
+                .entry(path)
+                .and_modify(|current| *current = merge_translator_bindings(current, &binding))
+                .or_insert(binding);
+        }
+        self.unknown_paths.extend(alternate.unknown_paths);
+        self.resolved_properties = self
+            .resolved_properties
+            .intersection(&alternate.resolved_properties)
+            .cloned()
+            .collect();
+        self
+    }
+
+    fn assign_path(
+        &mut self,
+        property: &str,
+        operator: AssignmentOperator,
+        exact_target: bool,
+        assigned_binding: Option<&TranslatorBinding>,
+        assigned_object: Option<&Self>,
+    ) {
+        let replaces_value = exact_target && !operator.is_logical();
+        if replaces_value {
+            self.remove_property(property);
+            self.resolved_properties.insert(property.to_string());
+        }
+        if operator != AssignmentOperator::Assign && !operator.is_logical() {
+            return;
+        }
+        if let Some(binding) = assigned_binding {
+            self.bindings
+                .entry(property.to_string())
+                .and_modify(|current| *current = merge_translator_bindings(current, binding))
+                .or_insert_with(|| binding.clone());
+        } else if let Some(assigned) = assigned_object {
+            for (nested_path, binding) in &assigned.bindings {
+                let path = format!("{property}.{nested_path}");
+                self.bindings
+                    .entry(path)
+                    .and_modify(|current| *current = merge_translator_bindings(current, binding))
+                    .or_insert_with(|| binding.clone());
+            }
+            self.unknown_paths
+                .extend(assigned.unknown_paths.iter().map(|nested_path| {
+                    if nested_path.is_empty() {
+                        property.to_string()
+                    } else {
+                        format!("{property}.{nested_path}")
+                    }
+                }));
+            if replaces_value {
+                self.resolved_properties.extend(
+                    assigned
+                        .resolved_properties
+                        .iter()
+                        .map(|nested_path| format!("{property}.{nested_path}")),
+                );
+            }
+        }
+    }
+
     fn subobject(&self, property: &str) -> Option<Self> {
         let prefix = format!("{property}.");
         let mut result = Self::default();
@@ -9020,6 +9084,20 @@ impl SourceUsageCollector {
                     (None, None) => None,
                 }
             }
+            Expression::LogicalExpression(logical) => {
+                let left = self.translator_binding_from_expression(&logical.left);
+                let right = self.translator_binding_from_expression(&logical.right);
+                match logical.operator {
+                    LogicalOperator::And => right,
+                    LogicalOperator::Or | LogicalOperator::Coalesce => match (left, right) {
+                        (Some(left), _) => Some(left),
+                        (None, Some(_)) => {
+                            Some(translator_binding_from_namespace_arg(NamespaceArg::Dynamic))
+                        }
+                        (None, None) => None,
+                    },
+                }
+            }
             Expression::CallExpression(call) => self.translator_binding_from_call(call),
             Expression::AwaitExpression(await_expression) => {
                 self.translator_binding_from_expression(&await_expression.argument)
@@ -9247,6 +9325,27 @@ impl SourceUsageCollector {
                 }
                 Some(result)
             }
+            Expression::LogicalExpression(logical) => {
+                let left = self.translator_object_bindings_from_expression(&logical.left);
+                let right = self.translator_object_bindings_from_expression(&logical.right);
+                let (mut result, unresolved) = match logical.operator {
+                    LogicalOperator::And => (right?, None),
+                    LogicalOperator::Or | LogicalOperator::Coalesce => match (left, right) {
+                        (Some(left), _) => (left, None),
+                        (None, Some(result)) => (result, Some(&logical.left)),
+                        (None, None) => return None,
+                    },
+                };
+                if unresolved.is_some_and(|expression| {
+                    !matches!(
+                        expression.get_inner_expression(),
+                        Expression::ObjectExpression(object) if object.properties.is_empty()
+                    )
+                }) {
+                    result.mark_unknown("");
+                }
+                Some(result)
+            }
             Expression::ConditionalExpression(conditional) => {
                 let consequent =
                     self.translator_object_bindings_from_expression(&conditional.consequent);
@@ -9254,24 +9353,7 @@ impl SourceUsageCollector {
                     self.translator_object_bindings_from_expression(&conditional.alternate);
                 let (mut result, unresolved) = match (consequent, alternate) {
                     (Some(consequent), Some(alternate)) => {
-                        let mut result = consequent;
-                        for (property, alternate_binding) in alternate.bindings {
-                            result
-                                .bindings
-                                .entry(property)
-                                .and_modify(|binding| {
-                                    *binding =
-                                        merge_translator_bindings(binding, &alternate_binding)
-                                })
-                                .or_insert(alternate_binding);
-                        }
-                        result.unknown_paths.extend(alternate.unknown_paths);
-                        result.resolved_properties = result
-                            .resolved_properties
-                            .intersection(&alternate.resolved_properties)
-                            .cloned()
-                            .collect();
-                        (result, None)
+                        (consequent.merge_alternative(alternate), None)
                     }
                     (Some(result), None) => (result, Some(&conditional.alternate)),
                     (None, Some(result)) => (result, Some(&conditional.consequent)),
@@ -9283,8 +9365,7 @@ impl SourceUsageCollector {
                         Expression::ObjectExpression(object) if object.properties.is_empty()
                     )
                 }) {
-                    result.unknown_paths.insert(String::new());
-                    result.resolved_properties.clear();
+                    result.mark_unknown("");
                 }
                 Some(result)
             }
@@ -11388,40 +11469,46 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 .translator_object_bindings
                 .entry(name.to_string())
                 .or_default();
-            bindings.remove_property(&property);
-            bindings.resolved_properties.insert(property.clone());
-            if let Some(binding) = assigned_binding {
-                bindings.bindings.insert(property, binding);
-            } else if let Some(assigned) = assigned_object {
-                bindings.bindings.extend(
-                    assigned.bindings.into_iter().map(|(nested_path, binding)| {
-                        (format!("{property}.{nested_path}"), binding)
-                    }),
-                );
-                bindings
-                    .unknown_paths
-                    .extend(assigned.unknown_paths.into_iter().map(|nested_path| {
-                        if nested_path.is_empty() {
-                            property.clone()
-                        } else {
-                            format!("{property}.{nested_path}")
-                        }
-                    }));
-                bindings.resolved_properties.extend(
-                    assigned
-                        .resolved_properties
-                        .into_iter()
-                        .map(|nested_path| format!("{property}.{nested_path}")),
-                );
-            }
+            bindings.assign_path(
+                &property,
+                expression.operator,
+                true,
+                assigned_binding.as_ref(),
+                assigned_object.as_ref(),
+            );
         } else if let Some((name, path)) =
             assignment_target_unknown_container_path(&expression.left)
         {
-            if let Some(bindings) = self.translator_object_bindings.get_mut(name) {
-                bindings.mark_unknown(&path.join("."));
-            }
-            if let Some(binding) = assigned_binding {
-                self.record_dynamic_key_for_binding(&binding, expression.span.start, None);
+            let properties = match &expression.left {
+                AssignmentTarget::ComputedMemberExpression(member) => {
+                    self.finite_strings_from_expression(&member.expression)
+                }
+                _ => None,
+            };
+            if let Some(properties) = properties {
+                let exact_target = properties.len() == 1;
+                let bindings = self
+                    .translator_object_bindings
+                    .entry(name.to_string())
+                    .or_default();
+                for property in properties {
+                    let mut property_path = path.clone();
+                    property_path.push(property);
+                    bindings.assign_path(
+                        &property_path.join("."),
+                        expression.operator,
+                        exact_target,
+                        assigned_binding.as_ref(),
+                        assigned_object.as_ref(),
+                    );
+                }
+            } else {
+                if let Some(bindings) = self.translator_object_bindings.get_mut(name) {
+                    bindings.mark_unknown(&path.join("."));
+                }
+                if let Some(binding) = assigned_binding {
+                    self.record_dynamic_key_for_binding(&binding, expression.span.start, None);
+                }
             }
         } else if let Some(name) = assignment_target_member_object_name(&expression.left) {
             if let Some(bindings) = self.translator_object_bindings.get_mut(name) {
@@ -14340,6 +14427,45 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
     }
 
     #[test]
+    fn logical_expressions_preserve_translator_aggregates() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const conditional = enabled && {format: common};
+            Object.values(conditional).forEach(format => format('conditional'));
+            const fallback = runtimeBundle ?? {format: common};
+            Object.values(fallback).forEach(format => format('fallback'));
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.conditional"));
+        assert!(scan.used_ids.contains("common.fallback"));
+    }
+
+    #[test]
+    fn known_translators_respect_logical_short_circuiting() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const retained = common || runtimeFallback;
+            retained('retained');
+            const selected = common && settings;
+            selected('selected');
+            const bundle = {format: common} ?? runtimeBundle;
+            Object.values(bundle).forEach(format => format('bundled'));
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.retained"));
+        assert!(scan.used_ids.contains("settings.selected"));
+        assert!(scan.used_ids.contains("common.bundled"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
     fn unrelated_static_mutations_preserve_translator_object_bindings() {
         let scan = scan(
             r#"
@@ -14347,6 +14473,44 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
             const common = useTranslations('common');
             const bundle = {format: common};
             bundle.label = 'runtime';
+            bundle.format('title');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn logical_member_assignments_merge_existing_translator_bindings() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const bundle = {format: common};
+            bundle.format ||= runtimeFallback;
+            bundle.format('retained');
+            bundle.format ??= settings;
+            bundle.format('merged');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.retained"));
+        assert!(scan.used_ids.contains("common.merged"));
+        assert!(scan.used_ids.contains("settings.merged"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn finite_computed_assignments_update_only_possible_properties() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const bundle = {format: common};
+            const property = 'label';
+            bundle[property] = runtimeLabel;
             bundle.format('title');
             "#,
         );
