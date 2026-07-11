@@ -1176,6 +1176,36 @@ fn unused_ignores_declaration_files() {
 }
 
 #[test]
+fn unused_scans_mjs_and_cjs_modules() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("app.fromMjs", "MJS"),
+            ("app.fromCjs", "CJS"),
+            ("app.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("mjs-usage.mjs"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('fromMjs');\n",
+    )
+    .expect("write mjs source");
+    std::fs::write(
+        dir.path().join("cjs-usage.cjs"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('fromCjs');\n",
+    )
+    .expect("write cjs source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("app.unused\n");
+}
+
+#[test]
 fn unused_reports_dynamic_usage_locations() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(
