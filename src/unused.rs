@@ -146,7 +146,18 @@ struct TranslatorObjectBinding {
 
 impl TranslatorObjectBinding {
     fn aggregate_binding(self) -> Option<TranslatorBinding> {
-        merge_translator_binding_iter(self.bindings.into_values())
+        let unknown = !self.unknown_paths.is_empty();
+        let binding = merge_translator_binding_iter(self.bindings.into_values());
+        if unknown {
+            binding.map(|binding| {
+                merge_translator_bindings(
+                    &binding,
+                    &translator_binding_from_namespace_arg(NamespaceArg::Dynamic),
+                )
+            })
+        } else {
+            binding
+        }
     }
 
     fn remove_property(&mut self, property: &str) {
@@ -1526,18 +1537,22 @@ impl ProjectIndex {
                 .get(name)
                 .and_then(|target| {
                     self.translator_array_return_for_import_at_depth(path, target, depth + 1)
+                        .or_else(|| {
+                            self.translator_return_for_import_at_depth(path, target, depth + 1)
+                        })
                 })
-                .or_else(|| self.translator_array_return_for_local_at_depth(path, name, depth + 1)),
+                .or_else(|| self.translator_array_return_for_local_at_depth(path, name, depth + 1))
+                .or_else(|| self.translator_return_for_local_at_depth(path, name, depth + 1)),
             TranslatorReturnForward::NamespaceMember { namespace, name } => {
                 let source = file.namespace_imports.get(namespace)?;
-                self.translator_array_return_for_import_at_depth(
-                    path,
-                    &ImportTarget {
-                        source: source.clone(),
-                        imported: ImportedName::Named(name.clone()),
-                    },
-                    depth + 1,
-                )
+                let target = ImportTarget {
+                    source: source.clone(),
+                    imported: ImportedName::Named(name.clone()),
+                };
+                self.translator_array_return_for_import_at_depth(path, &target, depth + 1)
+                    .or_else(|| {
+                        self.translator_return_for_import_at_depth(path, &target, depth + 1)
+                    })
             }
             TranslatorReturnForward::ForwardCall {
                 namespace, name, ..
@@ -4939,6 +4954,23 @@ fn call_is_callback_value_wrapper(call: &CallExpression<'_>, name: &str) -> bool
         .is_some_and(|property| property == name)
 }
 
+fn callback_return_expression<'a>(callback: &'a Argument<'a>) -> Option<&'a Expression<'a>> {
+    let (body, expression) = match callback {
+        Argument::ArrowFunctionExpression(arrow) => (&arrow.body, arrow.expression),
+        Argument::FunctionExpression(function) => (function.body.as_ref()?, false),
+        _ => return None,
+    };
+    if expression && let Some(Statement::ExpressionStatement(statement)) = body.statements.first() {
+        return Some(&statement.expression);
+    }
+    body.statements.iter().find_map(|statement| {
+        let Statement::ReturnStatement(statement) = statement else {
+            return None;
+        };
+        statement.argument.as_ref()
+    })
+}
+
 fn finite_records_from_callback_argument(
     callback: &Argument<'_>,
     constants: &BTreeMap<String, FiniteStrings>,
@@ -7807,6 +7839,19 @@ impl TranslatorReturnCollector {
                         .get(identifier.name.as_str())
                         .cloned()
                 {
+                    return Some(TranslatorReturnSummary {
+                        forwards,
+                        ..TranslatorReturnSummary::default()
+                    });
+                }
+                let mut forwards = translator_return_callable_forwards(expression);
+                forwards.retain(|forward| match forward {
+                    TranslatorReturnForward::Local(name) => {
+                        !self.parameter_callables.contains_key(name)
+                    }
+                    _ => true,
+                });
+                if !forwards.is_empty() {
                     return Some(TranslatorReturnSummary {
                         forwards,
                         ..TranslatorReturnSummary::default()
@@ -11079,6 +11124,12 @@ impl SourceUsageCollector {
                     .or_else(|| self.translator_map_entries_from_expression(source))
             }
             Expression::CallExpression(call) => {
+                if call_is_callback_value_wrapper(call, "useMemo")
+                    && let Some(result) =
+                        call.arguments.first().and_then(callback_return_expression)
+                {
+                    return self.translator_map_from_expression(result);
+                }
                 let member = call.callee.get_member_expr()?;
                 if member.static_property_name() != Some("set") {
                     return None;
@@ -11155,6 +11206,17 @@ impl SourceUsageCollector {
                     let source = call.arguments.first()?.as_expression()?;
                     return self.translator_object_bindings_from_expression(source);
                 }
+                if matches!(method, "map" | "flatMap") {
+                    let returned = call
+                        .arguments
+                        .first()
+                        .and_then(callback_return_expression)?;
+                    return if method == "flatMap" {
+                        self.translator_map_entries_from_expression(returned)
+                    } else {
+                        self.translator_map_entry_from_expression(returned)
+                    };
+                }
                 let mut result = self.translator_map_entries_from_expression(member.object())?;
                 match method.as_ref() {
                     "slice" | "filter" | "toReversed" | "toSorted" => Some(result),
@@ -11170,6 +11232,18 @@ impl SourceUsageCollector {
                                 Self::extend_translator_map_entries(&mut result, entries);
                             } else {
                                 result.mark_unknown("");
+                            }
+                        }
+                        Some(result)
+                    }
+                    "toSpliced" | "with" => {
+                        let offset = if method == "toSpliced" { 2 } else { 1 };
+                        for argument in call.arguments.iter().skip(offset) {
+                            if let Some(expression) = argument.as_expression()
+                                && let Some(entry) =
+                                    self.translator_map_entry_from_expression(expression)
+                            {
+                                Self::extend_translator_map_entries(&mut result, entry);
                             }
                         }
                         Some(result)
@@ -11367,6 +11441,13 @@ impl SourceUsageCollector {
         &self,
         call: &CallExpression<'_>,
     ) -> Option<TranslatorArgumentArray> {
+        if call_is_callback_value_wrapper(call, "useMemo") {
+            let result = call
+                .arguments
+                .first()
+                .and_then(callback_return_expression)?;
+            return self.translator_argument_array_from_expression(result);
+        }
         if self.is_promise_all_call(call) {
             let source = call.arguments.first()?.as_expression()?;
             return self.translator_argument_array_from_expression(source);
@@ -11582,7 +11663,10 @@ impl SourceUsageCollector {
             Argument::FunctionExpression(function) => {
                 (&function.params, function.body.as_ref(), false)
             }
-            _ => return None,
+            _ => {
+                let expression = callback.as_expression()?;
+                return self.translator_binding_from_callback_reference(expression);
+            }
         };
         let param = params
             .items
@@ -11609,6 +11693,31 @@ impl SourceUsageCollector {
             collector.visit_statement(statement);
         }
         merge_translator_binding_iter(collector.bindings)
+    }
+
+    fn translator_binding_from_callback_reference(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<TranslatorBinding> {
+        let project = self.project.as_ref()?;
+        let file = self.file_index.as_ref()?;
+        if let Some(identifier) = expression.get_identifier_reference() {
+            let name = identifier.name.as_str();
+            let mut bindings = project
+                .translator_return_for_local(&self.path, name)
+                .into_iter()
+                .chain(project.translator_array_return_for_local(&self.path, name))
+                .collect::<Vec<_>>();
+            if let Some(target) = file.imports.get(name) {
+                bindings.extend(project.translator_return_for_import(&self.path, target));
+                bindings.extend(project.translator_array_return_for_import(&self.path, target));
+            }
+            return merge_translator_binding_iter(bindings);
+        }
+        let member = expression.get_member_expr()?;
+        let namespace = member.object().get_identifier_reference()?;
+        let name = member.static_property_name()?;
+        project.translator_return_for_namespace_member(&self.path, namespace.name.as_str(), name)
     }
 
     fn translator_binding_from_callback_result(
@@ -15110,7 +15219,7 @@ mod tests {
         assert!(
             scan.dynamic_usages
                 .iter()
-                .any(|usage| usage.namespace_unknown)
+                .any(|usage| usage.namespace.is_empty())
         );
     }
 
@@ -16114,6 +16223,28 @@ mod tests {
     }
 
     #[test]
+    fn named_callbacks_resolve_fixed_translator_returns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper = dir.path().join("helper.ts");
+        fs::write(
+            &helper,
+            r#"
+            import {getTranslations} from 'next-intl/server';
+            function makeFormatter() { return getTranslations('fixed'); }
+            export function wrapped(items) { return items.map(makeFormatter); }
+            "#,
+        )
+        .expect("write helper source");
+        let project = ProjectIndex::build(dir.path(), std::slice::from_ref(&helper))
+            .expect("build project index");
+        let binding = project
+            .translator_array_return_for_local(&helper, "wrapped")
+            .expect("fixed callback return");
+
+        assert_eq!(binding.namespace.as_deref(), Some("fixed"));
+    }
+
+    #[test]
     fn mixed_map_chains_preserve_later_translator_values() {
         let scan = scan(
             r#"
@@ -16219,6 +16350,68 @@ mod tests {
 
         assert!(scan.used_ids.contains("common.filtered"));
         assert!(scan.used_ids.contains("settings.concatenated"));
+    }
+
+    #[test]
+    fn mapped_and_copied_map_entries_preserve_translators() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const other = useTranslations('other');
+            const mapped = [1].map(() => ['common', common]);
+            const entries = mapped.toSpliced(1, 0, ['settings', settings]);
+            const replaced = mapped.with(0, ['other', other]);
+            const formatters = new Map(entries);
+            const otherFormatters = new Map(replaced);
+            formatters.get('common')('mapped');
+            formatters.get('settings')('spliced');
+            otherFormatters.get('other')('replaced');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.mapped"));
+        assert!(scan.used_ids.contains("settings.spliced"));
+        assert!(scan.used_ids.contains("other.replaced"));
+    }
+
+    #[test]
+    fn react_memo_preserves_translator_containers() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const formatters = useMemo(() => new Map([['common', common]]), [common]);
+            const renderers = useMemo(() => new Set([settings]), [settings]);
+            const values = useMemo(() => [common], [common]);
+            formatters.get('common')('memo-map');
+            values[0]('memo-array');
+            renderers.forEach(render => render('memo-set'));
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.memo-map"));
+        assert!(scan.used_ids.contains("common.memo-array"));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 11));
+    }
+
+    #[test]
+    fn unknown_object_aggregation_becomes_dynamic() {
+        let mut bindings = TranslatorObjectBinding::default();
+        bindings.bindings.insert(
+            "known".to_string(),
+            translator_binding_from_namespace_arg(NamespaceArg::Scoped("common".to_string())),
+        );
+        bindings.mark_unknown("");
+
+        assert!(
+            bindings
+                .aggregate_binding()
+                .is_some_and(|binding| binding.dynamic_namespace)
+        );
     }
 
     #[test]
@@ -18720,12 +18913,6 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
         assert!(
             scan.dynamic_usages
                 .iter()
-                .any(|usage| usage.namespace == "common")
-        );
-        assert!(
-            !scan
-                .dynamic_usages
-                .iter()
                 .any(|usage| usage.namespace.is_empty())
         );
     }
@@ -18786,7 +18973,11 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
         );
 
         assert!(scan.used_ids.contains("common.conditional"));
-        assert!(scan.used_ids.contains("common.fallback"));
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace.is_empty() && usage.line == 7)
+        );
     }
 
     #[test]
