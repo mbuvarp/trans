@@ -9137,8 +9137,18 @@ impl SourceUsageCollector {
                 let left = self.translator_binding_from_expression(&logical.left);
                 let right = self.translator_binding_from_expression(&logical.right);
                 match logical.operator {
-                    LogicalOperator::And => right,
+                    LogicalOperator::And => match (left, right) {
+                        (Some(left), right) if !left.dynamic_namespace => right,
+                        (_, Some(right)) => Some(merge_translator_bindings(
+                            &right,
+                            &translator_binding_from_namespace_arg(NamespaceArg::Dynamic),
+                        )),
+                        (_, None) => None,
+                    },
                     LogicalOperator::Or | LogicalOperator::Coalesce => match (left, right) {
+                        (Some(left), Some(right)) if left.dynamic_namespace => {
+                            Some(merge_translator_bindings(&left, &right))
+                        }
                         (Some(left), _) => Some(left),
                         (None, Some(_)) => {
                             Some(translator_binding_from_namespace_arg(NamespaceArg::Dynamic))
@@ -9552,7 +9562,19 @@ impl SourceUsageCollector {
                 let left = self.translator_object_bindings_from_expression(&logical.left);
                 let right = self.translator_object_bindings_from_expression(&logical.right);
                 let (mut result, unresolved) = match logical.operator {
-                    LogicalOperator::And => (right?, None),
+                    LogicalOperator::And => {
+                        let mut result = right?;
+                        let left_is_known_truthy = matches!(
+                            logical.left.get_inner_expression(),
+                            Expression::ObjectExpression(_) | Expression::ArrayExpression(_)
+                        ) || self
+                            .translator_binding_from_expression(&logical.left)
+                            .is_some_and(|binding| !binding.dynamic_namespace);
+                        if !left_is_known_truthy {
+                            result.resolved_properties.clear();
+                        }
+                        (result, None)
+                    }
                     LogicalOperator::Or | LogicalOperator::Coalesce => match (left, right) {
                         (Some(left), _) => (left, None),
                         (None, Some(result)) => (result, Some(&logical.left)),
@@ -11727,14 +11749,24 @@ impl SourceUsageCollector {
         target: &ArrayAssignmentTarget<'_>,
         array: Option<&TranslatorArgumentArray>,
     ) {
+        let uncertain_binding = array.filter(|array| !array.safe_layout).and_then(|array| {
+            merge_translator_binding_iter(array.bindings.iter().flatten().cloned()).map(|binding| {
+                merge_translator_bindings(
+                    &binding,
+                    &translator_binding_from_namespace_arg(NamespaceArg::Dynamic),
+                )
+            })
+        });
         for (index, element) in target.elements.iter().enumerate() {
             let Some(element) = element else {
                 continue;
             };
-            let source = array
-                .and_then(|array| array.bindings.get(index))
-                .cloned()
-                .flatten();
+            let source = uncertain_binding.clone().or_else(|| {
+                array
+                    .and_then(|array| array.bindings.get(index))
+                    .cloned()
+                    .flatten()
+            });
             let source_resolved =
                 array.is_some_and(|array| array.safe_layout && index < array.bindings.len());
             self.bind_assignment_maybe_default(element, source, source_resolved);
@@ -12978,6 +13010,25 @@ mod tests {
         assert!(scan.used_ids.contains("settings.aliased"));
         assert!(scan.used_ids.contains("common.original"));
         assert!(scan.used_ids.contains("settings.original"));
+    }
+
+    #[test]
+    fn unsafe_translator_array_assignments_remain_dynamic() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const translators = [common, settings];
+            const alias = translators;
+            alias.reverse();
+            let render;
+            [render] = alias;
+            render('assigned');
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 10));
     }
 
     #[test]
@@ -15493,6 +15544,27 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
     }
 
     #[test]
+    fn logical_and_object_spreads_remain_optional() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const source = {
+                render: settings,
+                ...(enabled && {render: common}),
+            };
+            const {render} = source;
+            render('title');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.used_ids.contains("settings.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
     fn nested_array_destructuring_resolves_array_aliases() {
         let scan = scan(
             r#"
@@ -15702,6 +15774,21 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
         assert!(scan.used_ids.contains("settings.selected"));
         assert!(scan.used_ids.contains("common.bundled"));
         assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn optional_logical_translators_preserve_reachable_fallbacks() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const render = (enabled && common) || settings;
+            render('title');
+            "#,
+        );
+
+        assert_eq!(scan.dynamic_usages.len(), 1);
     }
 
     #[test]
