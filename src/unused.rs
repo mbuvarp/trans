@@ -1775,6 +1775,8 @@ struct SourceUsageCollector {
     get_translations: BTreeSet<String>,
     use_extracted: BTreeSet<String>,
     get_extracted: BTreeSet<String>,
+    next_intl_namespaces: BTreeSet<String>,
+    next_intl_server_namespaces: BTreeSet<String>,
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
     finite_object_maps: FiniteObjectMaps,
@@ -1813,6 +1815,8 @@ struct BindingEnvironment {
     translators: BTreeMap<String, TranslatorBinding>,
     potential_translators: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
+    next_intl_namespaces: BTreeSet<String>,
+    next_intl_server_namespaces: BTreeSet<String>,
 }
 
 fn helper_summary_from_expression_with_context(
@@ -2320,6 +2324,39 @@ fn translator_binding_from_namespace_arg(namespace: NamespaceArg) -> TranslatorB
             namespaces: None,
             dynamic_namespace: true,
         },
+    }
+}
+
+fn translator_binding_namespaces(binding: &TranslatorBinding) -> Option<FiniteStrings> {
+    if binding.dynamic_namespace {
+        return None;
+    }
+    Some(match &binding.namespaces {
+        Some(namespaces) => namespaces.clone(),
+        None => finite_string(binding.namespace.clone().unwrap_or_default()),
+    })
+}
+
+fn merge_translator_bindings(
+    left: &TranslatorBinding,
+    right: &TranslatorBinding,
+) -> TranslatorBinding {
+    let (Some(mut namespaces), Some(right_namespaces)) = (
+        translator_binding_namespaces(left),
+        translator_binding_namespaces(right),
+    ) else {
+        return translator_binding_from_namespace_arg(NamespaceArg::Dynamic);
+    };
+    namespaces.extend(right_namespaces);
+    if namespaces.len() == 1 {
+        let namespace = namespaces.into_iter().next().unwrap_or_default();
+        if namespace.is_empty() {
+            translator_binding_from_namespace_arg(NamespaceArg::Unscoped)
+        } else {
+            translator_binding_from_namespace_arg(NamespaceArg::Scoped(namespace))
+        }
+    } else {
+        translator_binding_from_namespace_arg(NamespaceArg::Finite(namespaces))
     }
 }
 
@@ -4058,12 +4095,41 @@ impl HelperBodyCollector {
         self.param_names.get(identifier.name.as_str()).copied()
     }
 
-    fn apply_helper_summary(&mut self, call: &CallExpression<'_>, summary: &HelperSummary) {
+    fn apply_helper_summary_with_offset(
+        &mut self,
+        call: &CallExpression<'_>,
+        summary: &HelperSummary,
+        offset: usize,
+    ) {
         for usage in &summary.param_usages {
-            let Some(argument) = call.arguments.get(usage.param_index) else {
+            let Some(argument) = call.arguments.get(usage.param_index + offset) else {
                 continue;
             };
             let Some(param_index) = self.param_index_from_argument(argument) else {
+                continue;
+            };
+            self.usages.push(HelperParamUsage {
+                param_index,
+                keys: usage.keys.clone(),
+                query: usage.query.clone(),
+                translator_like: usage.translator_like,
+            });
+        }
+    }
+
+    fn apply_helper_summary_from_array(
+        &mut self,
+        array: &oxc_ast::ast::ArrayExpression<'_>,
+        summary: &HelperSummary,
+        _start: u32,
+    ) {
+        for usage in &summary.param_usages {
+            let Some(ArrayExpressionElement::Identifier(identifier)) =
+                array.elements.get(usage.param_index)
+            else {
+                continue;
+            };
+            let Some(param_index) = self.param_names.get(identifier.name.as_str()).copied() else {
                 continue;
             };
             self.usages.push(HelperParamUsage {
@@ -4550,8 +4616,23 @@ impl<'a> Visit<'a> for HelperBodyCollector {
             return;
         }
 
-        if let Some(summary) = self.helper_summary_for_callee(&call.callee) {
-            self.apply_helper_summary(call, &summary);
+        let member_helper = call.callee.get_member_expr().and_then(|member| {
+            let method = member.static_property_name()?;
+            let summary = self.helper_summary_for_callee(member.object())?;
+            Some((method.to_string(), summary))
+        });
+        if let Some((method, summary)) = member_helper {
+            match method.as_str() {
+                "call" | "bind" => self.apply_helper_summary_with_offset(call, &summary, 1),
+                "apply" => {
+                    if let Some(Argument::ArrayExpression(array)) = call.arguments.get(1) {
+                        self.apply_helper_summary_from_array(array, &summary, call.span.start);
+                    }
+                }
+                _ => {}
+            }
+        } else if let Some(summary) = self.helper_summary_for_callee(&call.callee) {
+            self.apply_helper_summary_with_offset(call, &summary, 0);
         }
 
         if let Some(param_index) = self.callee_param_index(&call.callee) {
@@ -5648,6 +5729,8 @@ impl SourceUsageCollector {
             get_translations: BTreeSet::new(),
             use_extracted: BTreeSet::new(),
             get_extracted: BTreeSet::new(),
+            next_intl_namespaces: BTreeSet::new(),
+            next_intl_server_namespaces: BTreeSet::new(),
             finite_constants: BTreeMap::new(),
             finite_iterables: BTreeMap::new(),
             finite_object_maps: BTreeMap::new(),
@@ -5687,6 +5770,8 @@ impl SourceUsageCollector {
             translators: self.translators.clone(),
             potential_translators: self.potential_translators.clone(),
             message_key_helpers: self.message_key_helpers.clone(),
+            next_intl_namespaces: self.next_intl_namespaces.clone(),
+            next_intl_server_namespaces: self.next_intl_server_namespaces.clone(),
         }
     }
 
@@ -5705,6 +5790,8 @@ impl SourceUsageCollector {
         self.translators = environment.translators;
         self.potential_translators = environment.potential_translators;
         self.message_key_helpers = environment.message_key_helpers;
+        self.next_intl_namespaces = environment.next_intl_namespaces;
+        self.next_intl_server_namespaces = environment.next_intl_server_namespaces;
     }
 
     fn mask_binding_name(&mut self, name: &str) {
@@ -5720,6 +5807,8 @@ impl SourceUsageCollector {
         self.translators.remove(name);
         self.potential_translators.remove(name);
         self.message_key_helpers.remove(name);
+        self.next_intl_namespaces.remove(name);
+        self.next_intl_server_namespaces.remove(name);
     }
 
     fn mask_binding_pattern(&mut self, pattern: &BindingPattern<'_>) {
@@ -6397,11 +6486,30 @@ impl SourceUsageCollector {
             }
             _ => return None,
         };
-        let callee = self.callee_identifier(&call.callee)?;
-        if self.use_translations.contains(callee) || self.get_translations.contains(callee) {
+        if self.is_translation_factory_callee(&call.callee) {
             Some(matches!(self.call_namespace(call), NamespaceArg::Dynamic))
         } else {
             None
+        }
+    }
+
+    fn is_translation_factory_callee(&self, expression: &Expression<'_>) -> bool {
+        if let Some(callee) = self.callee_identifier(expression) {
+            return self.use_translations.contains(callee)
+                || self.get_translations.contains(callee);
+        }
+        let Some(member) = expression.get_member_expr() else {
+            return false;
+        };
+        let Some(object) = member.object().get_identifier_reference() else {
+            return false;
+        };
+        match member.static_property_name().as_deref() {
+            Some("useTranslations") => self.next_intl_namespaces.contains(object.name.as_str()),
+            Some("getTranslations") => self
+                .next_intl_server_namespaces
+                .contains(object.name.as_str()),
+            _ => false,
         }
     }
 
@@ -6409,24 +6517,22 @@ impl SourceUsageCollector {
         &self,
         expression: &Expression<'_>,
     ) -> Option<TranslatorBinding> {
-        let call = match expression.get_inner_expression() {
-            Expression::CallExpression(call) => call,
-            Expression::AwaitExpression(await_expression) => {
-                match await_expression.argument.get_inner_expression() {
-                    Expression::CallExpression(call) => call,
-                    _ => return None,
-                }
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => {
+                self.translators.get(identifier.name.as_str()).cloned()
             }
-            _ => return None,
-        };
-        let callee = self.callee_identifier(&call.callee)?;
-        if !self.use_translations.contains(callee) && !self.get_translations.contains(callee) {
-            return None;
+            Expression::ConditionalExpression(conditional) => {
+                let consequent =
+                    self.translator_binding_from_expression(&conditional.consequent)?;
+                let alternate = self.translator_binding_from_expression(&conditional.alternate)?;
+                Some(merge_translator_bindings(&consequent, &alternate))
+            }
+            Expression::CallExpression(call) => self.translator_binding_from_call(call),
+            Expression::AwaitExpression(await_expression) => {
+                self.translator_binding_from_expression(&await_expression.argument)
+            }
+            _ => None,
         }
-
-        Some(translator_binding_from_namespace_arg(
-            self.call_namespace(call),
-        ))
     }
 
     fn bind_promise_all_translators(
@@ -6615,8 +6721,7 @@ impl SourceUsageCollector {
     }
 
     fn translator_binding_from_call(&self, call: &CallExpression<'_>) -> Option<TranslatorBinding> {
-        let callee = self.callee_identifier(&call.callee)?;
-        if !self.use_translations.contains(callee) && !self.get_translations.contains(callee) {
+        if !self.is_translation_factory_callee(&call.callee) {
             return None;
         }
 
@@ -6711,29 +6816,60 @@ impl SourceUsageCollector {
         }
     }
 
-    fn apply_helper_summary(&mut self, call: &CallExpression<'_>, summary: &HelperSummary) {
+    fn apply_helper_summary_with_offset(
+        &mut self,
+        call: &CallExpression<'_>,
+        summary: &HelperSummary,
+        offset: usize,
+    ) {
         for usage in &summary.param_usages {
-            let Some(argument) = call.arguments.get(usage.param_index) else {
+            let Some(argument) = call.arguments.get(usage.param_index + offset) else {
                 continue;
             };
             let Some(binding) = self.translator_binding_from_argument(argument) else {
                 continue;
             };
-            match (&usage.keys, binding.dynamic_namespace) {
-                (Some(keys), false) => {
-                    for key in keys {
-                        self.record_used_key_for_binding(&binding, key);
-                    }
+            self.record_helper_usage_for_binding(usage, &binding, call.span.start);
+        }
+    }
+
+    fn record_helper_usage_for_binding(
+        &mut self,
+        usage: &HelperParamUsage,
+        binding: &TranslatorBinding,
+        start: u32,
+    ) {
+        match (&usage.keys, binding.dynamic_namespace) {
+            (Some(keys), false) => {
+                for key in keys {
+                    self.record_used_key_for_binding(&binding, key);
                 }
-                (None, false) => {
-                    if let Some(query) = &usage.query {
-                        self.record_dynamic_query_for_binding(&binding, query);
-                    } else {
-                        self.record_dynamic_key_for_binding(&binding, call.span.start, None);
-                    }
-                }
-                _ => self.record_dynamic_key_for_binding(&binding, call.span.start, None),
             }
+            (None, false) => {
+                if let Some(query) = &usage.query {
+                    self.record_dynamic_query_for_binding(&binding, query);
+                } else {
+                    self.record_dynamic_key_for_binding(&binding, start, None);
+                }
+            }
+            _ => self.record_dynamic_key_for_binding(&binding, start, None),
+        }
+    }
+
+    fn apply_helper_summary_from_array(
+        &mut self,
+        array: &oxc_ast::ast::ArrayExpression<'_>,
+        summary: &HelperSummary,
+        start: u32,
+    ) {
+        for usage in &summary.param_usages {
+            let Some(element) = array.elements.get(usage.param_index) else {
+                continue;
+            };
+            let Some(binding) = self.translator_binding_from_array_element(element) else {
+                continue;
+            };
+            self.record_helper_usage_for_binding(usage, &binding, start);
         }
     }
 
@@ -7351,18 +7487,29 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         if source == "next-intl" || source == "next-intl/server" {
             if let Some(specifiers) = &declaration.specifiers {
                 for specifier in specifiers {
-                    if let ImportDeclarationSpecifier::ImportSpecifier(specifier) = specifier {
-                        let imported = match &specifier.imported {
-                            ModuleExportName::IdentifierName(identifier) => {
-                                identifier.name.as_str()
+                    match specifier {
+                        ImportDeclarationSpecifier::ImportSpecifier(specifier) => {
+                            let imported = match &specifier.imported {
+                                ModuleExportName::IdentifierName(identifier) => {
+                                    identifier.name.as_str()
+                                }
+                                ModuleExportName::IdentifierReference(identifier) => {
+                                    identifier.name.as_str()
+                                }
+                                ModuleExportName::StringLiteral(literal) => literal.value.as_str(),
+                            };
+                            let local = specifier.local.name.as_str();
+                            self.record_import(source, imported, local);
+                        }
+                        ImportDeclarationSpecifier::ImportNamespaceSpecifier(specifier) => {
+                            let local = specifier.local.name.to_string();
+                            if source == "next-intl" {
+                                self.next_intl_namespaces.insert(local);
+                            } else {
+                                self.next_intl_server_namespaces.insert(local);
                             }
-                            ModuleExportName::IdentifierReference(identifier) => {
-                                identifier.name.as_str()
-                            }
-                            ModuleExportName::StringLiteral(literal) => literal.value.as_str(),
-                        };
-                        let local = specifier.local.name.as_str();
-                        self.record_import(source, imported, local);
+                        }
+                        ImportDeclarationSpecifier::ImportDefaultSpecifier(_) => {}
                     }
                 }
             }
@@ -7558,8 +7705,23 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             }
         }
 
-        if let Some(summary) = self.helper_summary_for_callee(&call.callee) {
-            self.apply_helper_summary(call, &summary);
+        let member_helper = call.callee.get_member_expr().and_then(|member| {
+            let method = member.static_property_name()?;
+            let summary = self.helper_summary_for_callee(member.object())?;
+            Some((method.to_string(), summary))
+        });
+        if let Some((method, summary)) = member_helper {
+            match method.as_str() {
+                "call" | "bind" => self.apply_helper_summary_with_offset(call, &summary, 1),
+                "apply" => {
+                    if let Some(Argument::ArrayExpression(array)) = call.arguments.get(1) {
+                        self.apply_helper_summary_from_array(array, &summary, call.span.start);
+                    }
+                }
+                _ => {}
+            }
+        } else if let Some(summary) = self.helper_summary_for_callee(&call.callee) {
+            self.apply_helper_summary_with_offset(call, &summary, 0);
         } else if self.callee_is_potential_helper(&call.callee) {
             self.protect_translator_arguments(call);
         }
@@ -7928,6 +8090,118 @@ mod tests {
             const t = useTranslations('common');
             const wrapper = function t() {};
             t(runtimeKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn translator_identifier_aliases_preserve_dynamic_namespaces() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('common');
+            const translate = t;
+            translate(runtimeKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn finite_conditional_translator_aliases_preserve_all_namespaces() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const tCommon = useTranslations('common');
+            const tSettings = useTranslations('settings');
+            const translate = compact ? tCommon : tSettings;
+            translate(runtimeKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "settings")
+        );
+    }
+
+    #[test]
+    fn namespace_imported_translation_factories_create_bindings() {
+        let scan = scan(
+            r#"
+            import * as intl from 'next-intl';
+            import * as intlServer from 'next-intl/server';
+            const tClient = intl.useTranslations('client');
+            const tServer = await intlServer.getTranslations('server');
+            tClient(runtimeClientKey);
+            tServer(runtimeServerKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "client")
+        );
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "server")
+        );
+    }
+
+    #[test]
+    fn helper_call_bind_and_apply_forms_protect_translator_arguments() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function label(translate, key) {
+              return translate(key);
+            }
+            const t = useTranslations('common');
+            label.call(null, t, runtimeCallKey);
+            label.bind(null, t);
+            label.apply(null, [t, runtimeApplyKey]);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn nested_helper_call_form_propagates_translator_parameters() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function inner(translate, key) {
+              return translate(key);
+            }
+            function outer(translate, key) {
+              return inner.call(null, translate, key);
+            }
+            const t = useTranslations('common');
+            outer(t, runtimeKey);
             "#,
         );
 
