@@ -3049,6 +3049,8 @@ struct SourceUsageCollector {
     translator_argument_arrays: BTreeMap<String, TranslatorArgumentArray>,
     translator_array_aliases: TranslatorArrayAliases,
     translator_maps: TranslatorMaps,
+    translator_map_entries: TranslatorMaps,
+    translator_map_aliases: TranslatorArrayAliases,
     potential_translators: BTreeSet<String>,
     shadowed_react_bindings: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
@@ -3082,6 +3084,8 @@ struct BindingEnvironment {
     translator_argument_arrays: BTreeMap<String, TranslatorArgumentArray>,
     translator_array_aliases: TranslatorArrayAliases,
     translator_maps: TranslatorMaps,
+    translator_map_entries: TranslatorMaps,
+    translator_map_aliases: TranslatorArrayAliases,
     potential_translators: BTreeSet<String>,
     shadowed_react_bindings: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
@@ -7342,6 +7346,23 @@ fn translator_return_callable_forwards(
 }
 
 impl TranslatorReturnCollector {
+    fn forward_parameter_indexes(forwards: &BTreeSet<TranslatorReturnForward>) -> ParamIndexes {
+        let mut indexes = BTreeSet::new();
+        for forward in forwards {
+            match forward {
+                TranslatorReturnForward::ParameterCall { param_index, .. } => {
+                    indexes.insert(*param_index);
+                }
+                TranslatorReturnForward::ForwardCall {
+                    argument_params, ..
+                } => indexes.extend(argument_params.iter().flatten().copied()),
+                TranslatorReturnForward::Local(_)
+                | TranslatorReturnForward::NamespaceMember { .. } => {}
+            }
+        }
+        indexes
+    }
+
     fn is_set_array_expression(&self, expression: &Expression<'_>) -> bool {
         match expression.get_inner_expression() {
             Expression::Identifier(identifier) => {
@@ -7693,11 +7714,15 @@ impl TranslatorReturnCollector {
         if expression
             && let Some(Statement::ExpressionStatement(statement)) = body.statements.first()
         {
+            let forwards = collector.forwards_from_expression(&statement.expression);
+            let mut array_param_indexes =
+                collector.array_params_from_expression(&statement.expression);
+            array_param_indexes.extend(Self::forward_parameter_indexes(&forwards));
             return Some(TranslatorReturnSummary {
                 binding: collector.binding_from_expression(&statement.expression),
                 array_binding: collector.array_binding_from_expression(&statement.expression),
-                array_param_indexes: collector.array_params_from_expression(&statement.expression),
-                forwards: BTreeSet::new(),
+                array_param_indexes,
+                forwards,
             });
         }
         collector.hoist_var_bindings(body);
@@ -7837,6 +7862,7 @@ impl TranslatorReturnCollector {
                     ) {
                         if let Some(summary) = self.callback_summary_from_argument(argument) {
                             indexes.extend(summary.array_param_indexes);
+                            indexes.extend(Self::forward_parameter_indexes(&summary.forwards));
                         }
                     } else if let Some(expression) = argument.as_expression() {
                         indexes.extend(self.array_params_from_expression(expression));
@@ -9325,6 +9351,8 @@ impl SourceUsageCollector {
             translator_argument_arrays: BTreeMap::new(),
             translator_array_aliases: BTreeMap::new(),
             translator_maps: BTreeMap::new(),
+            translator_map_entries: BTreeMap::new(),
+            translator_map_aliases: BTreeMap::new(),
             potential_translators: BTreeSet::new(),
             shadowed_react_bindings: BTreeSet::new(),
             message_key_helpers: BTreeMap::new(),
@@ -9359,6 +9387,8 @@ impl SourceUsageCollector {
             translator_argument_arrays: self.translator_argument_arrays.clone(),
             translator_array_aliases: self.translator_array_aliases.clone(),
             translator_maps: self.translator_maps.clone(),
+            translator_map_entries: self.translator_map_entries.clone(),
+            translator_map_aliases: self.translator_map_aliases.clone(),
             potential_translators: self.potential_translators.clone(),
             shadowed_react_bindings: self.shadowed_react_bindings.clone(),
             message_key_helpers: self.message_key_helpers.clone(),
@@ -9388,6 +9418,8 @@ impl SourceUsageCollector {
         self.translator_argument_arrays = environment.translator_argument_arrays;
         self.translator_array_aliases = environment.translator_array_aliases;
         self.translator_maps = environment.translator_maps;
+        self.translator_map_entries = environment.translator_map_entries;
+        self.translator_map_aliases = environment.translator_map_aliases;
         self.potential_translators = environment.potential_translators;
         self.shadowed_react_bindings = environment.shadowed_react_bindings;
         self.message_key_helpers = environment.message_key_helpers;
@@ -9417,6 +9449,8 @@ impl SourceUsageCollector {
         self.translator_argument_arrays.remove(name);
         self.remove_translator_array_alias(name);
         self.translator_maps.remove(name);
+        self.translator_map_entries.remove(name);
+        self.remove_translator_map_alias(name);
         self.potential_translators.remove(name);
         self.message_key_helpers.remove(name);
         self.next_intl_namespaces.remove(name);
@@ -9448,6 +9482,35 @@ impl SourceUsageCollector {
 
     fn translator_array_alias_group(&self, name: &str) -> BTreeSet<String> {
         self.translator_array_aliases
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| BTreeSet::from([name.to_string()]))
+    }
+
+    fn remove_translator_map_alias(&mut self, name: &str) {
+        self.translator_map_aliases.remove(name);
+        for aliases in self.translator_map_aliases.values_mut() {
+            aliases.remove(name);
+        }
+        self.translator_map_aliases
+            .retain(|_, aliases| !aliases.is_empty());
+    }
+
+    fn register_translator_map_alias(&mut self, alias: &str, source: &str) {
+        let mut aliases = BTreeSet::from([alias.to_string(), source.to_string()]);
+        if let Some(existing) = self.translator_map_aliases.get(alias) {
+            aliases.extend(existing.iter().cloned());
+        }
+        if let Some(existing) = self.translator_map_aliases.get(source) {
+            aliases.extend(existing.iter().cloned());
+        }
+        for name in aliases.clone() {
+            self.translator_map_aliases.insert(name, aliases.clone());
+        }
+    }
+
+    fn translator_map_alias_group(&self, name: &str) -> BTreeSet<String> {
+        self.translator_map_aliases
             .get(name)
             .cloned()
             .unwrap_or_else(|| BTreeSet::from([name.to_string()]))
@@ -10787,10 +10850,74 @@ impl SourceUsageCollector {
                         .as_ref()
                         .is_none_or(|file| !file.shadowed_builtins.contains("Map")) =>
             {
-                let source = new_expression.arguments.first()?.as_expression()?;
-                let Expression::ArrayExpression(entries) = source.get_inner_expression() else {
-                    return None;
+                let Some(source) = new_expression
+                    .arguments
+                    .first()
+                    .and_then(Argument::as_expression)
+                else {
+                    return Some(TranslatorObjectBinding::default());
                 };
+                self.translator_map_from_expression(source)
+                    .or_else(|| self.translator_map_entries_from_expression(source))
+            }
+            Expression::CallExpression(call) => {
+                let member = call.callee.get_member_expr()?;
+                if member.static_property_name() != Some("set") {
+                    return None;
+                }
+                let mut map = self.translator_map_from_expression(member.object())?;
+                let binding = call
+                    .arguments
+                    .get(1)
+                    .and_then(|argument| self.translator_binding_from_argument(argument))?;
+                if let Some(keys) = call
+                    .arguments
+                    .first()
+                    .and_then(|argument| self.finite_strings_from_argument(argument))
+                {
+                    let exact = keys.len() == 1;
+                    for key in keys {
+                        map.assign_path(
+                            &key,
+                            AssignmentOperator::Assign,
+                            exact,
+                            Some(&binding),
+                            None,
+                        );
+                    }
+                } else {
+                    map.bindings
+                        .insert(format!("@entry{}", map.bindings.len()), binding);
+                    map.mark_unknown("");
+                }
+                Some(map)
+            }
+            Expression::ConditionalExpression(conditional) => {
+                let left = self.translator_map_from_expression(&conditional.consequent);
+                let right = self.translator_map_from_expression(&conditional.alternate);
+                match (left, right) {
+                    (Some(left), Some(right)) => Some(left.merge_alternative(right)),
+                    (Some(mut map), None) | (None, Some(mut map)) => {
+                        map.mark_unknown("");
+                        Some(map)
+                    }
+                    (None, None) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn translator_map_entries_from_expression(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<TranslatorObjectBinding> {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => self
+                .translator_map_entries
+                .get(identifier.name.as_str())
+                .cloned(),
+            Expression::ArrayExpression(entries) => {
                 let mut result = TranslatorObjectBinding::default();
                 for entry in &entries.elements {
                     let Some(Expression::ArrayExpression(pair)) = entry.as_expression() else {
@@ -10838,11 +10965,11 @@ impl SourceUsageCollector {
                         );
                     }
                 }
-                (!result.bindings.is_empty()).then_some(result)
+                (!result.bindings.is_empty() || !result.unknown_paths.is_empty()).then_some(result)
             }
             Expression::ConditionalExpression(conditional) => {
-                let left = self.translator_map_from_expression(&conditional.consequent);
-                let right = self.translator_map_from_expression(&conditional.alternate);
+                let left = self.translator_map_entries_from_expression(&conditional.consequent);
+                let right = self.translator_map_entries_from_expression(&conditional.alternate);
                 match (left, right) {
                     (Some(left), Some(right)) => Some(left.merge_alternative(right)),
                     (Some(mut map), None) | (None, Some(mut map)) => {
@@ -10878,7 +11005,19 @@ impl SourceUsageCollector {
                         .as_ref()
                         .is_none_or(|file| !file.shadowed_builtins.contains("Set")) =>
             {
-                let source = new_expression.arguments.first()?.as_expression()?;
+                let Some(source) = new_expression
+                    .arguments
+                    .first()
+                    .and_then(Argument::as_expression)
+                else {
+                    return Some(TranslatorArgumentArray {
+                        bindings: Vec::new(),
+                        safe_layout: false,
+                        set_like: true,
+                        optional: false,
+                        unknown_contents: false,
+                    });
+                };
                 let mut array = self.translator_argument_array_from_expression(source)?;
                 array.safe_layout = false;
                 array.set_like = true;
@@ -11028,6 +11167,20 @@ impl SourceUsageCollector {
                 unknown_contents: !bindings.unknown_paths.is_empty(),
             });
         }
+        if matches!(method, "values" | "entries") && call.arguments.is_empty() {
+            if let Some(map) = self.translator_map_from_expression(member.object()) {
+                let bindings = map.bindings.into_values().map(Some).collect::<Vec<_>>();
+                if !bindings.is_empty() {
+                    return Some(TranslatorArgumentArray {
+                        bindings,
+                        safe_layout: false,
+                        set_like: false,
+                        optional: false,
+                        unknown_contents: !map.unknown_paths.is_empty() || method == "entries",
+                    });
+                }
+            }
+        }
         if method == "from" && is_identifier_expression(member.object(), "Array") {
             let source = call.arguments.first()?.as_expression()?;
             let mut array = self.translator_argument_array_from_expression(source)?;
@@ -11047,6 +11200,17 @@ impl SourceUsageCollector {
         }
         let mut array = self.translator_argument_array_from_expression(member.object())?;
         match method.as_ref() {
+            "add" if call.arguments.len() == 1 && array.set_like => {
+                if let Some(binding) = call
+                    .arguments
+                    .first()
+                    .and_then(|argument| self.translator_binding_from_argument(argument))
+                {
+                    array.bindings.push(Some(binding));
+                }
+                array.safe_layout = false;
+                Some(array)
+            }
             "values" if call.arguments.is_empty() => {
                 array.safe_layout = false;
                 array.set_like = false;
@@ -12503,7 +12667,14 @@ impl SourceUsageCollector {
         if !matches!(method, "map" | "flatMap" | "forEach") {
             return false;
         }
-        let Some(binding) = self.translator_iteration_binding(member.object()) else {
+        let binding = if method == "forEach" {
+            self.translator_map_from_expression(member.object())
+                .and_then(TranslatorObjectBinding::aggregate_binding)
+                .or_else(|| self.translator_iteration_binding(member.object()))
+        } else {
+            self.translator_iteration_binding(member.object())
+        };
+        let Some(binding) = binding else {
             return false;
         };
         let Some(callback) = call.arguments.first() else {
@@ -13562,6 +13733,16 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             .init
             .as_ref()
             .and_then(|init| self.translator_map_from_expression(init));
+        let translator_map_entries = declarator
+            .init
+            .as_ref()
+            .and_then(|init| self.translator_map_entries_from_expression(init));
+        let translator_map_alias_source = declarator.init.as_ref().and_then(|init| {
+            let identifier = init.get_identifier_reference()?;
+            self.translator_maps
+                .contains_key(identifier.name.as_str())
+                .then(|| identifier.name.to_string())
+        });
         let translator_object_bindings = declarator
             .init
             .as_ref()
@@ -13621,6 +13802,16 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         }
         if let (Some(name), Some(map)) = (binding_identifier_name(&declarator.id), translator_map) {
             self.translator_maps.insert(name.to_string(), map);
+            if let Some(source) = &translator_map_alias_source {
+                self.register_translator_map_alias(name, source);
+            }
+        }
+        if let (Some(name), Some(entries)) = (
+            binding_identifier_name(&declarator.id),
+            translator_map_entries,
+        ) {
+            self.translator_map_entries
+                .insert(name.to_string(), entries);
         }
         if declarator.kind == VariableDeclarationKind::Const {
             if let Some(init) = &declarator.init {
@@ -13720,6 +13911,62 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if let Some(member) = call.callee.get_member_expr()
+            && member.static_property_name() == Some("set")
+            && let Some(identifier) = member.object().get_identifier_reference()
+            && self.translator_maps.contains_key(identifier.name.as_str())
+        {
+            let key = call
+                .arguments
+                .first()
+                .and_then(|argument| self.finite_strings_from_argument(argument));
+            let binding = call
+                .arguments
+                .get(1)
+                .and_then(|argument| self.translator_binding_from_argument(argument));
+            if let Some(binding) = binding {
+                for alias in self.translator_map_alias_group(identifier.name.as_str()) {
+                    let map = self.translator_maps.entry(alias).or_default();
+                    if let Some(keys) = &key {
+                        let exact = keys.len() == 1;
+                        for key in keys {
+                            map.assign_path(
+                                key,
+                                AssignmentOperator::Assign,
+                                exact,
+                                Some(&binding),
+                                None,
+                            );
+                        }
+                    } else {
+                        map.bindings
+                            .insert(format!("@entry{}", map.bindings.len()), binding.clone());
+                        map.mark_unknown("");
+                    }
+                }
+            }
+        }
+        if let Some(member) = call.callee.get_member_expr()
+            && member.static_property_name() == Some("add")
+            && let Some(identifier) = member.object().get_identifier_reference()
+            && self
+                .translator_argument_arrays
+                .get(identifier.name.as_str())
+                .is_some_and(|array| array.set_like)
+        {
+            let binding = call
+                .arguments
+                .first()
+                .and_then(|argument| self.translator_binding_from_argument(argument));
+            for alias in self.translator_array_alias_group(identifier.name.as_str()) {
+                if let Some(array) = self.translator_argument_arrays.get_mut(&alias) {
+                    if let Some(binding) = &binding {
+                        array.bindings.push(Some(binding.clone()));
+                    }
+                    array.safe_layout = false;
+                }
+            }
+        }
         if let Some(member) = call.callee.get_member_expr()
             && let Some(method) = member.static_property_name()
             && ARRAY_MUTATING_METHODS.contains(&method)
@@ -13943,6 +14190,11 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             let right_argument_array =
                 self.translator_argument_array_from_expression(&expression.right);
             let right_translator_map = self.translator_map_from_expression(&expression.right);
+            let right_translator_map_alias = expression
+                .right
+                .get_identifier_reference()
+                .filter(|identifier| self.translator_maps.contains_key(identifier.name.as_str()))
+                .map(|identifier| identifier.name.to_string());
             let right_argument_array_aliases = right_argument_array
                 .as_ref()
                 .map(|_| self.translator_argument_array_alias_sources(&expression.right))
@@ -14054,6 +14306,9 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             }
             if let Some(map) = translator_map {
                 self.translator_maps.insert(name.to_string(), map);
+                if let Some(source) = right_translator_map_alias {
+                    self.register_translator_map_alias(name, &source);
+                }
             }
         }
         let assigned_binding = self.translator_binding_from_expression(&expression.right);
@@ -14123,6 +14378,17 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     }
 
     fn visit_for_of_statement(&mut self, statement: &ForOfStatement<'a>) {
+        if let Some(binding) = self.translator_iteration_binding(&statement.right) {
+            if let Some(name) = self.for_of_binding_name(statement).map(str::to_string) {
+                self.with_translator_binding(&name, binding, |collector| {
+                    collector.visit_statement(&statement.body);
+                });
+            } else {
+                self.record_dynamic_key_for_binding(&binding, statement.span.start, None);
+                self.visit_statement(&statement.body);
+            }
+            return;
+        }
         if let Some(values) = self.finite_record_iterable_from_expression(&statement.right) {
             if let Some(binding) = self.for_of_binding_name(statement).map(str::to_string) {
                 self.with_finite_record_constant(&binding, values, |collector| {
@@ -15241,6 +15507,112 @@ mod tests {
         assert!(scan.used_ids.contains("common.dynamic"));
         assert!(scan.used_ids.contains("settings.dynamic"));
         assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn map_entry_aliases_and_value_iteration_preserve_translators() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const entries = [
+              ['common', common],
+              ['settings', settings],
+            ];
+            const formatters = new Map(entries);
+            formatters.get('common')('exact');
+            formatters.forEach(render => render('iterated'));
+            const values = Array.from(formatters.values());
+            values[0]('materialized');
+            for (const [, render] of formatters.entries()) render('entry');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.exact"));
+        assert!(scan.used_ids.contains("common.iterated"));
+        assert!(scan.used_ids.contains("settings.iterated"));
+        assert!(scan.used_ids.contains("common.materialized"));
+        assert!(scan.used_ids.contains("settings.materialized"));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 14));
+    }
+
+    #[test]
+    fn mutable_map_and_set_aliases_preserve_added_translators() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const formatters = new Map();
+            const mapAlias = formatters;
+            mapAlias.set('common', common);
+            formatters.get('common')('mapped');
+            const renderers = new Set();
+            const setAlias = renderers;
+            setAlias.add(settings);
+            renderers.forEach(render => render('set-value'));
+            const chainedMap = new Map().set('settings', settings);
+            chainedMap.get('settings')('chained-map');
+            const chainedSet = new Set().add(common);
+            chainedSet.forEach(render => render('chained-set'));
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.mapped"));
+        assert!(scan.used_ids.contains("settings.chained-map"));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 12));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 16));
+    }
+
+    #[test]
+    fn for_of_preserves_translator_array_and_set_contents() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            for (const render of [common]) render('array-loop');
+            for (const render of new Set([settings])) render('set-loop');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.array-loop"));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 6));
+    }
+
+    #[test]
+    fn transformed_callbacks_preserve_forwarded_helper_parameters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("main.ts");
+        let helper = dir.path().join("helper.ts");
+        fs::write(
+            &main,
+            r#"
+            import {useTranslations} from 'next-intl';
+            import {wrapFormatter} from './helper';
+            const common = useTranslations('common');
+            const values = wrapFormatter(common);
+            values[0]('forwarded');
+            "#,
+        )
+        .expect("write main source");
+        fs::write(
+            &helper,
+            r#"
+            function passThrough(value) {
+              return value;
+            }
+            export function wrapFormatter(format) {
+              return [1].map(() => passThrough(format));
+            }
+            "#,
+        )
+        .expect("write helper source");
+
+        let scan = collect_usage_from_files(dir.path(), &[main, helper]).expect("scan project");
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 6));
     }
 
     #[test]
