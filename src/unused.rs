@@ -7469,6 +7469,20 @@ impl TranslatorReturnCollector {
             _ => true,
         });
         forwards.extend(self.parameter_calls_from_expression(expression));
+        match expression.get_inner_expression() {
+            Expression::AwaitExpression(await_expression) => {
+                forwards.extend(self.forwards_from_expression(&await_expression.argument));
+            }
+            Expression::ConditionalExpression(conditional) => {
+                forwards.extend(self.forwards_from_expression(&conditional.consequent));
+                forwards.extend(self.forwards_from_expression(&conditional.alternate));
+            }
+            Expression::LogicalExpression(logical) => {
+                forwards.extend(self.forwards_from_expression(&logical.left));
+                forwards.extend(self.forwards_from_expression(&logical.right));
+            }
+            _ => {}
+        }
         if let Expression::CallExpression(call) = expression.get_inner_expression()
             && let Some(member) = call.callee.get_member_expr()
             && let Some(method) = member.static_property_name()
@@ -7479,7 +7493,7 @@ impl TranslatorReturnCollector {
                     Some(1)
                 } else if matches!(
                     method,
-                    "map" | "flatMap" | "reduce" | "reduceRight" | "then"
+                    "map" | "flatMap" | "reduce" | "reduceRight" | "then" | "catch"
                 ) {
                     Some(0)
                 } else {
@@ -7747,7 +7761,7 @@ impl TranslatorReturnCollector {
                             .and_then(|callback| self.callback_binding_from_argument(callback));
                         merge_translator_binding_iter(receiver.into_iter().chain(callback))
                     }
-                    "then" => call
+                    "then" | "catch" => call
                         .arguments
                         .first()
                         .and_then(|callback| self.callback_binding_from_argument(callback)),
@@ -7982,6 +7996,7 @@ impl TranslatorReturnCollector {
                             | "reduce"
                             | "reduceRight"
                             | "then"
+                            | "catch"
                             | "slice"
                             | "filter"
                             | "splice"
@@ -11013,14 +11028,29 @@ impl SourceUsageCollector {
         self.translator_binding_from_expression(expression)
             .or_else(|| {
                 self.translator_argument_array_from_expression(expression)
-                    .and_then(|array| {
-                        merge_translator_binding_iter(array.bindings.into_iter().flatten())
-                    })
+                    .and_then(Self::aggregate_translator_argument_array)
             })
             .or_else(|| {
                 self.translator_object_bindings_from_expression(expression)
                     .and_then(TranslatorObjectBinding::aggregate_binding)
             })
+    }
+
+    fn aggregate_translator_argument_array(
+        array: TranslatorArgumentArray,
+    ) -> Option<TranslatorBinding> {
+        let unknown_contents = array.unknown_contents;
+        let binding = merge_translator_binding_iter(array.bindings.into_iter().flatten());
+        if unknown_contents {
+            binding.map(|binding| {
+                merge_translator_bindings(
+                    &binding,
+                    &translator_binding_from_namespace_arg(NamespaceArg::Dynamic),
+                )
+            })
+        } else {
+            binding
+        }
     }
 
     fn translator_map_from_expression(
@@ -11099,6 +11129,16 @@ impl SourceUsageCollector {
         }
     }
 
+    fn extend_translator_map_entries(
+        target: &mut TranslatorObjectBinding,
+        source: TranslatorObjectBinding,
+    ) {
+        for (key, binding) in source.bindings {
+            target.assign_path(&key, AssignmentOperator::Assign, true, Some(&binding), None);
+        }
+        target.unknown_paths.extend(source.unknown_paths);
+    }
+
     fn translator_map_entries_from_expression(
         &self,
         expression: &Expression<'_>,
@@ -11110,13 +11150,32 @@ impl SourceUsageCollector {
                 .cloned(),
             Expression::CallExpression(call) => {
                 let member = call.callee.get_member_expr()?;
-                if member.static_property_name() != Some("entries")
-                    || !is_identifier_expression(member.object(), "Object")
-                {
-                    return None;
+                let method = member.static_property_name()?;
+                if method == "entries" && is_identifier_expression(member.object(), "Object") {
+                    let source = call.arguments.first()?.as_expression()?;
+                    return self.translator_object_bindings_from_expression(source);
                 }
-                let source = call.arguments.first()?.as_expression()?;
-                self.translator_object_bindings_from_expression(source)
+                let mut result = self.translator_map_entries_from_expression(member.object())?;
+                match method.as_ref() {
+                    "slice" | "filter" | "toReversed" | "toSorted" => Some(result),
+                    "concat" => {
+                        for argument in &call.arguments {
+                            let expression = match argument {
+                                Argument::SpreadElement(spread) => &spread.argument,
+                                _ => argument.as_expression()?,
+                            };
+                            if let Some(entries) =
+                                self.translator_map_entries_from_expression(expression)
+                            {
+                                Self::extend_translator_map_entries(&mut result, entries);
+                            } else {
+                                result.mark_unknown("");
+                            }
+                        }
+                        Some(result)
+                    }
+                    _ => None,
+                }
             }
             Expression::ArrayExpression(entries) => {
                 let mut result = TranslatorObjectBinding::default();
@@ -11125,16 +11184,7 @@ impl SourceUsageCollector {
                         if let Some(spread) =
                             self.translator_map_entries_from_expression(&spread.argument)
                         {
-                            for (key, binding) in spread.bindings {
-                                result.assign_path(
-                                    &key,
-                                    AssignmentOperator::Assign,
-                                    true,
-                                    Some(&binding),
-                                    None,
-                                );
-                            }
-                            result.unknown_paths.extend(spread.unknown_paths);
+                            Self::extend_translator_map_entries(&mut result, spread);
                         } else {
                             result.mark_unknown("");
                         }
@@ -11194,9 +11244,7 @@ impl SourceUsageCollector {
             })
             .or_else(|| {
                 self.translator_argument_array_from_expression(value)
-                    .and_then(|array| {
-                        merge_translator_binding_iter(array.bindings.into_iter().flatten())
-                    })
+                    .and_then(Self::aggregate_translator_argument_array)
             })?;
         let mut result = TranslatorObjectBinding::default();
         if let Some(keys) = self.finite_strings_from_expression(key) {
@@ -11884,9 +11932,7 @@ impl SourceUsageCollector {
             })
             .or_else(|| {
                 self.translator_argument_array_from_expression(expression)
-                    .and_then(|array| {
-                        merge_translator_binding_iter(array.bindings.into_iter().flatten())
-                    })
+                    .and_then(Self::aggregate_translator_argument_array)
             })
     }
 
@@ -14483,6 +14529,8 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             let right_argument_array =
                 self.translator_argument_array_from_expression(&expression.right);
             let right_translator_map = self.translator_map_from_expression(&expression.right);
+            let right_translator_map_entries =
+                self.translator_map_entries_from_expression(&expression.right);
             let right_translator_map_aliases = self.translator_map_alias_sources(&expression.right);
             let right_argument_array_aliases = right_argument_array
                 .as_ref()
@@ -14493,6 +14541,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             let current_object_bindings = self.translator_object_bindings.get(name).cloned();
             let current_argument_array = self.translator_argument_arrays.get(name).cloned();
             let current_translator_map = self.translator_maps.get(name).cloned();
+            let current_translator_map_entries = self.translator_map_entries.get(name).cloned();
             let mut current_argument_array_aliases = self.translator_array_alias_group(name);
             current_argument_array_aliases.remove(name);
 
@@ -14577,6 +14626,22 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 }
                 _ => unreachable!("identifier branch only handles assignment operators"),
             };
+            let translator_map_entries = match expression.operator {
+                AssignmentOperator::Assign | AssignmentOperator::LogicalAnd => {
+                    right_translator_map_entries
+                }
+                AssignmentOperator::LogicalOr | AssignmentOperator::LogicalNullish => {
+                    match (current_translator_map_entries, right_translator_map_entries) {
+                        (Some(current), Some(right)) => Some(current.merge_alternative(right)),
+                        (Some(mut current), None) | (None, Some(mut current)) => {
+                            current.mark_unknown("");
+                            Some(current)
+                        }
+                        (None, None) => None,
+                    }
+                }
+                _ => unreachable!("identifier branch only handles assignment operators"),
+            };
             self.mask_binding_name(name);
             if let Some(binding) = translator {
                 self.translators.insert(name.to_string(), binding);
@@ -14598,6 +14663,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 for source in right_translator_map_aliases {
                     self.register_translator_map_alias(name, &source);
                 }
+            }
+            if let Some(entries) = translator_map_entries {
+                self.translator_map_entries
+                    .insert(name.to_string(), entries);
             }
         }
         let assigned_binding = self.translator_binding_from_expression(&expression.right);
@@ -16013,6 +16082,38 @@ mod tests {
     }
 
     #[test]
+    fn branched_awaited_and_catch_callbacks_preserve_forwarded_parameters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper = dir.path().join("helper.ts");
+        fs::write(
+            &helper,
+            r#"
+            function passThrough(value) { return value; }
+            export function conditional(format, enabled) {
+              return enabled ? [1].map(() => passThrough(format)) : [];
+            }
+            export async function awaited(format) {
+              return await Promise.resolve().then(() => passThrough(format));
+            }
+            export function recovered(format) {
+              return Promise.reject().catch(() => passThrough(format));
+            }
+            "#,
+        )
+        .expect("write helper source");
+        let project = ProjectIndex::build(dir.path(), std::slice::from_ref(&helper))
+            .expect("build project index");
+
+        for name in ["conditional", "awaited", "recovered"] {
+            assert_eq!(
+                project.translator_array_return_params_for_local(&helper, name),
+                BTreeSet::from([0]),
+                "missing forwarded parameter for {name}"
+            );
+        }
+    }
+
+    #[test]
     fn mixed_map_chains_preserve_later_translator_values() {
         let scan = scan(
             r#"
@@ -16099,6 +16200,28 @@ mod tests {
     }
 
     #[test]
+    fn transformed_and_reassigned_map_entries_preserve_translators() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            let entries = [['common', common]];
+            entries = entries
+              .filter(Boolean)
+              .concat([['settings', settings]])
+              .slice();
+            const formatters = new Map(entries);
+            formatters.get('common')('filtered');
+            formatters.get('settings')('concatenated');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.filtered"));
+        assert!(scan.used_ids.contains("settings.concatenated"));
+    }
+
+    #[test]
     fn nested_collection_container_values_are_conservatively_protected() {
         let scan = scan(
             r#"
@@ -16119,6 +16242,23 @@ mod tests {
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 7));
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 10));
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 12));
+    }
+
+    #[test]
+    fn uncertain_nested_collections_keep_dynamic_namespace_protection() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const values = [common];
+            values.push(runtimeValue);
+            const formatters = new Map();
+            formatters.set('group', values);
+            formatters.forEach(([render]) => render('uncertain'));
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 8));
     }
 
     #[test]
