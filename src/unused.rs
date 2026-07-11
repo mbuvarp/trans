@@ -3160,6 +3160,7 @@ struct SourceUsageCollector {
     translator_map_aliases: TranslatorArrayAliases,
     translator_callback_returns: BTreeMap<String, TranslatorBinding>,
     potential_translators: BTreeSet<String>,
+    potential_wrapper_values: BTreeSet<String>,
     shadowed_react_bindings: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
     binding_scopes: Vec<BindingEnvironment>,
@@ -3196,6 +3197,7 @@ struct BindingEnvironment {
     translator_map_aliases: TranslatorArrayAliases,
     translator_callback_returns: BTreeMap<String, TranslatorBinding>,
     potential_translators: BTreeSet<String>,
+    potential_wrapper_values: BTreeSet<String>,
     shadowed_react_bindings: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
     next_intl_namespaces: BTreeSet<String>,
@@ -3832,6 +3834,8 @@ fn finite_record_return_summary_from_arrow(
         BTreeMap::new(),
         BTreeMap::new(),
         BTreeMap::new(),
+        BTreeSet::new(),
+        BTreeSet::new(),
     )
 }
 
@@ -3846,6 +3850,8 @@ fn finite_record_return_summary_from_function(function: &Function<'_>) -> Option
         BTreeMap::new(),
         BTreeMap::new(),
         BTreeMap::new(),
+        BTreeSet::new(),
+        BTreeSet::new(),
     )
 }
 
@@ -3858,6 +3864,8 @@ fn finite_record_return_summary_from_function_with_context(
     record_iterables: &FiniteRecordBindings,
     record_maps: &FiniteRecordMaps,
     enum_member_domains: &TypeDomains,
+    react_use_memo_identifiers: BTreeSet<String>,
+    react_namespaces: BTreeSet<String>,
 ) -> Option<FiniteRecords> {
     let body = function.body.as_ref()?;
     finite_record_return_summary_from_body(
@@ -3869,6 +3877,8 @@ fn finite_record_return_summary_from_function_with_context(
         record_iterables.clone(),
         record_maps.clone(),
         enum_member_domains.clone(),
+        react_use_memo_identifiers,
+        react_namespaces,
     )
 }
 
@@ -3881,6 +3891,8 @@ fn finite_record_return_summary_from_body(
     finite_record_iterables: FiniteRecordBindings,
     finite_record_maps: FiniteRecordMaps,
     enum_member_domains: TypeDomains,
+    react_use_memo_identifiers: BTreeSet<String>,
+    react_namespaces: BTreeSet<String>,
 ) -> Option<FiniteRecords> {
     let mut collector = ReturnRecordCollector {
         finite_constants,
@@ -3890,6 +3902,8 @@ fn finite_record_return_summary_from_body(
         finite_record_iterables,
         finite_record_maps,
         enum_member_domains,
+        react_use_memo_identifiers,
+        react_namespaces,
         return_records: Vec::new(),
         unknown_return: false,
     };
@@ -4041,6 +4055,10 @@ fn merge_optional_translator_bindings(
         )),
         (None, None) => None,
     }
+}
+
+fn dynamic_translator_binding() -> TranslatorBinding {
+    translator_binding_from_namespace_arg(NamespaceArg::Dynamic)
 }
 
 fn merge_translator_argument_arrays(
@@ -4941,20 +4959,6 @@ fn finite_record_property_iterable(
     }
 }
 
-fn call_is_named_callback_value_wrapper(call: &CallExpression<'_>, name: &str) -> bool {
-    if call
-        .callee
-        .get_identifier_reference()
-        .is_some_and(|identifier| identifier.name.as_str() == name)
-    {
-        return true;
-    }
-    call.callee
-        .get_member_expr()
-        .and_then(|member| member.static_property_name())
-        .is_some_and(|property| property == name)
-}
-
 #[derive(Clone, Default)]
 struct CallbackLocalValue {
     binding: Option<TranslatorBinding>,
@@ -4981,10 +4985,21 @@ impl<F> CallbackReturnExpressionCollector<'_, '_, F> {
         }
         let object = self
             .source
-            .translator_object_bindings_from_expression(expression);
+            .translator_object_bindings_from_expression(expression)
+            .or_else(|| {
+                matches!(
+                    expression.get_inner_expression(),
+                    Expression::ObjectExpression(_)
+                )
+                .then(TranslatorObjectBinding::default)
+            });
         let array = self
             .source
             .translator_argument_array_from_expression(expression);
+        let map = self.source.translator_map_from_expression(expression);
+        let entries = self
+            .source
+            .translator_map_entries_from_expression(expression);
         let binding = self
             .source
             .translator_binding_from_expression(expression)
@@ -4997,17 +5012,59 @@ impl<F> CallbackReturnExpressionCollector<'_, '_, F> {
                 array
                     .clone()
                     .and_then(SourceUsageCollector::aggregate_translator_argument_array)
+            })
+            .or_else(|| {
+                map.clone()
+                    .and_then(TranslatorObjectBinding::aggregate_binding)
+            })
+            .or_else(|| {
+                entries
+                    .clone()
+                    .and_then(TranslatorObjectBinding::aggregate_binding)
             });
         CallbackLocalValue {
             binding,
             object,
-            map: self.source.translator_map_from_expression(expression),
-            entries: self
-                .source
-                .translator_map_entries_from_expression(expression),
+            map,
+            entries,
             entry: self.source.translator_map_entry_from_expression(expression),
             array,
         }
+    }
+
+    fn refresh_local_binding(&mut self, name: &str) {
+        let Some(local) = self.locals.get_mut(name) else {
+            return;
+        };
+        let bindings = local
+            .binding
+            .clone()
+            .into_iter()
+            .chain(
+                local
+                    .object
+                    .clone()
+                    .and_then(TranslatorObjectBinding::aggregate_binding),
+            )
+            .chain(
+                local
+                    .map
+                    .clone()
+                    .and_then(TranslatorObjectBinding::aggregate_binding),
+            )
+            .chain(
+                local
+                    .entries
+                    .clone()
+                    .and_then(TranslatorObjectBinding::aggregate_binding),
+            )
+            .chain(
+                local
+                    .array
+                    .clone()
+                    .and_then(SourceUsageCollector::aggregate_translator_argument_array),
+            );
+        local.binding = merge_translator_binding_iter(bindings);
     }
 }
 
@@ -5035,6 +5092,264 @@ where
             .map(|init| self.local_value_from_expression(init))
             .unwrap_or_default();
         self.locals.insert(name.to_string(), value);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        let Some(member) = call.callee.get_member_expr() else {
+            walk::walk_call_expression(self, call);
+            return;
+        };
+        let Some(object) = member.object().get_identifier_reference() else {
+            walk::walk_call_expression(self, call);
+            return;
+        };
+        let name = object.name.as_str();
+        let Some(method) = member.static_property_name() else {
+            walk::walk_call_expression(self, call);
+            return;
+        };
+
+        if method == "set"
+            && self
+                .locals
+                .get(name)
+                .is_some_and(|local| local.map.is_some())
+        {
+            let keys = call
+                .arguments
+                .first()
+                .and_then(|argument| self.source.finite_strings_from_argument(argument));
+            let binding = call
+                .arguments
+                .get(1)
+                .and_then(Argument::as_expression)
+                .and_then(|expression| self.local_value_from_expression(expression).binding);
+            let map = self
+                .locals
+                .get_mut(name)
+                .and_then(|local| local.map.as_mut())
+                .expect("checked callback-local Map");
+            if let Some(keys) = keys {
+                let exact = keys.len() == 1;
+                for key in keys {
+                    if let Some(binding) = &binding {
+                        map.assign_path(
+                            &key,
+                            AssignmentOperator::Assign,
+                            exact,
+                            Some(binding),
+                            None,
+                        );
+                    } else if map.bindings.is_empty() {
+                        map.mark_unknown(&key);
+                    } else {
+                        let dynamic = dynamic_translator_binding();
+                        map.assign_path(
+                            &key,
+                            AssignmentOperator::Assign,
+                            exact,
+                            Some(&dynamic),
+                            None,
+                        );
+                    }
+                }
+            } else {
+                if let Some(binding) = binding {
+                    map.bindings
+                        .insert(format!("@entry{}", map.bindings.len()), binding);
+                } else if !map.bindings.is_empty() {
+                    map.bindings.insert(
+                        format!("@entry{}", map.bindings.len()),
+                        dynamic_translator_binding(),
+                    );
+                }
+                map.mark_unknown("");
+            }
+            self.refresh_local_binding(name);
+            return;
+        }
+
+        if method == "add"
+            && self
+                .locals
+                .get(name)
+                .and_then(|local| local.array.as_ref())
+                .is_some_and(|array| array.set_like)
+        {
+            let binding = call
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .and_then(|expression| self.local_value_from_expression(expression).binding);
+            let array = self
+                .locals
+                .get_mut(name)
+                .and_then(|local| local.array.as_mut())
+                .expect("checked callback-local Set");
+            if let Some(binding) = binding {
+                array.bindings.push(Some(binding));
+            } else if array.bindings.iter().any(Option::is_some) {
+                array.bindings.push(Some(dynamic_translator_binding()));
+            }
+            array.safe_layout = false;
+            array.unknown_contents = true;
+            self.refresh_local_binding(name);
+            return;
+        }
+
+        if matches!(method, "push" | "unshift" | "splice") {
+            let offset = if method == "splice" { 2 } else { 0 };
+            if self
+                .locals
+                .get(name)
+                .is_some_and(|local| local.entries.is_some())
+            {
+                let mut additions = Vec::new();
+                let mut unresolved = false;
+                for argument in call.arguments.iter().skip(offset) {
+                    let entry = match argument {
+                        Argument::SpreadElement(spread) => {
+                            let local = self.local_value_from_expression(&spread.argument);
+                            local.entries.or_else(|| {
+                                self.source
+                                    .translator_map_entries_from_expression(&spread.argument)
+                            })
+                        }
+                        _ => argument.as_expression().and_then(|expression| {
+                            let local = self.local_value_from_expression(expression);
+                            local.entry.or_else(|| {
+                                self.source.translator_map_entry_from_expression(expression)
+                            })
+                        }),
+                    };
+                    if let Some(entry) = entry {
+                        additions.push(entry);
+                    } else {
+                        unresolved = true;
+                    }
+                }
+                let entries = self
+                    .locals
+                    .get_mut(name)
+                    .and_then(|local| local.entries.as_mut())
+                    .expect("checked callback-local entries");
+                for addition in additions {
+                    if method == "push" {
+                        SourceUsageCollector::extend_translator_map_entries(entries, addition);
+                    } else {
+                        SourceUsageCollector::extend_unordered_translator_map_entries(
+                            entries, addition,
+                        );
+                    }
+                }
+                if unresolved {
+                    if !entries.bindings.is_empty() {
+                        entries.bindings.insert(
+                            format!("@entry{}", entries.bindings.len()),
+                            dynamic_translator_binding(),
+                        );
+                    }
+                }
+                if unresolved {
+                    entries.mark_unknown("");
+                }
+            }
+            if self
+                .locals
+                .get(name)
+                .is_some_and(|local| local.array.is_some())
+            {
+                let mut bindings = Vec::new();
+                for argument in call.arguments.iter().skip(offset) {
+                    let binding = match argument {
+                        Argument::SpreadElement(spread) => self
+                            .local_value_from_expression(&spread.argument)
+                            .array
+                            .and_then(SourceUsageCollector::aggregate_translator_argument_array),
+                        _ => argument.as_expression().and_then(|expression| {
+                            self.local_value_from_expression(expression).binding
+                        }),
+                    };
+                    bindings.push(binding);
+                }
+                let array = self
+                    .locals
+                    .get_mut(name)
+                    .and_then(|local| local.array.as_mut())
+                    .expect("checked callback-local array");
+                let has_known = array.bindings.iter().any(Option::is_some)
+                    || bindings.iter().any(Option::is_some);
+                array
+                    .bindings
+                    .extend(bindings.into_iter().filter_map(|binding| {
+                        binding
+                            .map(Some)
+                            .or_else(|| has_known.then(|| Some(dynamic_translator_binding())))
+                    }));
+                array.safe_layout = false;
+                array.unknown_contents = true;
+            }
+            self.refresh_local_binding(name);
+            return;
+        }
+
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
+        if expression.operator == AssignmentOperator::Assign
+            && let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &expression.left
+            && self.locals.contains_key(identifier.name.as_str())
+        {
+            let value = self.local_value_from_expression(&expression.right);
+            self.locals.insert(identifier.name.to_string(), value);
+            return;
+        }
+
+        let binding = self.local_value_from_expression(&expression.right).binding;
+        if let Some((name, path)) = assignment_target_static_member_path(&expression.left)
+            && let Some(local) = self.locals.get_mut(name)
+        {
+            if let Some(object) = local.object.as_mut() {
+                if let Some(binding) = &binding {
+                    object.assign_path(
+                        &path.join("."),
+                        expression.operator,
+                        true,
+                        Some(binding),
+                        None,
+                    );
+                } else {
+                    object.mark_unknown(&path.join("."));
+                }
+            }
+            if let Some(array) = local.array.as_mut() {
+                if let Some(binding) = &binding {
+                    array.bindings.push(Some(binding.clone()));
+                } else if array.bindings.iter().any(Option::is_some) {
+                    array.bindings.push(Some(dynamic_translator_binding()));
+                }
+                array.safe_layout = false;
+                array.unknown_contents = true;
+            }
+            if let Some(entries) = local.entries.as_mut() {
+                if let Some(binding) = binding {
+                    entries
+                        .bindings
+                        .insert(format!("@entry{}", entries.bindings.len()), binding);
+                } else if !entries.bindings.is_empty() {
+                    entries.bindings.insert(
+                        format!("@entry{}", entries.bindings.len()),
+                        dynamic_translator_binding(),
+                    );
+                }
+                entries.mark_unknown("");
+            }
+            self.refresh_local_binding(name);
+            return;
+        }
+
+        walk::walk_assignment_expression(self, expression);
     }
 
     fn visit_return_statement(&mut self, statement: &ReturnStatement<'a>) {
@@ -5125,6 +5440,8 @@ fn finite_records_from_callback_argument(
                 record_iterables.clone(),
                 record_maps.clone(),
                 enum_member_domains.clone(),
+                BTreeSet::new(),
+                BTreeSet::new(),
             )
         }
         Argument::FunctionExpression(function) => finite_record_return_summary_from_body(
@@ -5136,6 +5453,8 @@ fn finite_records_from_callback_argument(
             record_iterables.clone(),
             record_maps.clone(),
             enum_member_domains.clone(),
+            BTreeSet::new(),
+            BTreeSet::new(),
         ),
         _ => None,
     }
@@ -5385,19 +5704,6 @@ fn finite_record_iterable_from_expression(
                 record_maps,
             ) {
                 return Some(records);
-            }
-            if call_is_named_callback_value_wrapper(call, "useMemo") {
-                return call.arguments.first().and_then(|callback| {
-                    finite_records_from_callback_argument(
-                        callback,
-                        constants,
-                        &BTreeMap::new(),
-                        object_maps,
-                        enum_member_domains,
-                        record_iterables,
-                        record_maps,
-                    )
-                });
             }
             let member = call.callee.get_member_expr()?;
             let method = member.static_property_name()?;
@@ -7119,6 +7425,8 @@ struct ReturnRecordCollector {
     finite_record_iterables: FiniteRecordBindings,
     finite_record_maps: FiniteRecordMaps,
     enum_member_domains: TypeDomains,
+    react_use_memo_identifiers: BTreeSet<String>,
+    react_namespaces: BTreeSet<String>,
     return_records: FiniteRecords,
     unknown_return: bool,
 }
@@ -7128,6 +7436,36 @@ impl ReturnRecordCollector {
         &self,
         expression: &Expression<'_>,
     ) -> Option<FiniteRecords> {
+        if let Expression::CallExpression(call) = expression.get_inner_expression() {
+            let react_memo =
+                call.callee
+                    .get_identifier_reference()
+                    .is_some_and(|identifier| {
+                        self.react_use_memo_identifiers
+                            .contains(identifier.name.as_str())
+                    })
+                    || call.callee.get_member_expr().is_some_and(|member| {
+                        member.static_property_name() == Some("useMemo")
+                            && member.object().get_identifier_reference().is_some_and(
+                                |identifier| {
+                                    self.react_namespaces.contains(identifier.name.as_str())
+                                },
+                            )
+                    });
+            if react_memo {
+                return call.arguments.first().and_then(|callback| {
+                    finite_records_from_callback_argument(
+                        callback,
+                        &self.finite_constants,
+                        &self.finite_iterables,
+                        &self.finite_object_maps,
+                        &self.enum_member_domains,
+                        &self.finite_record_iterables,
+                        &self.finite_record_maps,
+                    )
+                });
+            }
+        }
         finite_record_iterable_from_expression(
             expression,
             &self.finite_constants,
@@ -8621,6 +8959,29 @@ struct IndexBindingEnvironment {
 }
 
 impl SourceIndexCollector {
+    fn react_use_memo_identifiers(&self) -> BTreeSet<String> {
+        self.imports
+            .iter()
+            .filter(|(_, target)| {
+                target.source == "react"
+                    && matches!(&target.imported, ImportedName::Named(name) if name == "useMemo")
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    fn react_namespaces(&self) -> BTreeSet<String> {
+        self.namespace_imports
+            .iter()
+            .filter(|(_, source)| source.as_str() == "react")
+            .map(|(name, _)| name.clone())
+            .chain(self.imports.iter().filter_map(|(name, target)| {
+                (target.source == "react" && matches!(target.imported, ImportedName::Default))
+                    .then(|| name.clone())
+            }))
+            .collect()
+    }
+
     fn call_is_react_wrapper(&self, call: &CallExpression<'_>, name: &str) -> bool {
         if let Some(identifier) = call.callee.get_identifier_reference() {
             return self.imports.get(identifier.name.as_str()).is_some_and(|target| {
@@ -8646,6 +9007,35 @@ impl SourceIndexCollector {
                                 })
                     })
         })
+    }
+
+    fn contextual_finite_record_iterable_from_expression(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<FiniteRecords> {
+        if let Expression::CallExpression(call) = expression.get_inner_expression()
+            && self.call_is_react_wrapper(call, "useMemo")
+        {
+            return call.arguments.first().and_then(|callback| {
+                finite_records_from_callback_argument(
+                    callback,
+                    &self.finite_constants,
+                    &self.finite_iterables,
+                    &self.finite_object_maps,
+                    &self.enum_member_domains,
+                    &self.finite_record_iterables,
+                    &self.finite_record_maps,
+                )
+            });
+        }
+        finite_record_iterable_from_expression(
+            expression,
+            &self.finite_constants,
+            &self.finite_object_maps,
+            &self.enum_member_domains,
+            &self.finite_record_iterables,
+            &self.finite_record_maps,
+        )
     }
 
     fn new(path: &Path, source: &str) -> Self {
@@ -9042,14 +9432,7 @@ impl SourceIndexCollector {
             ) {
                 self.finite_object_maps.insert(name.to_string(), values);
             }
-            if let Some(values) = finite_record_iterable_from_expression(
-                init,
-                &self.finite_constants,
-                &self.finite_object_maps,
-                &self.enum_member_domains,
-                &self.finite_record_iterables,
-                &self.finite_record_maps,
-            ) {
+            if let Some(values) = self.contextual_finite_record_iterable_from_expression(init) {
                 self.record_finite_record_iterable(name, values);
             }
             if let Some(values) = finite_record_from_expression(
@@ -9182,6 +9565,8 @@ impl SourceIndexCollector {
                         &self.finite_record_iterables,
                         &self.finite_record_maps,
                         &self.enum_member_domains,
+                        self.react_use_memo_identifiers(),
+                        self.react_namespaces(),
                     );
                 self.default_record_return_summary = default_record_return_summary.clone();
                 let translator_return = function
@@ -9451,6 +9836,8 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                 &self.finite_record_iterables,
                 &self.finite_record_maps,
                 &self.enum_member_domains,
+                self.react_use_memo_identifiers(),
+                self.react_namespaces(),
             ) {
                 self.record_return_record_helper(id.name.as_str(), summary);
             }
@@ -9509,14 +9896,9 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                     ) {
                         self.finite_object_maps.insert(name.to_string(), values);
                     }
-                    if let Some(values) = finite_record_iterable_from_expression(
-                        init,
-                        &self.finite_constants,
-                        &self.finite_object_maps,
-                        &self.enum_member_domains,
-                        &self.finite_record_iterables,
-                        &self.finite_record_maps,
-                    ) {
+                    if let Some(values) =
+                        self.contextual_finite_record_iterable_from_expression(init)
+                    {
                         self.record_finite_record_iterable(name, values);
                     }
                     if let Some(values) = finite_record_from_expression(
@@ -9762,6 +10144,7 @@ impl SourceUsageCollector {
             translator_map_aliases: BTreeMap::new(),
             translator_callback_returns: BTreeMap::new(),
             potential_translators: BTreeSet::new(),
+            potential_wrapper_values: BTreeSet::new(),
             shadowed_react_bindings: BTreeSet::new(),
             message_key_helpers: BTreeMap::new(),
             binding_scopes: Vec::new(),
@@ -9799,6 +10182,7 @@ impl SourceUsageCollector {
             translator_map_aliases: self.translator_map_aliases.clone(),
             translator_callback_returns: self.translator_callback_returns.clone(),
             potential_translators: self.potential_translators.clone(),
+            potential_wrapper_values: self.potential_wrapper_values.clone(),
             shadowed_react_bindings: self.shadowed_react_bindings.clone(),
             message_key_helpers: self.message_key_helpers.clone(),
             next_intl_namespaces: self.next_intl_namespaces.clone(),
@@ -9831,6 +10215,7 @@ impl SourceUsageCollector {
         self.translator_map_aliases = environment.translator_map_aliases;
         self.translator_callback_returns = environment.translator_callback_returns;
         self.potential_translators = environment.potential_translators;
+        self.potential_wrapper_values = environment.potential_wrapper_values;
         self.shadowed_react_bindings = environment.shadowed_react_bindings;
         self.message_key_helpers = environment.message_key_helpers;
         self.next_intl_namespaces = environment.next_intl_namespaces;
@@ -9863,6 +10248,7 @@ impl SourceUsageCollector {
         self.remove_translator_map_alias(name);
         self.translator_callback_returns.remove(name);
         self.potential_translators.remove(name);
+        self.potential_wrapper_values.remove(name);
         self.message_key_helpers.remove(name);
         self.next_intl_namespaces.remove(name);
         self.next_intl_server_namespaces.remove(name);
@@ -10555,6 +10941,19 @@ impl SourceUsageCollector {
                 finite_record_property_iterable(records, member.property.name.as_str())
             }
             Expression::CallExpression(call) => {
+                if self.call_is_react_callback_wrapper(call, "useMemo") {
+                    return call.arguments.first().and_then(|callback| {
+                        finite_records_from_callback_argument(
+                            callback,
+                            &self.finite_constants,
+                            &self.finite_iterables,
+                            &self.finite_object_maps,
+                            &self.enum_member_domains,
+                            &self.finite_record_iterables,
+                            &self.finite_record_maps,
+                        )
+                    });
+                }
                 if let Some(member) = call.callee.get_member_expr() {
                     if let Some(method) = member.static_property_name() {
                         let records = self.finite_record_iterable_from_expression(member.object());
@@ -10653,6 +11052,37 @@ impl SourceUsageCollector {
     fn is_tracked_unbound_translator_call(&self, expression: &Expression<'_>) -> bool {
         self.unbound_translator_name(expression)
             .is_some_and(|name| self.potential_translators.contains(name))
+    }
+
+    fn is_potential_wrapper_translator_call(&self, expression: &Expression<'_>) -> bool {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => {
+                self.potential_wrapper_values
+                    .contains(identifier.name.as_str())
+                    && is_translator_like_name(identifier.name.as_str())
+            }
+            Expression::ComputedMemberExpression(member) => member
+                .object
+                .get_identifier_reference()
+                .is_some_and(|identifier| {
+                    self.potential_wrapper_values
+                        .contains(identifier.name.as_str())
+                }),
+            Expression::CallExpression(call) => {
+                let Some(member) = call.callee.get_member_expr() else {
+                    return false;
+                };
+                member.static_property_name() == Some("get")
+                    && member
+                        .object()
+                        .get_identifier_reference()
+                        .is_some_and(|identifier| {
+                            self.potential_wrapper_values
+                                .contains(identifier.name.as_str())
+                        })
+            }
+            _ => false,
+        }
     }
 
     fn maybe_translator_call(&self, expression: &Expression<'_>) -> Option<TranslatorBinding> {
@@ -11411,9 +11841,6 @@ impl SourceUsageCollector {
                     .arguments
                     .get(1)
                     .and_then(|argument| self.translator_binding_from_argument(argument));
-                let Some(binding) = binding else {
-                    return Some(map);
-                };
                 if let Some(keys) = call
                     .arguments
                     .first()
@@ -11421,17 +11848,37 @@ impl SourceUsageCollector {
                 {
                     let exact = keys.len() == 1;
                     for key in keys {
-                        map.assign_path(
-                            &key,
-                            AssignmentOperator::Assign,
-                            exact,
-                            Some(&binding),
-                            None,
-                        );
+                        if let Some(binding) = &binding {
+                            map.assign_path(
+                                &key,
+                                AssignmentOperator::Assign,
+                                exact,
+                                Some(binding),
+                                None,
+                            );
+                        } else if map.bindings.is_empty() {
+                            map.mark_unknown(&key);
+                        } else {
+                            let dynamic = dynamic_translator_binding();
+                            map.assign_path(
+                                &key,
+                                AssignmentOperator::Assign,
+                                exact,
+                                Some(&dynamic),
+                                None,
+                            );
+                        }
                     }
                 } else {
-                    map.bindings
-                        .insert(format!("@entry{}", map.bindings.len()), binding);
+                    if let Some(binding) = binding {
+                        map.bindings
+                            .insert(format!("@entry{}", map.bindings.len()), binding);
+                    } else if !map.bindings.is_empty() {
+                        map.bindings.insert(
+                            format!("@entry{}", map.bindings.len()),
+                            dynamic_translator_binding(),
+                        );
+                    }
                     map.mark_unknown("");
                 }
                 Some(map)
@@ -11458,6 +11905,24 @@ impl SourceUsageCollector {
     ) {
         for (key, binding) in source.bindings {
             target.assign_path(&key, AssignmentOperator::Assign, true, Some(&binding), None);
+        }
+        target.unknown_paths.extend(source.unknown_paths);
+    }
+
+    fn extend_unordered_translator_map_entries(
+        target: &mut TranslatorObjectBinding,
+        source: TranslatorObjectBinding,
+    ) {
+        for (key, binding) in source.bindings {
+            let duplicate = target.bindings.get(&key).cloned();
+            let binding = duplicate
+                .as_ref()
+                .map(|current| merge_translator_bindings(current, &binding))
+                .unwrap_or(binding);
+            target.assign_path(&key, AssignmentOperator::Assign, true, Some(&binding), None);
+            if duplicate.is_some() {
+                target.mark_unknown(&key);
+            }
         }
         target.unknown_paths.extend(source.unknown_paths);
     }
@@ -11549,7 +12014,7 @@ impl SourceUsageCollector {
                                 }),
                             };
                             if let Some(entry) = entry {
-                                Self::extend_translator_map_entries(&mut result, entry);
+                                Self::extend_unordered_translator_map_entries(&mut result, entry);
                             } else {
                                 result.mark_unknown("");
                             }
@@ -14541,6 +15006,16 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     }
 
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        let potential_wrapper_binding = binding_identifier_name(&declarator.id).filter(|_| {
+            declarator
+                .init
+                .as_ref()
+                .and_then(|init| match init.get_inner_expression() {
+                    Expression::CallExpression(call) => Some(call),
+                    _ => None,
+                })
+                .is_some_and(|call| self.call_is_react_callback_wrapper(call, "useMemo"))
+        });
         let mut callback_return_bindings = Vec::new();
         if let Some(Expression::CallExpression(call)) = declarator
             .init
@@ -14796,6 +15271,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             if let Some(binding) = merge_translator_binding_iter(state_bindings) {
                 self.translators.insert(name.to_string(), binding);
             }
+            self.potential_wrapper_values.insert(name.to_string());
+        }
+        if let Some(name) = potential_wrapper_binding {
+            self.potential_wrapper_values.insert(name.to_string());
         }
         if let (Some(name), Some(binding)) =
             (binding_identifier_name(&declarator.id), callback_return)
@@ -14914,25 +15393,43 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 .arguments
                 .get(1)
                 .and_then(|argument| self.translator_binding_from_argument(argument));
-            if let Some(binding) = binding {
-                for alias in self.translator_map_alias_group(identifier.name.as_str()) {
-                    let map = self.translator_maps.entry(alias).or_default();
-                    if let Some(keys) = &key {
-                        let exact = keys.len() == 1;
-                        for key in keys {
+            for alias in self.translator_map_alias_group(identifier.name.as_str()) {
+                let map = self.translator_maps.entry(alias).or_default();
+                if let Some(keys) = &key {
+                    let exact = keys.len() == 1;
+                    for key in keys {
+                        if let Some(binding) = &binding {
                             map.assign_path(
                                 key,
                                 AssignmentOperator::Assign,
                                 exact,
-                                Some(&binding),
+                                Some(binding),
+                                None,
+                            );
+                        } else if map.bindings.is_empty() {
+                            map.mark_unknown(key);
+                        } else {
+                            let dynamic = dynamic_translator_binding();
+                            map.assign_path(
+                                key,
+                                AssignmentOperator::Assign,
+                                exact,
+                                Some(&dynamic),
                                 None,
                             );
                         }
-                    } else {
+                    }
+                } else {
+                    if let Some(binding) = &binding {
                         map.bindings
                             .insert(format!("@entry{}", map.bindings.len()), binding.clone());
-                        map.mark_unknown("");
+                    } else if !map.bindings.is_empty() {
+                        map.bindings.insert(
+                            format!("@entry{}", map.bindings.len()),
+                            dynamic_translator_binding(),
+                        );
                     }
+                    map.mark_unknown("");
                 }
             }
         }
@@ -14952,8 +15449,11 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 if let Some(array) = self.translator_argument_arrays.get_mut(&alias) {
                     if let Some(binding) = &binding {
                         array.bindings.push(Some(binding.clone()));
+                    } else if array.bindings.iter().any(Option::is_some) {
+                        array.bindings.push(Some(dynamic_translator_binding()));
                     }
                     array.safe_layout = false;
+                    array.unknown_contents = true;
                 }
             }
         }
@@ -14966,34 +15466,43 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 .contains_key(identifier.name.as_str())
         {
             let offset = if method == "splice" { 2 } else { 0 };
-            let additions = call
-                .arguments
-                .iter()
-                .skip(offset)
-                .filter_map(|argument| match argument {
+            let mut additions = Vec::new();
+            let mut unresolved = false;
+            for argument in call.arguments.iter().skip(offset) {
+                let addition = match argument {
                     Argument::SpreadElement(spread) => {
                         self.translator_map_entries_from_expression(&spread.argument)
                     }
                     _ => argument.as_expression().and_then(|expression| {
                         self.translator_map_entry_from_expression(expression)
                     }),
-                })
-                .collect::<Vec<_>>();
+                };
+                if let Some(addition) = addition {
+                    additions.push(addition);
+                } else {
+                    unresolved = true;
+                }
+            }
             for addition in additions {
                 for alias in self.translator_array_alias_group(identifier.name.as_str()) {
                     let entries = self.translator_map_entries.entry(alias).or_default();
-                    for (key, binding) in &addition.bindings {
-                        entries.assign_path(
-                            key,
-                            AssignmentOperator::Assign,
-                            true,
-                            Some(binding),
-                            None,
+                    if method == "push" {
+                        Self::extend_translator_map_entries(entries, addition.clone());
+                    } else {
+                        Self::extend_unordered_translator_map_entries(entries, addition.clone());
+                    }
+                }
+            }
+            if unresolved {
+                for alias in self.translator_array_alias_group(identifier.name.as_str()) {
+                    let entries = self.translator_map_entries.entry(alias).or_default();
+                    if !entries.bindings.is_empty() {
+                        entries.bindings.insert(
+                            format!("@entry{}", entries.bindings.len()),
+                            dynamic_translator_binding(),
                         );
                     }
-                    entries
-                        .unknown_paths
-                        .extend(addition.unknown_paths.iter().cloned());
+                    entries.mark_unknown("");
                 }
             }
         }
@@ -15120,6 +15629,8 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     }
                 }
             }
+        } else if self.is_potential_wrapper_translator_call(&call.callee) {
+            self.record_unknown_dynamic_key_usage(call.span.start, call.arguments.first());
         } else if self.is_unbound_translator_call(&call.callee) {
             let argument = call.arguments.first();
             match argument.and_then(|argument| self.finite_strings_from_argument(argument)) {
@@ -15365,16 +15876,21 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         if expression.operator == AssignmentOperator::Assign
             && let Some(name) = assignment_target_member_object_name(&expression.left)
             && self.translator_map_entries.contains_key(name)
-            && let Some(entry) = self.translator_map_entry_from_expression(&expression.right)
         {
+            let entry = self.translator_map_entry_from_expression(&expression.right);
             for alias in self.translator_array_alias_group(name) {
                 let entries = self.translator_map_entries.entry(alias).or_default();
-                for (key, binding) in &entry.bindings {
-                    entries.assign_path(key, AssignmentOperator::Assign, true, Some(binding), None);
+                if let Some(entry) = &entry {
+                    Self::extend_unordered_translator_map_entries(entries, entry.clone());
+                } else {
+                    if !entries.bindings.is_empty() {
+                        entries.bindings.insert(
+                            format!("@entry{}", entries.bindings.len()),
+                            dynamic_translator_binding(),
+                        );
+                    }
+                    entries.mark_unknown("");
                 }
-                entries
-                    .unknown_paths
-                    .extend(entry.unknown_paths.iter().cloned());
             }
         }
         if let Some(name) = assignment_target_member_object_name(&expression.left) {
@@ -17123,6 +17639,127 @@ mod tests {
 
         assert!(!scan.used_ids.contains("common.not-react"));
         assert!(scan.used_ids.contains("common.default-import"));
+    }
+
+    #[test]
+    fn finite_memo_records_require_react_import_identity() {
+        let custom = scan(
+            r#"
+            import {useMemo} from 'runtime-library';
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('common');
+            const rows = useMemo(() => [{key: 'custom'}]);
+            rows.forEach(row => t(row.key));
+            "#,
+        );
+        assert!(!custom.used_ids.contains("common.custom"));
+        assert!(custom.dynamic_usages.iter().any(|usage| usage.line == 6));
+
+        let react = scan(
+            r#"
+            import React from 'react';
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('common');
+            const rows = React.useMemo(() => [{key: 'react'}], []);
+            rows.forEach(row => t(row.key));
+            "#,
+        );
+        assert!(react.used_ids.contains("common.react"));
+        assert!(react.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn fully_unresolved_react_wrapper_returns_stay_dynamic() {
+        let scan = scan(
+            r#"
+            import {useMemo, useState} from 'react';
+            const formatters = useMemo(() => runtimeMap(), []);
+            const values = useMemo(() => runtimeArray(), []);
+            const [state] = useState(() => runtimeState());
+            formatters.get('format')('runtime-map');
+            values[0]('runtime-array');
+            state.get('format')('runtime-state');
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 6));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 7));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 8));
+    }
+
+    #[test]
+    fn callback_local_container_mutations_are_tracked() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const formatters = useMemo(() => {
+              const local = new Map();
+              local.set('format', common);
+              return local;
+            }, [common]);
+            const handlers = useMemo(() => {
+              const local = {};
+              local.format = settings;
+              return local;
+            }, [settings]);
+            const values = useMemo(() => {
+              const local = [];
+              local.push(settings);
+              return local;
+            }, [settings]);
+            formatters.get('format')('local-map-mutation');
+            handlers.format('local-object-mutation');
+            values[0]('local-array-mutation');
+            "#,
+        );
+        assert!(scan.used_ids.contains("common.local-map-mutation"));
+        assert!(scan.used_ids.contains("settings.local-object-mutation"));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 23));
+    }
+
+    #[test]
+    fn copied_duplicate_entries_do_not_assume_insertion_wins() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const base = [['format', common]];
+            const entries = base.toSpliced(0, 0, ['format', settings]);
+            const formatters = new Map(entries);
+            formatters.get('format')('copy-order');
+            "#,
+        );
+        assert!(scan.used_ids.contains("common.copy-order"));
+        assert!(scan.used_ids.contains("settings.copy-order"));
+    }
+
+    #[test]
+    fn mutable_container_uncertainty_and_entry_order_are_preserved() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const formatters = new Map([['format', common]]);
+            formatters.set('format', runtimeTranslator);
+            formatters.get('format')('unknown-set');
+            const entries = [['format', common]];
+            entries.unshift(['format', settings]);
+            const ordered = new Map(entries);
+            ordered.get('format')('unshift-order');
+            entries.push(runtimeEntry);
+            const uncertain = new Map(entries);
+            uncertain.get('format')('unknown-entry');
+            "#,
+        );
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 7));
+        assert!(scan.used_ids.contains("common.unshift-order"));
+        assert!(scan.used_ids.contains("settings.unshift-order"));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 14));
     }
 
     #[test]
