@@ -862,7 +862,7 @@ fn unused_lists_unused_next_intl_keys() {
 }
 
 #[test]
-fn unused_keys_flag_outputs_only_unused_keys() {
+fn unused_keys_flag_keeps_dynamic_namespaces_out_of_the_candidate_set() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(
         dir.path(),
@@ -876,11 +876,85 @@ fn unused_keys_flag_outputs_only_unused_keys() {
 
     trans_cmd()
         .current_dir(dir.path())
+        .args(["unused", "--keys", "--no-ts-checker"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+}
+
+#[test]
+fn unused_traces_translator_props_into_imported_jsx_components() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.noDescription", "No description"),
+            ("projects.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("card.tsx"),
+        r#"
+        export function Card({tProjects}: {
+          tProjects: (key: 'noDescription') => string
+        }) {
+          return <p>{tProjects('noDescription')}</p>;
+        }
+        "#,
+    )
+    .expect("write component");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        r#"
+        import {useTranslations} from 'next-intl';
+        import {Card} from './card';
+        const tProjects = useTranslations('projects');
+        export default function Page() {
+          return <Card tProjects={tProjects} />;
+        }
+        "#,
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
         .args(["unused", "--keys"])
         .assert()
         .success()
-        .stdout("app.unused\n")
-        .stderr("");
+        .stdout("projects.unused\n");
+}
+
+#[test]
+fn unused_conservatively_protects_keys_from_unknown_jsx_translator_namespaces() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("products.articleNumber", "Article number"),
+            ("products.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        r#"
+        function Facts({controller}: {controller: unknown}) {
+          const {t} = controller;
+          return <p>{t('products.articleNumber')}</p>;
+        }
+        export default function Page({controller}: {controller: unknown}) {
+          return <Facts controller={controller} />;
+        }
+        "#,
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys", "--no-ts-checker"])
+        .assert()
+        .success()
+        .stdout("products.unused\n");
 }
 
 #[test]
@@ -966,7 +1040,28 @@ fn unused_reports_dynamic_usage_locations() {
         .stdout(predicate::str::contains(
             "Warning: dynamic translation key usage detected in 1 place(s):",
         ))
-        .stdout(predicate::str::contains("./page.tsx:3"));
+        .stdout(predicate::str::contains("./page.tsx:3"))
+        .stdout(predicate::str::contains(
+            "Warning: TypeScript checker failed:",
+        ));
+}
+
+#[test]
+fn unused_keys_reports_requested_typescript_checker_failure() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(dir.path(), &[("app.unused", "Unused")]);
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt(key);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("TypeScript checker failed"));
 }
 
 #[test]
@@ -1943,6 +2038,7 @@ fn unused_remove_force_still_respects_exclude_patterns() {
         .current_dir(dir.path())
         .args([
             "unused",
+            "--no-ts-checker",
             "remove",
             "--apply",
             "--force",
@@ -1974,7 +2070,7 @@ fn unused_remove_refuses_dynamic_usage_without_force() {
 
     trans_cmd()
         .current_dir(dir.path())
-        .args(["unused", "remove", "--apply"])
+        .args(["unused", "--no-ts-checker", "remove", "--apply"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -1997,7 +2093,7 @@ fn unused_remove_force_allows_dynamic_usage() {
 
     trans_cmd()
         .current_dir(dir.path())
-        .args(["unused", "remove", "--apply", "--force"])
+        .args(["unused", "--no-ts-checker", "remove", "--apply", "--force"])
         .assert()
         .success()
         .stdout(predicate::str::contains(

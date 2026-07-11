@@ -508,6 +508,13 @@ fn run() -> Result<()> {
                                 );
                             }
                         }
+                        for warning in &report.warnings {
+                            if warning.starts_with("dynamic translation key usage detected") {
+                                continue;
+                            }
+                            println!();
+                            println!("{}", style(format!("Warning: {warning}")).yellow());
+                        }
                     }
                     Ok(())
                 }

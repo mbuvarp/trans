@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::Write;
@@ -10,15 +11,20 @@ use oxc_ast::ast::{
     ComputedMemberExpression, ConditionalExpression, Declaration, ExportDefaultDeclaration,
     ExportDefaultDeclarationKind, ExportNamedDeclaration, Expression, ForOfStatement,
     ForStatementLeft, Function, FunctionBody, ImportDeclaration, ImportDeclarationSpecifier,
-    ModuleExportName, ObjectExpression, ObjectPropertyKind, PropertyKind, ReturnStatement,
-    Statement, StaticMemberExpression, TSInterfaceDeclaration, TSLiteral, TSSignature, TSType,
-    TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator, TSTypeQueryExprName,
-    TemplateLiteral, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXElementName, JSXExpression,
+    JSXOpeningElement, ModuleExportName, ObjectExpression, ObjectPropertyKind, PropertyKind,
+    ReturnStatement, Statement, StaticMemberExpression, TSInterfaceDeclaration, TSLiteral,
+    TSSignature, TSType, TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator,
+    TSTypeQueryExprName, TemplateLiteral, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
-use oxc_syntax::{operator::LogicalOperator, scope::ScopeFlags};
+use oxc_syntax::{
+    operator::LogicalOperator,
+    scope::{ScopeFlags, ScopeId},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -34,6 +40,15 @@ const FALLBACK_EXCLUDED_DIRS: &[&str] =
     &[".git", "node_modules", ".next", "dist", "build", "coverage"];
 const TRANSLATOR_METHODS: &[&str] = &["rich", "markup", "raw", "has"];
 const MAX_FINITE_STRINGS: usize = 128;
+
+fn is_translator_like_name(name: &str) -> bool {
+    name == "t"
+        || name.starts_with("translate")
+        || name
+            .strip_prefix('t')
+            .and_then(|suffix| suffix.chars().next())
+            .is_some_and(char::is_uppercase)
+}
 
 type FiniteStrings = BTreeSet<String>;
 type FiniteObjectMap = BTreeMap<String, FiniteStrings>;
@@ -59,6 +74,7 @@ pub struct UnusedReport {
     pub dynamic_usage_locations: Vec<UsageLocation>,
     pub dynamic_usage_detected: bool,
     pub extraction_usage_detected: bool,
+    pub ts_checker_failed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +86,7 @@ pub struct UsageLocation {
 #[derive(Debug, Clone, Default)]
 pub struct UsageScan {
     pub used_ids: BTreeSet<String>,
+    pub used_key_suffixes: BTreeSet<String>,
     pub dynamic_usages: Vec<DynamicUsage>,
     pub extraction_usages: Vec<String>,
 }
@@ -79,6 +96,7 @@ pub struct DynamicUsage {
     pub namespace: String,
     pub path: PathBuf,
     pub line: usize,
+    possible_keys: Option<FiniteStrings>,
     key_start: Option<usize>,
     key_end: Option<usize>,
 }
@@ -112,14 +130,17 @@ struct SourceFileIndex {
     re_exports: BTreeMap<String, ImportTarget>,
     dependency_sources: BTreeSet<String>,
     helpers: BTreeMap<String, HelperSummary>,
+    jsx_components: BTreeMap<String, JsxComponentSummary>,
     return_helpers: BTreeMap<String, FiniteStrings>,
     return_record_helpers: BTreeMap<String, FiniteRecords>,
     named_exports: BTreeMap<String, HelperSummary>,
+    named_jsx_exports: BTreeMap<String, JsxComponentSummary>,
     named_return_exports: BTreeMap<String, FiniteStrings>,
     named_iterable_exports: BTreeMap<String, FiniteStrings>,
     named_record_iterable_exports: BTreeMap<String, FiniteRecords>,
     named_record_return_exports: BTreeMap<String, FiniteRecords>,
     default_export: Option<HelperSummary>,
+    default_jsx_export: Option<JsxComponentSummary>,
     default_return_export: Option<FiniteStrings>,
     default_iterable_export: Option<FiniteStrings>,
     default_record_iterable_export: Option<FiniteRecords>,
@@ -148,6 +169,28 @@ struct HelperParamUsage {
     param_index: usize,
     keys: Option<FiniteStrings>,
     query: Option<HelperKeyQuery>,
+    translator_like: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct JsxComponentSummary {
+    usages: Vec<JsxPropUsage>,
+    forwards: Vec<JsxPropForward>,
+}
+
+#[derive(Debug, Clone)]
+struct JsxPropUsage {
+    prop_name: String,
+    keys: Option<FiniteStrings>,
+    query: Option<HelperKeyQuery>,
+    translator_like: bool,
+}
+
+#[derive(Debug, Clone)]
+struct JsxPropForward {
+    prop_name: String,
+    component_name: String,
+    target_prop: String,
 }
 
 #[derive(Debug, Clone)]
@@ -244,6 +287,8 @@ struct TsCheckerQuery {
 #[serde(rename_all = "camelCase")]
 struct TsCheckerResponse {
     results: Vec<TsCheckerResult>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -401,12 +446,12 @@ function finiteFromExpression(ts, checker, node) {
     ts.findConfigFile(input.root, ts.sys.fileExists, 'tsconfig.json') ||
     ts.findConfigFile(input.root, ts.sys.fileExists, 'jsconfig.json');
   if (!configPath) {
-    console.log(JSON.stringify({ results: [] }));
+    console.log(JSON.stringify({ results: [], error: 'no tsconfig.json or jsconfig.json found' }));
     return;
   }
   const config = ts.readConfigFile(configPath, ts.sys.readFile);
   if (config.error) {
-    console.log(JSON.stringify({ results: [] }));
+    console.log(JSON.stringify({ results: [], error: 'failed to read the TypeScript configuration' }));
     return;
   }
   const parsed = ts.parseJsonConfigFileContent(
@@ -431,9 +476,12 @@ function finiteFromExpression(ts, checker, node) {
       results.push({ index: query.index, keys });
     }
   }
-  console.log(JSON.stringify({ results }));
-})().catch(() => {
-  console.log(JSON.stringify({ results: [] }));
+  console.log(JSON.stringify({ results, error: null }));
+})().catch(error => {
+  console.log(JSON.stringify({
+    results: [],
+    error: error instanceof Error ? error.message : String(error),
+  }));
 });
 "#;
 
@@ -450,7 +498,7 @@ pub fn find_unused_with_ts_checker(
 }
 
 pub fn find_unused_keys(root: impl AsRef<Path>, config: &TransConfig) -> Result<Vec<String>> {
-    Ok(find_unused_with_options(root, config, false, true)?.unused_ids)
+    find_unused_keys_with_ts_checker(root, config, true)
 }
 
 pub fn find_unused_keys_with_ts_checker(
@@ -458,7 +506,14 @@ pub fn find_unused_keys_with_ts_checker(
     config: &TransConfig,
     use_ts_checker: bool,
 ) -> Result<Vec<String>> {
-    Ok(find_unused_with_options(root, config, false, use_ts_checker)?.unused_ids)
+    let report = find_unused_with_options(root, config, true, use_ts_checker)?;
+    if report.ts_checker_failed {
+        return Err(TransError::InvalidInput(
+            "the TypeScript checker failed; rerun with --no-ts-checker to list conservative results"
+                .to_string(),
+        ));
+    }
+    Ok(report.unused_ids)
 }
 
 pub fn remove_unused(
@@ -478,6 +533,13 @@ pub fn remove_unused_with_ts_checker(
 ) -> Result<UnusedReport> {
     let root = root.as_ref();
     let mut report = find_unused_with_options(root, config, !force, use_ts_checker)?;
+
+    if report.ts_checker_failed {
+        return Err(TransError::InvalidInput(
+            "the TypeScript checker failed; fix the checker or rerun with --no-ts-checker"
+                .to_string(),
+        ));
+    }
 
     if report.extraction_usage_detected {
         return Err(TransError::InvalidInput(
@@ -608,13 +670,20 @@ fn find_unused_with_options(
     let primary = load_language_translations(root, config, &config.primary_language)?;
     let source_files = discover_source_files(root)?;
     let mut scan = collect_usage_from_files(root, &source_files)?;
-    if use_ts_checker {
-        apply_ts_checker_fallback(root, &mut scan);
-    }
+    let ts_checker_error = use_ts_checker
+        .then(|| apply_ts_checker_fallback(root, &mut scan).err())
+        .flatten();
 
     let mut unused_ids = Vec::new();
     for id in primary.keys() {
         if scan.used_ids.contains(id) {
+            continue;
+        }
+        if scan
+            .used_key_suffixes
+            .iter()
+            .any(|key| translation_id_matches_key(id, key))
+        {
             continue;
         }
         if apply_dynamic_exclusions && is_dynamic_protected(id, &scan.dynamic_usages) {
@@ -623,10 +692,16 @@ fn find_unused_with_options(
         unused_ids.push(id.clone());
     }
 
-    let dynamic_usage_locations = dynamic_usage_locations(root, &scan.dynamic_usages);
+    let unbounded_dynamic_usages = scan
+        .dynamic_usages
+        .iter()
+        .filter(|usage| usage.possible_keys.is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    let dynamic_usage_locations = dynamic_usage_locations(root, &unbounded_dynamic_usages);
 
     let mut warnings = Vec::new();
-    if !scan.dynamic_usages.is_empty() {
+    if !unbounded_dynamic_usages.is_empty() {
         warnings.push(format!(
             "dynamic translation key usage detected in {} place(s)",
             dynamic_usage_locations.len()
@@ -638,14 +713,18 @@ fn find_unused_with_options(
             scan.extraction_usages.len()
         ));
     }
+    if let Some(error) = &ts_checker_error {
+        warnings.push(format!("TypeScript checker failed: {error}"));
+    }
 
     Ok(UnusedReport {
         unused_ids,
         total_ids: primary.len(),
         warnings,
         dynamic_usage_locations,
-        dynamic_usage_detected: !scan.dynamic_usages.is_empty(),
+        dynamic_usage_detected: !unbounded_dynamic_usages.is_empty(),
         extraction_usage_detected: !scan.extraction_usages.is_empty(),
+        ts_checker_failed: ts_checker_error.is_some(),
     })
 }
 
@@ -661,12 +740,22 @@ fn write_snapshot(root: &Path, config: &TransConfig, snapshot: &TranslationSnaps
 
 fn is_dynamic_protected(id: &str, dynamic_usages: &[DynamicUsage]) -> bool {
     dynamic_usages.iter().any(|prefix| {
+        if let Some(keys) = &prefix.possible_keys {
+            return keys.iter().any(|key| translation_id_matches_key(id, key));
+        }
         prefix.namespace.is_empty()
             || id == prefix.namespace
             || id
                 .strip_prefix(&prefix.namespace)
                 .is_some_and(|remaining| remaining.starts_with('.'))
     })
+}
+
+fn translation_id_matches_key(id: &str, key: &str) -> bool {
+    id == key
+        || id
+            .strip_suffix(key)
+            .is_some_and(|remaining| remaining.ends_with('.'))
 }
 
 fn dynamic_usage_locations(root: &Path, dynamic_usages: &[DynamicUsage]) -> Vec<UsageLocation> {
@@ -704,6 +793,7 @@ fn collect_usage_from_files(root: &Path, paths: &[PathBuf]) -> Result<UsageScan>
         let source = fs::read_to_string(path)?;
         let scan = collect_usage_from_source_with_project(&source, path, Some(&project))?;
         combined.used_ids.extend(scan.used_ids);
+        combined.used_key_suffixes.extend(scan.used_key_suffixes);
         combined.dynamic_usages.extend(scan.dynamic_usages);
         combined.extraction_usages.extend(scan.extraction_usages);
     }
@@ -714,19 +804,17 @@ fn collect_usage_from_files(root: &Path, paths: &[PathBuf]) -> Result<UsageScan>
     Ok(combined)
 }
 
-fn apply_ts_checker_fallback(root: &Path, scan: &mut UsageScan) {
+fn apply_ts_checker_fallback(root: &Path, scan: &mut UsageScan) -> std::result::Result<(), String> {
     let queries = ts_checker_queries(&scan.dynamic_usages);
     if queries.is_empty() {
-        return;
+        return Ok(());
     }
 
     let request = TsCheckerRequest {
         root: root.to_string_lossy().to_string(),
         queries,
     };
-    let Ok(input) = serde_json::to_vec(&request) else {
-        return;
-    };
+    let input = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
 
     let mut child = match Command::new("node")
         .arg("-e")
@@ -738,25 +826,30 @@ fn apply_ts_checker_fallback(root: &Path, scan: &mut UsageScan) {
         .spawn()
     {
         Ok(child) => child,
-        Err(_) => return,
+        Err(error) => return Err(format!("could not start Node.js: {error}")),
     };
 
     if let Some(stdin) = child.stdin.as_mut() {
         if stdin.write_all(&input).is_err() {
-            return;
+            return Err("could not send queries to the TypeScript checker".to_string());
         }
     }
 
-    let Ok(output) = child.wait_with_output() else {
-        return;
-    };
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("could not wait for the TypeScript checker: {error}"))?;
     if !output.status.success() {
-        return;
+        return Err(format!(
+            "TypeScript checker exited with status {}",
+            output.status
+        ));
     }
 
-    let Ok(response) = serde_json::from_slice::<TsCheckerResponse>(&output.stdout) else {
-        return;
-    };
+    let response = serde_json::from_slice::<TsCheckerResponse>(&output.stdout)
+        .map_err(|error| format!("invalid TypeScript checker response: {error}"))?;
+    if let Some(error) = response.error {
+        return Err(error);
+    }
 
     let mut resolved = BTreeSet::new();
     for result in response.results {
@@ -783,6 +876,7 @@ fn apply_ts_checker_fallback(root: &Path, scan: &mut UsageScan) {
             keep
         });
     }
+    Ok(())
 }
 
 fn ts_checker_queries(dynamic_usages: &[DynamicUsage]) -> Vec<TsCheckerQuery> {
@@ -1040,6 +1134,92 @@ impl ProjectIndex {
             }),
             ImportedName::Default => file.default_export.clone(),
         }
+    }
+
+    fn jsx_component_for_name(&self, from: &Path, name: &str) -> Option<JsxComponentSummary> {
+        let file = self.files.get(from)?;
+        let (path, summary) = if let Some(summary) = file.jsx_components.get(name) {
+            (from.to_path_buf(), summary.clone())
+        } else {
+            self.jsx_component_target_for_import(from, file.imports.get(name)?, 0)?
+        };
+        self.expand_jsx_component_summary(&path, summary, 0)
+    }
+
+    fn jsx_component_target_for_import(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+        depth: usize,
+    ) -> Option<(PathBuf, JsxComponentSummary)> {
+        if depth > 16 {
+            return None;
+        }
+        let path = self.resolve_module(from, &target.source)?;
+        let file = self.files.get(&path)?;
+        match &target.imported {
+            ImportedName::Named(name) => file
+                .named_jsx_exports
+                .get(name)
+                .cloned()
+                .map(|summary| (path.clone(), summary))
+                .or_else(|| {
+                    file.re_exports.get(name).and_then(|target| {
+                        self.jsx_component_target_for_import(&path, target, depth + 1)
+                    })
+                }),
+            ImportedName::Default => file
+                .default_jsx_export
+                .clone()
+                .map(|summary| (path, summary)),
+        }
+    }
+
+    fn expand_jsx_component_summary(
+        &self,
+        path: &Path,
+        mut summary: JsxComponentSummary,
+        depth: usize,
+    ) -> Option<JsxComponentSummary> {
+        if depth > 16 {
+            return None;
+        }
+        let forwards = std::mem::take(&mut summary.forwards);
+        for forward in forwards {
+            let Some(file) = self.files.get(path) else {
+                continue;
+            };
+            let child = if let Some(child) = file.jsx_components.get(&forward.component_name) {
+                Some((path.to_path_buf(), child.clone()))
+            } else {
+                file.imports
+                    .get(&forward.component_name)
+                    .and_then(|target| {
+                        self.jsx_component_target_for_import(path, target, depth + 1)
+                    })
+            };
+            let Some((child_path, child_summary)) = child else {
+                continue;
+            };
+            let Some(child_summary) =
+                self.expand_jsx_component_summary(&child_path, child_summary, depth + 1)
+            else {
+                continue;
+            };
+            summary.usages.extend(
+                child_summary
+                    .usages
+                    .into_iter()
+                    .filter(|usage| usage.prop_name == forward.target_prop)
+                    .map(|usage| JsxPropUsage {
+                        prop_name: forward.prop_name.clone(),
+                        keys: usage.keys,
+                        query: usage.query,
+                        translator_like: usage.translator_like,
+                    }),
+            );
+        }
+        Some(summary)
     }
 
     fn return_helper_for_import(
@@ -1563,7 +1743,27 @@ struct SourceUsageCollector {
     enum_member_domains: TypeDomains,
     translators: BTreeMap<String, TranslatorBinding>,
     message_key_helpers: BTreeMap<String, usize>,
+    binding_scopes: Vec<BindingEnvironment>,
+    scope_depth: usize,
+    injected_bindings: BTreeSet<String>,
     scan: UsageScan,
+}
+
+#[derive(Debug, Clone)]
+struct BindingEnvironment {
+    finite_constants: BTreeMap<String, FiniteStrings>,
+    finite_iterables: BTreeMap<String, FiniteStrings>,
+    finite_object_maps: FiniteObjectMaps,
+    finite_record_constants: FiniteRecordBindings,
+    finite_record_iterables: FiniteRecordBindings,
+    finite_record_maps: FiniteRecordMaps,
+    typed_object_property_domains: TypePropertyDomains,
+    type_domains: TypeDomains,
+    type_property_domains: TypePropertyDomains,
+    zod_schema_property_domains: TypePropertyDomains,
+    enum_member_domains: TypeDomains,
+    translators: BTreeMap<String, TranslatorBinding>,
+    message_key_helpers: BTreeMap<String, usize>,
 }
 
 fn helper_summary_from_expression_with_context(
@@ -1694,6 +1894,7 @@ fn helper_summary_from_body_with_context(
         enum_member_domains: enum_member_domains.clone(),
         source_context: source_context.cloned(),
         usages: Vec::new(),
+        jsx_forwards: Vec::new(),
     };
     for statement in &body.statements {
         collector.visit_statement(statement);
@@ -1702,6 +1903,88 @@ fn helper_summary_from_body_with_context(
     HelperSummary {
         param_usages: collector.usages,
     }
+}
+
+fn jsx_component_summary_from_body(
+    pattern: &BindingPattern<'_>,
+    body: &FunctionBody<'_>,
+    helpers: &BTreeMap<String, HelperSummary>,
+    finite_constants: &BTreeMap<String, FiniteStrings>,
+    finite_iterables: &BTreeMap<String, FiniteStrings>,
+    finite_object_maps: &FiniteObjectMaps,
+    finite_record_constants: &FiniteRecordBindings,
+    finite_record_iterables: &FiniteRecordBindings,
+    finite_record_maps: &FiniteRecordMaps,
+    enum_member_domains: &TypeDomains,
+    source_context: &SourceQueryContext,
+) -> Option<JsxComponentSummary> {
+    let BindingPattern::ObjectPattern(object) = pattern else {
+        return None;
+    };
+    let mut param_names = BTreeMap::new();
+    let mut prop_names = Vec::new();
+    for property in &object.properties {
+        if property.computed {
+            continue;
+        }
+        let Some(prop_name) = property.key.static_name() else {
+            continue;
+        };
+        let Some(binding_name) = binding_identifier_name(&property.value) else {
+            continue;
+        };
+        let index = prop_names.len();
+        prop_names.push(prop_name.to_string());
+        param_names.insert(binding_name.to_string(), index);
+    }
+    if param_names.is_empty() {
+        return None;
+    }
+
+    let mut collector = HelperBodyCollector {
+        param_names,
+        helpers: helpers.clone(),
+        finite_constants: finite_constants.clone(),
+        finite_iterables: finite_iterables.clone(),
+        finite_object_maps: finite_object_maps.clone(),
+        finite_record_constants: finite_record_constants.clone(),
+        finite_record_iterables: finite_record_iterables.clone(),
+        finite_record_maps: finite_record_maps.clone(),
+        enum_member_domains: enum_member_domains.clone(),
+        source_context: Some(source_context.clone()),
+        usages: Vec::new(),
+        jsx_forwards: Vec::new(),
+    };
+    for statement in &body.statements {
+        collector.visit_statement(statement);
+    }
+    let usages = collector
+        .usages
+        .into_iter()
+        .filter_map(|usage| {
+            if usage.keys.is_none() && usage.query.is_none() {
+                return None;
+            }
+            Some(JsxPropUsage {
+                prop_name: prop_names.get(usage.param_index)?.clone(),
+                keys: usage.keys,
+                query: usage.query,
+                translator_like: usage.translator_like,
+            })
+        })
+        .collect::<Vec<_>>();
+    let forwards = collector
+        .jsx_forwards
+        .into_iter()
+        .filter_map(|forward| {
+            Some(JsxPropForward {
+                prop_name: prop_names.get(forward.param_index)?.clone(),
+                component_name: forward.component_name,
+                target_prop: forward.target_prop,
+            })
+        })
+        .collect::<Vec<_>>();
+    (!usages.is_empty() || !forwards.is_empty()).then_some(JsxComponentSummary { usages, forwards })
 }
 
 fn message_key_helper_from_expression(expression: &Expression<'_>) -> Option<usize> {
@@ -3443,6 +3726,13 @@ struct HelperBodyCollector {
     finite_record_maps: FiniteRecordMaps,
     enum_member_domains: TypeDomains,
     usages: Vec<HelperParamUsage>,
+    jsx_forwards: Vec<HelperJsxForward>,
+}
+
+struct HelperJsxForward {
+    param_index: usize,
+    component_name: String,
+    target_prop: String,
 }
 
 struct MessageKeyHelperCollector {
@@ -3491,6 +3781,17 @@ impl HelperBodyCollector {
         self.param_names.get(object.name.as_str()).copied()
     }
 
+    fn callee_param_name<'b>(&self, expression: &'b Expression<'b>) -> Option<&'b str> {
+        if let Some(identifier) = expression.get_identifier_reference() {
+            return Some(identifier.name.as_str());
+        }
+        expression
+            .get_member_expr()?
+            .object()
+            .get_identifier_reference()
+            .map(|identifier| identifier.name.as_str())
+    }
+
     fn helper_summary_for_callee(&self, expression: &Expression<'_>) -> Option<HelperSummary> {
         let callee = expression
             .get_inner_expression()
@@ -3518,6 +3819,7 @@ impl HelperBodyCollector {
                 param_index,
                 keys: usage.keys.clone(),
                 query: usage.query.clone(),
+                translator_like: usage.translator_like,
             });
         }
     }
@@ -3805,7 +4107,53 @@ impl HelperBodyCollector {
 }
 
 impl<'a> Visit<'a> for HelperBodyCollector {
+    fn visit_jsx_opening_element(&mut self, opening: &JSXOpeningElement<'a>) {
+        let component_name = match &opening.name {
+            JSXElementName::Identifier(identifier) => identifier.name.as_str(),
+            JSXElementName::IdentifierReference(identifier) => identifier.name.as_str(),
+            _ => {
+                walk::walk_jsx_opening_element(self, opening);
+                return;
+            }
+        };
+        for attribute in &opening.attributes {
+            let JSXAttributeItem::Attribute(attribute) = attribute else {
+                continue;
+            };
+            let JSXAttributeName::Identifier(target_prop) = &attribute.name else {
+                continue;
+            };
+            let Some(JSXAttributeValue::ExpressionContainer(container)) = &attribute.value else {
+                continue;
+            };
+            let JSXExpression::Identifier(identifier) = &container.expression else {
+                continue;
+            };
+            let Some(param_index) = self.param_names.get(identifier.name.as_str()).copied() else {
+                continue;
+            };
+            self.jsx_forwards.push(HelperJsxForward {
+                param_index,
+                component_name: component_name.to_string(),
+                target_prop: target_prop.name.to_string(),
+            });
+        }
+        walk::walk_jsx_opening_element(self, opening);
+    }
+
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if let Some(source) = declarator
+            .init
+            .as_ref()
+            .and_then(Expression::get_identifier_reference)
+        {
+            if let Some(param_index) = self.param_names.get(source.name.as_str()).copied() {
+                for identifier in declarator.id.get_binding_identifiers() {
+                    self.param_names
+                        .insert(identifier.name.to_string(), param_index);
+                }
+            }
+        }
         if declarator.kind == VariableDeclarationKind::Const {
             if let Some(name) = binding_identifier_name(&declarator.id) {
                 if let Some(init) = &declarator.init {
@@ -3888,6 +4236,9 @@ impl<'a> Visit<'a> for HelperBodyCollector {
                 param_index,
                 keys,
                 query,
+                translator_like: self
+                    .callee_param_name(&call.callee)
+                    .is_some_and(is_translator_like_name),
             });
         }
         self.visit_callback_arguments(call);
@@ -4147,6 +4498,14 @@ impl<'a> Visit<'a> for ReturnValueCollector {
             self.unknown_return = true;
             return;
         };
+        if matches!(argument.get_inner_expression(), Expression::NullLiteral(_))
+            || argument
+                .get_inner_expression()
+                .get_identifier_reference()
+                .is_some_and(|identifier| identifier.name == "undefined")
+        {
+            return;
+        }
         let Some(values) = finite_strings_from_expression(
             argument,
             &self.finite_constants,
@@ -4174,6 +4533,7 @@ struct SourceIndexCollector {
     re_exports: BTreeMap<String, ImportTarget>,
     dependency_sources: BTreeSet<String>,
     helpers: BTreeMap<String, HelperSummary>,
+    jsx_components: BTreeMap<String, JsxComponentSummary>,
     return_helpers: BTreeMap<String, FiniteStrings>,
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
@@ -4186,10 +4546,28 @@ struct SourceIndexCollector {
     export_locals: BTreeMap<String, String>,
     default_local: Option<String>,
     default_summary: Option<HelperSummary>,
+    default_jsx_summary: Option<JsxComponentSummary>,
     default_return_summary: Option<FiniteStrings>,
     default_iterable_summary: Option<FiniteStrings>,
     default_record_iterable_export: Option<FiniteRecords>,
     default_record_return_summary: Option<FiniteRecords>,
+    binding_scopes: Vec<IndexBindingEnvironment>,
+    scope_depth: usize,
+}
+
+#[derive(Clone)]
+struct IndexBindingEnvironment {
+    helpers: BTreeMap<String, HelperSummary>,
+    jsx_components: BTreeMap<String, JsxComponentSummary>,
+    return_helpers: BTreeMap<String, FiniteStrings>,
+    finite_constants: BTreeMap<String, FiniteStrings>,
+    finite_iterables: BTreeMap<String, FiniteStrings>,
+    finite_object_maps: FiniteObjectMaps,
+    finite_record_constants: FiniteRecordBindings,
+    finite_record_iterables: FiniteRecordBindings,
+    finite_record_maps: FiniteRecordMaps,
+    return_record_helpers: BTreeMap<String, FiniteRecords>,
+    enum_member_domains: TypeDomains,
 }
 
 impl SourceIndexCollector {
@@ -4202,6 +4580,7 @@ impl SourceIndexCollector {
 
     fn finish(self) -> SourceFileIndex {
         let mut named_exports = BTreeMap::new();
+        let mut named_jsx_exports = BTreeMap::new();
         let mut named_return_exports = BTreeMap::new();
         let mut named_iterable_exports = BTreeMap::new();
         let mut named_record_iterable_exports = BTreeMap::new();
@@ -4209,6 +4588,9 @@ impl SourceIndexCollector {
         for (exported, local) in self.export_locals {
             if let Some(summary) = self.helpers.get(&local) {
                 named_exports.insert(exported.clone(), summary.clone());
+            }
+            if let Some(summary) = self.jsx_components.get(&local) {
+                named_jsx_exports.insert(exported.clone(), summary.clone());
             }
             if let Some(summary) = self.return_helpers.get(&local) {
                 named_return_exports.insert(exported.clone(), summary.clone());
@@ -4229,6 +4611,11 @@ impl SourceIndexCollector {
             default_local
                 .as_ref()
                 .and_then(|name| self.helpers.get(name).cloned())
+        });
+        let default_jsx_export = self.default_jsx_summary.or_else(|| {
+            default_local
+                .as_ref()
+                .and_then(|name| self.jsx_components.get(name).cloned())
         });
         let default_return_export = self.default_return_summary.or_else(|| {
             default_local
@@ -4256,19 +4643,52 @@ impl SourceIndexCollector {
             re_exports: self.re_exports,
             dependency_sources: self.dependency_sources,
             helpers: self.helpers,
+            jsx_components: self.jsx_components,
             return_helpers: self.return_helpers,
             return_record_helpers: self.return_record_helpers,
             named_exports,
+            named_jsx_exports,
             named_return_exports,
             named_iterable_exports,
             named_record_iterable_exports,
             named_record_return_exports,
             default_export,
+            default_jsx_export,
             default_return_export,
             default_iterable_export,
             default_record_iterable_export,
             default_record_return_export,
         }
+    }
+
+    fn binding_environment(&self) -> IndexBindingEnvironment {
+        IndexBindingEnvironment {
+            helpers: self.helpers.clone(),
+            jsx_components: self.jsx_components.clone(),
+            return_helpers: self.return_helpers.clone(),
+            finite_constants: self.finite_constants.clone(),
+            finite_iterables: self.finite_iterables.clone(),
+            finite_object_maps: self.finite_object_maps.clone(),
+            finite_record_constants: self.finite_record_constants.clone(),
+            finite_record_iterables: self.finite_record_iterables.clone(),
+            finite_record_maps: self.finite_record_maps.clone(),
+            return_record_helpers: self.return_record_helpers.clone(),
+            enum_member_domains: self.enum_member_domains.clone(),
+        }
+    }
+
+    fn restore_binding_environment(&mut self, environment: IndexBindingEnvironment) {
+        self.helpers = environment.helpers;
+        self.jsx_components = environment.jsx_components;
+        self.return_helpers = environment.return_helpers;
+        self.finite_constants = environment.finite_constants;
+        self.finite_iterables = environment.finite_iterables;
+        self.finite_object_maps = environment.finite_object_maps;
+        self.finite_record_constants = environment.finite_record_constants;
+        self.finite_record_iterables = environment.finite_record_iterables;
+        self.finite_record_maps = environment.finite_record_maps;
+        self.return_record_helpers = environment.return_record_helpers;
+        self.enum_member_domains = environment.enum_member_domains;
     }
 
     fn record_helper(&mut self, name: &str, summary: HelperSummary) {
@@ -4462,6 +4882,26 @@ impl SourceIndexCollector {
     fn record_default_export(&mut self, declaration: &ExportDefaultDeclaration<'_>) {
         match &declaration.declaration {
             ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
+                self.default_jsx_summary = function
+                    .params
+                    .items
+                    .first()
+                    .zip(function.body.as_ref())
+                    .and_then(|(parameter, body)| {
+                        jsx_component_summary_from_body(
+                            &parameter.pattern,
+                            body,
+                            &self.helpers,
+                            &self.finite_constants,
+                            &self.finite_iterables,
+                            &self.finite_object_maps,
+                            &self.finite_record_constants,
+                            &self.finite_record_iterables,
+                            &self.finite_record_maps,
+                            &self.enum_member_domains,
+                            &self.source_context,
+                        )
+                    });
                 if let Some(summary) = helper_summary_from_function_with_context(
                     function,
                     &self.helpers,
@@ -4508,6 +4948,21 @@ impl SourceIndexCollector {
                 self.default_local = Some(identifier.name.to_string());
             }
             ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
+                self.default_jsx_summary = arrow.params.items.first().and_then(|parameter| {
+                    jsx_component_summary_from_body(
+                        &parameter.pattern,
+                        &arrow.body,
+                        &self.helpers,
+                        &self.finite_constants,
+                        &self.finite_iterables,
+                        &self.finite_object_maps,
+                        &self.finite_record_constants,
+                        &self.finite_record_iterables,
+                        &self.finite_record_maps,
+                        &self.enum_member_domains,
+                        &self.source_context,
+                    )
+                });
                 self.default_summary = Some(helper_summary_from_arrow_with_context(
                     arrow,
                     &self.helpers,
@@ -4526,6 +4981,26 @@ impl SourceIndexCollector {
                 }
             }
             ExportDefaultDeclarationKind::FunctionExpression(function) => {
+                self.default_jsx_summary = function
+                    .params
+                    .items
+                    .first()
+                    .zip(function.body.as_ref())
+                    .and_then(|(parameter, body)| {
+                        jsx_component_summary_from_body(
+                            &parameter.pattern,
+                            body,
+                            &self.helpers,
+                            &self.finite_constants,
+                            &self.finite_iterables,
+                            &self.finite_object_maps,
+                            &self.finite_record_constants,
+                            &self.finite_record_iterables,
+                            &self.finite_record_maps,
+                            &self.enum_member_domains,
+                            &self.source_context,
+                        )
+                    });
                 self.default_summary = helper_summary_from_function_with_context(
                     function,
                     &self.helpers,
@@ -4566,6 +5041,22 @@ impl SourceIndexCollector {
 }
 
 impl<'a> Visit<'a> for SourceIndexCollector {
+    fn enter_scope(&mut self, _flags: ScopeFlags, _scope_id: &Cell<Option<ScopeId>>) {
+        if self.scope_depth > 0 {
+            self.binding_scopes.push(self.binding_environment());
+        }
+        self.scope_depth += 1;
+    }
+
+    fn leave_scope(&mut self) {
+        self.scope_depth = self.scope_depth.saturating_sub(1);
+        if self.scope_depth > 0 {
+            if let Some(environment) = self.binding_scopes.pop() {
+                self.restore_binding_environment(environment);
+            }
+        }
+    }
+
     fn visit_import_declaration(&mut self, declaration: &ImportDeclaration<'a>) {
         let source = declaration.source.value.as_str();
         if source != "next-intl" && source != "next-intl/server" {
@@ -4604,6 +5095,25 @@ impl<'a> Visit<'a> for SourceIndexCollector {
 
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
         if let Some(id) = &function.id {
+            if let (Some(parameter), Some(body)) =
+                (function.params.items.first(), function.body.as_ref())
+            {
+                if let Some(summary) = jsx_component_summary_from_body(
+                    &parameter.pattern,
+                    body,
+                    &self.helpers,
+                    &self.finite_constants,
+                    &self.finite_iterables,
+                    &self.finite_object_maps,
+                    &self.finite_record_constants,
+                    &self.finite_record_iterables,
+                    &self.finite_record_maps,
+                    &self.enum_member_domains,
+                    &self.source_context,
+                ) {
+                    self.jsx_components.insert(id.name.to_string(), summary);
+                }
+            }
             if let Some(summary) = helper_summary_from_function_with_context(
                 function,
                 &self.helpers,
@@ -4712,6 +5222,49 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                 ) {
                     self.record_helper(name, summary);
                 }
+                let jsx_summary = match init.get_inner_expression() {
+                    Expression::ArrowFunctionExpression(arrow) => {
+                        arrow.params.items.first().and_then(|parameter| {
+                            jsx_component_summary_from_body(
+                                &parameter.pattern,
+                                &arrow.body,
+                                &self.helpers,
+                                &self.finite_constants,
+                                &self.finite_iterables,
+                                &self.finite_object_maps,
+                                &self.finite_record_constants,
+                                &self.finite_record_iterables,
+                                &self.finite_record_maps,
+                                &self.enum_member_domains,
+                                &self.source_context,
+                            )
+                        })
+                    }
+                    Expression::FunctionExpression(function) => function
+                        .params
+                        .items
+                        .first()
+                        .zip(function.body.as_ref())
+                        .and_then(|(parameter, body)| {
+                            jsx_component_summary_from_body(
+                                &parameter.pattern,
+                                body,
+                                &self.helpers,
+                                &self.finite_constants,
+                                &self.finite_iterables,
+                                &self.finite_object_maps,
+                                &self.finite_record_constants,
+                                &self.finite_record_iterables,
+                                &self.finite_record_maps,
+                                &self.enum_member_domains,
+                                &self.source_context,
+                            )
+                        }),
+                    _ => None,
+                };
+                if let Some(summary) = jsx_summary {
+                    self.jsx_components.insert(name.to_string(), summary);
+                }
                 if let Some(summary) = finite_return_summary_from_expression(init) {
                     self.record_return_helper(name, summary);
                 }
@@ -4770,7 +5323,67 @@ impl SourceUsageCollector {
             enum_member_domains: BTreeMap::new(),
             translators: BTreeMap::new(),
             message_key_helpers: BTreeMap::new(),
+            binding_scopes: Vec::new(),
+            scope_depth: 0,
+            injected_bindings: BTreeSet::new(),
             scan: UsageScan::default(),
+        }
+    }
+
+    fn binding_environment(&self) -> BindingEnvironment {
+        BindingEnvironment {
+            finite_constants: self.finite_constants.clone(),
+            finite_iterables: self.finite_iterables.clone(),
+            finite_object_maps: self.finite_object_maps.clone(),
+            finite_record_constants: self.finite_record_constants.clone(),
+            finite_record_iterables: self.finite_record_iterables.clone(),
+            finite_record_maps: self.finite_record_maps.clone(),
+            typed_object_property_domains: self.typed_object_property_domains.clone(),
+            type_domains: self.type_domains.clone(),
+            type_property_domains: self.type_property_domains.clone(),
+            zod_schema_property_domains: self.zod_schema_property_domains.clone(),
+            enum_member_domains: self.enum_member_domains.clone(),
+            translators: self.translators.clone(),
+            message_key_helpers: self.message_key_helpers.clone(),
+        }
+    }
+
+    fn restore_binding_environment(&mut self, environment: BindingEnvironment) {
+        self.finite_constants = environment.finite_constants;
+        self.finite_iterables = environment.finite_iterables;
+        self.finite_object_maps = environment.finite_object_maps;
+        self.finite_record_constants = environment.finite_record_constants;
+        self.finite_record_iterables = environment.finite_record_iterables;
+        self.finite_record_maps = environment.finite_record_maps;
+        self.typed_object_property_domains = environment.typed_object_property_domains;
+        self.type_domains = environment.type_domains;
+        self.type_property_domains = environment.type_property_domains;
+        self.zod_schema_property_domains = environment.zod_schema_property_domains;
+        self.enum_member_domains = environment.enum_member_domains;
+        self.translators = environment.translators;
+        self.message_key_helpers = environment.message_key_helpers;
+    }
+
+    fn mask_binding_name(&mut self, name: &str) {
+        self.finite_constants.remove(name);
+        self.finite_iterables.remove(name);
+        self.finite_object_maps.remove(name);
+        self.finite_record_constants.remove(name);
+        self.finite_record_iterables.remove(name);
+        self.finite_record_maps.remove(name);
+        self.typed_object_property_domains.remove(name);
+        self.zod_schema_property_domains.remove(name);
+        self.enum_member_domains.remove(name);
+        self.translators.remove(name);
+        self.message_key_helpers.remove(name);
+    }
+
+    fn mask_binding_pattern(&mut self, pattern: &BindingPattern<'_>) {
+        for identifier in pattern.get_binding_identifiers() {
+            let name = identifier.name.as_str();
+            if !self.injected_bindings.remove(name) {
+                self.mask_binding_name(name);
+            }
         }
     }
 
@@ -5087,6 +5700,7 @@ impl SourceUsageCollector {
             namespace: namespace.unwrap_or_default().to_string(),
             path: self.path.clone(),
             line: self.line_number(start),
+            possible_keys: None,
             key_start: None,
             key_end: None,
         });
@@ -5103,6 +5717,7 @@ impl SourceUsageCollector {
             namespace: namespace.unwrap_or_default().to_string(),
             path: self.path.clone(),
             line: self.line_number(call_start),
+            possible_keys: None,
             key_start: Some(self.utf16_offset(span.start as usize)),
             key_end: Some(self.utf16_offset(span.end as usize)),
         });
@@ -5343,6 +5958,20 @@ impl SourceUsageCollector {
             .get_inner_expression()
             .get_identifier_reference()
             .map(|identifier| identifier.name.as_str())
+    }
+
+    fn is_unbound_translator_call(&self, expression: &Expression<'_>) -> bool {
+        if let Some(identifier) = expression.get_identifier_reference() {
+            return is_translator_like_name(identifier.name.as_str());
+        }
+        let Some(member) = expression.get_member_expr() else {
+            return false;
+        };
+        TRANSLATOR_METHODS.contains(&member.static_property_name().as_deref().unwrap_or_default())
+            && member
+                .object()
+                .get_identifier_reference()
+                .is_some_and(|identifier| is_translator_like_name(identifier.name.as_str()))
     }
 
     fn maybe_translator_call(&self, expression: &Expression<'_>) -> Option<TranslatorBinding> {
@@ -5677,6 +6306,7 @@ impl SourceUsageCollector {
                 namespace,
                 path: query.path.clone(),
                 line: query.line,
+                possible_keys: None,
                 key_start: Some(query.key_start),
                 key_end: Some(query.key_end),
             });
@@ -5707,6 +6337,84 @@ impl SourceUsageCollector {
                 _ => self.record_dynamic_key_for_binding(&binding, call.span.start, None),
             }
         }
+    }
+
+    fn apply_jsx_component_summary(&mut self, opening: &JSXOpeningElement<'_>) {
+        let component_name = match &opening.name {
+            JSXElementName::Identifier(identifier) => identifier.name.as_str(),
+            JSXElementName::IdentifierReference(identifier) => identifier.name.as_str(),
+            _ => return,
+        };
+        let Some(summary) = self.jsx_component_summary(component_name) else {
+            return;
+        };
+
+        for usage in summary.usages {
+            let binding = opening.attributes.iter().find_map(|attribute| {
+                let JSXAttributeItem::Attribute(attribute) = attribute else {
+                    return None;
+                };
+                let JSXAttributeName::Identifier(name) = &attribute.name else {
+                    return None;
+                };
+                if name.name.as_str() != usage.prop_name {
+                    return None;
+                }
+                let Some(JSXAttributeValue::ExpressionContainer(container)) = &attribute.value
+                else {
+                    return None;
+                };
+                let JSXExpression::Identifier(identifier) = &container.expression else {
+                    return None;
+                };
+                self.translators.get(identifier.name.as_str()).cloned()
+            });
+            let Some(binding) = binding else {
+                if !usage.translator_like {
+                    continue;
+                }
+                if let Some(query) = usage.query {
+                    self.scan.dynamic_usages.push(DynamicUsage {
+                        namespace: String::new(),
+                        path: query.path,
+                        line: query.line,
+                        possible_keys: usage.keys,
+                        key_start: Some(query.key_start),
+                        key_end: Some(query.key_end),
+                    });
+                } else {
+                    self.scan.dynamic_usages.push(DynamicUsage {
+                        namespace: String::new(),
+                        path: self.path.clone(),
+                        line: self.line_number(opening.span.start),
+                        possible_keys: usage.keys,
+                        key_start: None,
+                        key_end: None,
+                    });
+                }
+                continue;
+            };
+            match usage.keys {
+                Some(keys) if !binding.dynamic_namespace => {
+                    for key in keys {
+                        self.record_used_key_for_binding(&binding, &key);
+                    }
+                }
+                _ => {
+                    if let Some(query) = &usage.query {
+                        self.record_dynamic_query_for_binding(&binding, query);
+                    } else {
+                        self.record_dynamic_key_for_binding(&binding, opening.span.start, None);
+                    }
+                }
+            }
+        }
+    }
+
+    fn jsx_component_summary(&self, name: &str) -> Option<JsxComponentSummary> {
+        self.project
+            .as_ref()?
+            .jsx_component_for_name(&self.path, name)
     }
 
     fn protect_translator_arguments(&mut self, call: &CallExpression<'_>) {
@@ -5942,7 +6650,9 @@ impl SourceUsageCollector {
         visit: impl FnOnce(&mut Self),
     ) {
         let previous = self.finite_constants.insert(name.to_string(), values);
+        self.injected_bindings.insert(name.to_string());
         visit(self);
+        self.injected_bindings.remove(name);
         match previous {
             Some(values) => {
                 self.finite_constants.insert(name.to_string(), values);
@@ -6089,7 +6799,9 @@ impl SourceUsageCollector {
         let previous = self
             .finite_record_constants
             .insert(name.to_string(), values);
+        self.injected_bindings.insert(name.to_string());
         visit(self);
+        self.injected_bindings.remove(name);
         match previous {
             Some(values) => {
                 self.finite_record_constants
@@ -6134,6 +6846,27 @@ impl SourceUsageCollector {
 }
 
 impl<'a> Visit<'a> for SourceUsageCollector {
+    fn enter_scope(&mut self, _flags: ScopeFlags, _scope_id: &Cell<Option<ScopeId>>) {
+        if self.scope_depth > 0 {
+            self.binding_scopes.push(self.binding_environment());
+        }
+        self.scope_depth += 1;
+    }
+
+    fn leave_scope(&mut self) {
+        self.scope_depth = self.scope_depth.saturating_sub(1);
+        if self.scope_depth > 0 {
+            if let Some(environment) = self.binding_scopes.pop() {
+                self.restore_binding_environment(environment);
+            }
+        }
+    }
+
+    fn visit_jsx_opening_element(&mut self, opening: &JSXOpeningElement<'a>) {
+        self.apply_jsx_component_summary(opening);
+        walk::walk_jsx_opening_element(self, opening);
+    }
+
     fn visit_ts_type_alias_declaration(&mut self, declaration: &TSTypeAliasDeclaration<'a>) {
         self.record_ts_type_alias(declaration);
         walk::walk_ts_type_alias_declaration(self, declaration);
@@ -6145,6 +6878,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     }
 
     fn visit_formal_parameter(&mut self, parameter: &oxc_ast::ast::FormalParameter<'a>) {
+        self.mask_binding_pattern(&parameter.pattern);
         if let Some(annotation) = &parameter.type_annotation {
             self.bind_pattern_type_domains(&parameter.pattern, &annotation.type_annotation);
         }
@@ -6177,6 +6911,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
 
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
         if let Some(id) = &function.id {
+            self.mask_binding_name(id.name.as_str());
             if let Some(param_index) = message_key_helper_from_function(function) {
                 self.message_key_helpers
                     .insert(id.name.to_string(), param_index);
@@ -6186,6 +6921,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     }
 
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        self.mask_binding_pattern(&declarator.id);
         if declarator.kind == VariableDeclarationKind::Const {
             if let Some(init) = &declarator.init {
                 if let Some(records) = self.finite_record_from_expression(init) {
@@ -6331,6 +7067,14 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     }
                 }
             }
+        } else if self.is_unbound_translator_call(&call.callee) {
+            if let Some(keys) = call
+                .arguments
+                .first()
+                .and_then(|argument| self.finite_strings_from_argument(argument))
+            {
+                self.scan.used_key_suffixes.extend(keys);
+            }
         }
 
         if let Some(summary) = self.helper_summary_for_callee(&call.callee) {
@@ -6439,11 +7183,111 @@ mod tests {
     }
 
     #[test]
+    fn traces_translator_passed_to_local_jsx_component() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function Card({tProjects}: {
+              tProjects: (key: 'empty' | 'noDescription') => string
+            }) {
+              return <p>{tProjects('noDescription')}</p>;
+            }
+            function Page() {
+              const tProjects = useTranslations('projects.deviations');
+              return <Card tProjects={tProjects} />;
+            }
+            "#,
+        );
+        assert!(scan.used_ids.contains("projects.deviations.noDescription"));
+
+        let unscoped_scan = collect_usage_from_source(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function Facts({t}: {t: (key: 'products.article-number') => string}) {
+              return <p>{t('products.article-number')}</p>;
+            }
+            function ReadOnlyForm({t}: {t: (key: 'products.article-number') => string}) {
+              return <Facts t={t} />;
+            }
+            function Form() {
+              const t = useTranslations();
+              return <ReadOnlyForm t={t} />;
+            }
+            "#,
+            Path::new("sample.tsx"),
+        );
+        let unscoped_scan = unscoped_scan.expect("scan");
+        assert!(unscoped_scan.used_ids.contains("products.article-number"));
+    }
+
+    #[test]
+    fn finite_bindings_do_not_leak_between_function_scopes() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('items');
+            function first() {
+              const key = 'known';
+              return key;
+            }
+            function second(key: string) {
+              return t(key);
+            }
+            "#,
+        );
+        assert!(!scan.used_ids.contains("items.known"));
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "items")
+        );
+    }
+
+    #[test]
+    fn translator_parameters_shadow_outer_translator_bindings() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('outer');
+            function Card({t}: {t: (key: 'inside') => string}) {
+              return <p>{t('inside')}</p>;
+            }
+            "#,
+        );
+        assert!(!scan.used_ids.contains("outer.inside"));
+    }
+
+    #[test]
+    fn unbound_translator_helpers_protect_finite_key_suffixes() {
+        let scan = scan(
+            r#"
+            function getRoleLabelKey(userType: string) {
+              switch (userType) {
+                case 'ADMIN': return 'admin';
+                case 'USER': return 'user';
+                default: return null;
+              }
+            }
+            function Page({tRoles, userType}: {
+              tRoles: (key: 'admin' | 'user') => string,
+              userType: string
+            }) {
+              const roleLabelKey = getRoleLabelKey(userType);
+              return roleLabelKey ? tRoles(roleLabelKey) : null;
+            }
+            "#,
+        );
+        assert!(scan.used_key_suffixes.contains("admin"));
+        assert!(scan.used_key_suffixes.contains("user"));
+    }
+
+    #[test]
     fn ts_checker_queries_include_unscoped_dynamic_key_usage() {
         let queries = ts_checker_queries(&[DynamicUsage {
             namespace: String::new(),
             path: PathBuf::from("/tmp/sample.tsx"),
             line: 1,
+            possible_keys: None,
             key_start: Some(10),
             key_end: Some(20),
         }]);
