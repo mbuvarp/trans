@@ -8,18 +8,19 @@ use std::sync::Arc;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, ArrowFunctionExpression, AssignmentExpression,
-    AssignmentTarget, BindingIdentifier, BindingPattern, CallExpression, CatchParameter,
-    ComputedMemberExpression, ConditionalExpression, Declaration, ExportAllDeclaration,
-    ExportDefaultDeclaration, ExportDefaultDeclarationKind, ExportNamedDeclaration, Expression,
-    ForOfStatement, ForStatementLeft, Function, FunctionBody, FunctionType, IdentifierReference,
-    ImportDeclaration, ImportDeclarationSpecifier, JSXAttributeItem, JSXAttributeName,
-    JSXAttributeValue, JSXChild, JSXElement, JSXElementName, JSXExpression,
-    JSXMemberExpressionObject, JSXOpeningElement, ModuleExportName, ObjectExpression,
-    ObjectPropertyKind, PropertyKind, ReturnStatement, Statement, StaticMemberExpression,
-    TSInterfaceDeclaration, TSLiteral, TSSignature, TSType, TSTypeAliasDeclaration, TSTypeName,
-    TSTypeOperatorOperator, TSTypeQueryExprName, TemplateLiteral, VariableDeclaration,
-    VariableDeclarationKind, VariableDeclarator,
+    Argument, ArrayAssignmentTarget, ArrayExpressionElement, ArrowFunctionExpression,
+    AssignmentExpression, AssignmentTarget, AssignmentTargetMaybeDefault, AssignmentTargetProperty,
+    BindingIdentifier, BindingPattern, CallExpression, CatchParameter, ComputedMemberExpression,
+    ConditionalExpression, Declaration, ExportAllDeclaration, ExportDefaultDeclaration,
+    ExportDefaultDeclarationKind, ExportNamedDeclaration, Expression, ForOfStatement,
+    ForStatementLeft, Function, FunctionBody, FunctionType, IdentifierReference, ImportDeclaration,
+    ImportDeclarationSpecifier, JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild,
+    JSXElement, JSXElementName, JSXExpression, JSXMemberExpressionObject, JSXOpeningElement,
+    ModuleExportName, ObjectAssignmentTarget, ObjectExpression, ObjectPropertyKind, PropertyKind,
+    ReturnStatement, Statement, StaticMemberExpression, TSInterfaceDeclaration, TSLiteral,
+    TSSignature, TSType, TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator,
+    TSTypeQueryExprName, TemplateLiteral, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -183,6 +184,13 @@ impl TranslatorObjectBinding {
                                 .strip_prefix(resolved)
                                 .is_some_and(|remaining| remaining.starts_with('.')))
                 })
+        })
+    }
+
+    fn binding_for_path(&self, path: &str) -> Option<TranslatorBinding> {
+        self.bindings.get(path).cloned().or_else(|| {
+            (!self.bindings.is_empty() && self.path_is_unknown(path))
+                .then(|| translator_binding_from_namespace_arg(NamespaceArg::Dynamic))
         })
     }
 
@@ -10968,38 +10976,91 @@ impl SourceUsageCollector {
         pattern: &BindingPattern<'_>,
         bindings: &TranslatorObjectBinding,
     ) {
-        let BindingPattern::ObjectPattern(object) = pattern else {
+        if !matches!(pattern, BindingPattern::ObjectPattern(_)) {
             return;
-        };
-        for property in &object.properties {
-            if property.computed {
-                continue;
-            }
-            let Some(property_name) = property.key.static_name() else {
-                continue;
-            };
-            let Some(binding_name) = binding_identifier_name(&property.value) else {
-                continue;
-            };
-            if let Some(binding) = bindings.bindings.get(property_name.as_ref()) {
-                self.translators
-                    .insert(binding_name.to_string(), binding.clone());
-            }
         }
-        if let Some(rest) = &object.rest
-            && let Some(rest_name) = binding_identifier_name(&rest.argument)
-        {
-            let mut residual = bindings.clone();
-            for property in &object.properties {
-                if property.computed {
-                    continue;
-                }
-                if let Some(property_name) = property.key.static_name() {
-                    residual.remove_property(property_name.as_ref());
+        self.bind_pattern_translator_object_path(pattern, bindings, &[]);
+    }
+
+    fn bind_pattern_translator_object_path(
+        &mut self,
+        pattern: &BindingPattern<'_>,
+        bindings: &TranslatorObjectBinding,
+        path: &[String],
+    ) {
+        match pattern {
+            BindingPattern::BindingIdentifier(identifier) => {
+                if let Some(binding) = bindings.binding_for_path(&path.join(".")) {
+                    self.translators
+                        .insert(identifier.name.to_string(), binding);
                 }
             }
-            self.translator_object_bindings
-                .insert(rest_name.to_string(), residual);
+            BindingPattern::AssignmentPattern(assignment) => {
+                let source_binding = bindings.binding_for_path(&path.join("."));
+                if let Some(name) = binding_identifier_name(&assignment.left)
+                    && let Some(binding) = source_binding
+                        .clone()
+                        .or_else(|| self.translator_binding_from_expression(&assignment.right))
+                {
+                    self.translators.insert(name.to_string(), binding);
+                    return;
+                }
+                if source_binding.is_none()
+                    && let Some(default_bindings) =
+                        self.translator_object_bindings_from_expression(&assignment.right)
+                {
+                    self.bind_pattern_translator_object_path(
+                        &assignment.left,
+                        &default_bindings,
+                        &[],
+                    );
+                } else {
+                    self.bind_pattern_translator_object_path(&assignment.left, bindings, path);
+                }
+            }
+            BindingPattern::ObjectPattern(object) => {
+                for property in &object.properties {
+                    if property.computed {
+                        continue;
+                    }
+                    let Some(property_name) = property.key.static_name() else {
+                        continue;
+                    };
+                    let mut property_path = path.to_vec();
+                    property_path.push(property_name.to_string());
+                    self.bind_pattern_translator_object_path(
+                        &property.value,
+                        bindings,
+                        &property_path,
+                    );
+                }
+                if let Some(rest) = &object.rest
+                    && let Some(rest_name) = binding_identifier_name(&rest.argument)
+                {
+                    let mut residual = if path.is_empty() {
+                        Some(bindings.clone())
+                    } else {
+                        path.iter().try_fold(bindings.clone(), |binding, property| {
+                            binding.subobject(property)
+                        })
+                    };
+                    if let Some(residual) = residual.as_mut() {
+                        for property in &object.properties {
+                            if property.computed {
+                                continue;
+                            }
+                            if let Some(property_name) = property.key.static_name() {
+                                residual.remove_property(property_name.as_ref());
+                            }
+                        }
+                    }
+                    if let Some(residual) = residual {
+                        self.translator_object_bindings
+                            .insert(rest_name.to_string(), residual);
+                    }
+                }
+            }
+            BindingPattern::ArrayPattern(_) => {}
         }
     }
 
@@ -11024,13 +11085,23 @@ impl SourceUsageCollector {
             })
             .flatten();
         for (index, element) in pattern.elements.iter().enumerate() {
-            let Some(name) = element.as_ref().and_then(binding_identifier_name) else {
+            let Some(element) = element.as_ref() else {
                 continue;
             };
-            if let Some(binding) = uncertain_binding
+            let Some(name) = binding_identifier_name(element) else {
+                continue;
+            };
+            let binding = uncertain_binding
                 .as_ref()
                 .or_else(|| array.bindings.get(index).and_then(Option::as_ref))
-            {
+                .cloned()
+                .or_else(|| match element {
+                    BindingPattern::AssignmentPattern(assignment) => {
+                        self.translator_binding_from_expression(&assignment.right)
+                    }
+                    _ => None,
+                });
+            if let Some(binding) = binding {
                 self.translators.insert(name.to_string(), binding.clone());
             }
         }
@@ -11053,6 +11124,123 @@ impl SourceUsageCollector {
                     safe_layout: array.safe_layout,
                 },
             );
+        }
+    }
+
+    fn bind_assignment_identifier(
+        &mut self,
+        identifier: &IdentifierReference<'_>,
+        binding: Option<TranslatorBinding>,
+    ) {
+        let name = identifier.name.as_str();
+        self.mask_binding_name(name);
+        if let Some(binding) = binding {
+            self.translators.insert(name.to_string(), binding);
+        }
+    }
+
+    fn bind_assignment_maybe_default(
+        &mut self,
+        target: &AssignmentTargetMaybeDefault<'_>,
+        source: Option<TranslatorBinding>,
+    ) {
+        let default = match target {
+            AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(default) => {
+                self.translator_binding_from_expression(&default.init)
+            }
+            _ => None,
+        };
+        if let Some(identifier) = target.identifier() {
+            self.bind_assignment_identifier(identifier, source.or(default));
+        }
+    }
+
+    fn bind_object_assignment_target(
+        &mut self,
+        target: &ObjectAssignmentTarget<'_>,
+        bindings: Option<&TranslatorObjectBinding>,
+    ) {
+        let mut removed = Vec::new();
+        for property in &target.properties {
+            match property {
+                AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(property) => {
+                    let name = property.binding.name.as_str();
+                    removed.push(name.to_string());
+                    let source = bindings.and_then(|bindings| bindings.binding_for_path(name));
+                    let default = property
+                        .init
+                        .as_ref()
+                        .and_then(|init| self.translator_binding_from_expression(init));
+                    self.bind_assignment_identifier(&property.binding, source.or(default));
+                }
+                AssignmentTargetProperty::AssignmentTargetPropertyProperty(property) => {
+                    if property.computed {
+                        continue;
+                    }
+                    let Some(name) = property.name.static_name() else {
+                        continue;
+                    };
+                    removed.push(name.to_string());
+                    let source =
+                        bindings.and_then(|bindings| bindings.binding_for_path(name.as_ref()));
+                    self.bind_assignment_maybe_default(&property.binding, source);
+                }
+            }
+        }
+        if let Some(rest) = &target.rest
+            && let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &rest.target
+        {
+            let name = identifier.name.as_str();
+            self.mask_binding_name(name);
+            if let Some(bindings) = bindings {
+                let mut residual = bindings.clone();
+                for property in removed {
+                    residual.remove_property(&property);
+                }
+                self.translator_object_bindings
+                    .insert(name.to_string(), residual);
+            }
+        }
+    }
+
+    fn bind_array_assignment_target(
+        &mut self,
+        target: &ArrayAssignmentTarget<'_>,
+        array: Option<&TranslatorArgumentArray>,
+    ) {
+        for (index, element) in target.elements.iter().enumerate() {
+            let Some(element) = element else {
+                continue;
+            };
+            let source = array
+                .and_then(|array| array.bindings.get(index))
+                .cloned()
+                .flatten();
+            self.bind_assignment_maybe_default(element, source);
+        }
+        if let Some(rest) = &target.rest
+            && let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &rest.target
+        {
+            let name = identifier.name.as_str();
+            self.mask_binding_name(name);
+            if let Some(array) = array {
+                self.translator_argument_arrays.insert(
+                    name.to_string(),
+                    TranslatorArgumentArray {
+                        bindings: if array.safe_layout {
+                            array
+                                .bindings
+                                .iter()
+                                .skip(target.elements.len())
+                                .cloned()
+                                .collect()
+                        } else {
+                            array.bindings.clone()
+                        },
+                        safe_layout: array.safe_layout,
+                    },
+                );
+            }
         }
     }
 }
@@ -11526,6 +11714,20 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     }
 
     fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
+        if expression.operator == AssignmentOperator::Assign {
+            match &expression.left {
+                AssignmentTarget::ObjectAssignmentTarget(target) => {
+                    let bindings =
+                        self.translator_object_bindings_from_expression(&expression.right);
+                    self.bind_object_assignment_target(target, bindings.as_ref());
+                }
+                AssignmentTarget::ArrayAssignmentTarget(target) => {
+                    let array = self.translator_argument_array_from_expression(&expression.right);
+                    self.bind_array_assignment_target(target, array.as_ref());
+                }
+                _ => {}
+            }
+        }
         if expression.operator == AssignmentOperator::Assign
             && let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &expression.left
         {
@@ -14596,6 +14798,64 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
         );
 
         assert!(scan.used_ids.contains("common.primary"));
+        assert!(scan.used_ids.contains("settings.rest"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn nested_object_destructuring_binds_translator_aliases() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const bundle = {group: {format: common}};
+            const {group: {format: render}} = bundle;
+            render('title');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn destructuring_defaults_bind_known_translators() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const [arrayRender = common] = [];
+            arrayRender('array');
+            const {format: objectRender = common} = {};
+            objectRender('object');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.array"));
+        assert!(scan.used_ids.contains("common.object"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn destructuring_assignments_bind_translators_and_rest_arrays() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            let objectRender;
+            let arrayRender;
+            let rest;
+            ({format: objectRender} = {format: common});
+            [arrayRender, ...rest] = [common, settings];
+            objectRender('object');
+            arrayRender('array');
+            rest.forEach(render => render('rest'));
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.object"));
+        assert!(scan.used_ids.contains("common.array"));
         assert!(scan.used_ids.contains("settings.rest"));
         assert!(scan.dynamic_usages.is_empty());
     }
