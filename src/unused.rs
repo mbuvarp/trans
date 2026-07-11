@@ -194,6 +194,16 @@ impl TranslatorObjectBinding {
         })
     }
 
+    fn has_binding_at_or_below(&self, path: &str) -> bool {
+        self.bindings.keys().any(|candidate| {
+            path.is_empty()
+                || candidate == path
+                || candidate
+                    .strip_prefix(path)
+                    .is_some_and(|remaining| remaining.starts_with('.'))
+        })
+    }
+
     fn mark_unknown(&mut self, container: &str) {
         self.unknown_paths.insert(container.to_string());
         self.resolved_properties.retain(|path| {
@@ -11045,8 +11055,8 @@ impl SourceUsageCollector {
                 }
             }
             BindingPattern::AssignmentPattern(assignment) => {
-                if let Some(binding) = self
-                    .translator_binding_from_expression_path(expression, path)
+                let source_binding = self.translator_binding_from_expression_path(expression, path);
+                if let Some(binding) = source_binding
                     .or_else(|| self.translator_binding_from_expression(&assignment.right))
                     && let Some(name) = binding_identifier_name(&assignment.left)
                 {
@@ -11056,6 +11066,15 @@ impl SourceUsageCollector {
                             *current = merge_translator_bindings(current, &binding)
                         })
                         .or_insert(binding);
+                } else if self
+                    .translator_object_bindings_from_expression(expression)
+                    .is_some_and(|bindings| bindings.has_binding_at_or_below(&path.join(".")))
+                {
+                    self.bind_pattern_translator_expression_path(
+                        &assignment.left,
+                        expression,
+                        path,
+                    );
                 } else {
                     self.bind_pattern_translator_expression_path(
                         &assignment.left,
@@ -11118,20 +11137,32 @@ impl SourceUsageCollector {
             BindingPattern::BindingIdentifier(identifier) => {
                 if let Some(binding) = bindings.binding_for_path(&path.join(".")) {
                     self.translators
-                        .insert(identifier.name.to_string(), binding);
+                        .entry(identifier.name.to_string())
+                        .and_modify(|current| {
+                            *current = merge_translator_bindings(current, &binding)
+                        })
+                        .or_insert(binding);
                 }
             }
             BindingPattern::AssignmentPattern(assignment) => {
-                let source_binding = bindings.binding_for_path(&path.join("."));
+                let source_path = path.join(".");
+                let source_binding = bindings.binding_for_path(&source_path);
                 if let Some(name) = binding_identifier_name(&assignment.left)
                     && let Some(binding) = source_binding
                         .clone()
                         .or_else(|| self.translator_binding_from_expression(&assignment.right))
                 {
-                    self.translators.insert(name.to_string(), binding);
+                    self.translators
+                        .entry(name.to_string())
+                        .and_modify(|current| {
+                            *current = merge_translator_bindings(current, &binding)
+                        })
+                        .or_insert(binding);
                     return;
                 }
-                if source_binding.is_none()
+                if bindings.has_binding_at_or_below(&source_path) {
+                    self.bind_pattern_translator_object_path(&assignment.left, bindings, path);
+                } else if source_binding.is_none()
                     && let Some(default_bindings) =
                         self.translator_object_bindings_from_expression(&assignment.right)
                 {
@@ -11193,7 +11224,9 @@ impl SourceUsageCollector {
                                     .static_name()
                                     .map(|name| finite_string(name.to_string()))
                             };
-                            if let Some(names) = names {
+                            if let Some(names) = names
+                                && (!property.computed || names.len() == 1)
+                            {
                                 for name in names {
                                     residual.remove_property(&name);
                                 }
@@ -11285,16 +11318,43 @@ impl SourceUsageCollector {
         }
     }
 
+    fn merge_assignment_identifier(
+        &mut self,
+        identifier: &IdentifierReference<'_>,
+        binding: Option<TranslatorBinding>,
+    ) {
+        if let Some(binding) = binding {
+            self.translators
+                .entry(identifier.name.to_string())
+                .and_modify(|current| *current = merge_translator_bindings(current, &binding))
+                .or_insert(binding);
+        }
+    }
+
     fn bind_assignment_target_expression_path(
         &mut self,
         target: &AssignmentTarget<'_>,
         expression: &Expression<'_>,
         path: &[String],
     ) {
+        self.bind_assignment_target_expression_path_inner(target, expression, path, false);
+    }
+
+    fn bind_assignment_target_expression_path_inner(
+        &mut self,
+        target: &AssignmentTarget<'_>,
+        expression: &Expression<'_>,
+        path: &[String],
+        merge_existing: bool,
+    ) {
         match target {
             AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
                 let binding = self.translator_binding_from_expression_path(expression, path);
-                self.bind_assignment_identifier(identifier, binding);
+                if merge_existing {
+                    self.merge_assignment_identifier(identifier, binding);
+                } else {
+                    self.bind_assignment_identifier(identifier, binding);
+                }
             }
             AssignmentTarget::ObjectAssignmentTarget(target) => {
                 for property in &target.properties {
@@ -11309,7 +11369,11 @@ impl SourceUsageCollector {
                                         self.translator_binding_from_expression(init)
                                     })
                                 });
-                            self.bind_assignment_identifier(&property.binding, binding);
+                            if merge_existing {
+                                self.merge_assignment_identifier(&property.binding, binding);
+                            } else {
+                                self.bind_assignment_identifier(&property.binding, binding);
+                            }
                         }
                         AssignmentTargetProperty::AssignmentTargetPropertyProperty(property) => {
                             let names = if property.computed {
@@ -11326,13 +11390,14 @@ impl SourceUsageCollector {
                             let Some(names) = names else {
                                 continue;
                             };
-                            for name in names {
+                            for (index, name) in names.into_iter().enumerate() {
                                 let mut property_path = path.to_vec();
                                 property_path.push(name);
                                 self.bind_assignment_maybe_default_expression_path(
                                     &property.binding,
                                     expression,
                                     &property_path,
+                                    merge_existing || index > 0,
                                 );
                             }
                         }
@@ -11350,6 +11415,7 @@ impl SourceUsageCollector {
                         element,
                         expression,
                         &element_path,
+                        merge_existing,
                     );
                 }
             }
@@ -11362,34 +11428,55 @@ impl SourceUsageCollector {
         target: &AssignmentTargetMaybeDefault<'_>,
         expression: &Expression<'_>,
         path: &[String],
+        merge_existing: bool,
     ) {
         match target {
             AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(default) => {
-                if let Some(binding) = self
-                    .translator_binding_from_expression_path(expression, path)
+                let source_binding = self.translator_binding_from_expression_path(expression, path);
+                if let Some(binding) = source_binding
                     .or_else(|| self.translator_binding_from_expression(&default.init))
                     && let AssignmentTarget::AssignmentTargetIdentifier(identifier) =
                         &default.binding
                 {
-                    self.bind_assignment_identifier(identifier, Some(binding));
+                    if merge_existing {
+                        self.merge_assignment_identifier(identifier, Some(binding));
+                    } else {
+                        self.bind_assignment_identifier(identifier, Some(binding));
+                    }
+                } else if self
+                    .translator_object_bindings_from_expression(expression)
+                    .is_some_and(|bindings| bindings.has_binding_at_or_below(&path.join(".")))
+                {
+                    self.bind_assignment_target_expression_path_inner(
+                        &default.binding,
+                        expression,
+                        path,
+                        merge_existing,
+                    );
                 } else {
-                    self.bind_assignment_target_expression_path(
+                    self.bind_assignment_target_expression_path_inner(
                         &default.binding,
                         &default.init,
                         &[],
+                        merge_existing,
                     );
                 }
             }
             AssignmentTargetMaybeDefault::AssignmentTargetIdentifier(identifier) => {
                 let binding = self.translator_binding_from_expression_path(expression, path);
-                self.bind_assignment_identifier(identifier, binding);
+                if merge_existing {
+                    self.merge_assignment_identifier(identifier, binding);
+                } else {
+                    self.bind_assignment_identifier(identifier, binding);
+                }
             }
             AssignmentTargetMaybeDefault::ObjectAssignmentTarget(_)
             | AssignmentTargetMaybeDefault::ArrayAssignmentTarget(_) => self
-                .bind_assignment_target_expression_path(
+                .bind_assignment_target_expression_path_inner(
                     target.to_assignment_target(),
                     expression,
                     path,
+                    merge_existing,
                 ),
             _ => {}
         }
@@ -11435,6 +11522,7 @@ impl SourceUsageCollector {
                             .name
                             .as_expression()
                             .and_then(|key| self.finite_strings_from_expression(key))
+                            && names.len() == 1
                         {
                             removed.extend(names);
                         }
@@ -15116,6 +15204,57 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
     }
 
     #[test]
+    fn finite_computed_destructuring_merges_all_possible_translators() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const property = enabled ? 'common' : 'settings';
+            const bundle = {common, settings};
+            const {[property]: render} = bundle;
+            render('title');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.used_ids.contains("settings.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn finite_computed_destructuring_keeps_possible_rest_translators() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const property = enabled ? 'common' : 'settings';
+            const bundle = {common, settings};
+            const {[property]: render, ...rest} = bundle;
+            render('selected');
+            Object.values(rest).forEach(format => format('remaining'));
+            let assigned;
+            let assignedRest;
+            ({[property]: assigned, ...assignedRest} = bundle);
+            assigned('assigned');
+            Object.values(assignedRest).forEach(format => format('assignedRemaining'));
+            "#,
+        );
+
+        for namespace in ["common", "settings"] {
+            assert!(scan.used_ids.contains(&format!("{namespace}.selected")));
+            assert!(scan.used_ids.contains(&format!("{namespace}.remaining")));
+            assert!(scan.used_ids.contains(&format!("{namespace}.assigned")));
+            assert!(
+                scan.used_ids
+                    .contains(&format!("{namespace}.assignedRemaining"))
+            );
+        }
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
     fn nested_array_destructuring_resolves_array_aliases() {
         let scan = scan(
             r#"
@@ -15194,6 +15333,29 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
 
         assert!(scan.used_ids.contains("common.object"));
         assert!(scan.used_ids.contains("settings.array"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn nested_destructuring_defaults_prefer_present_source_containers() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const source = {group: {format: common}};
+            const {group: {format: render} = {format: settings}} = source;
+            let assigned;
+            ({group: {format: assigned} = {format: settings}} = source);
+            render('declaration');
+            assigned('assignment');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.declaration"));
+        assert!(scan.used_ids.contains("common.assignment"));
+        assert!(!scan.used_ids.contains("settings.declaration"));
+        assert!(!scan.used_ids.contains("settings.assignment"));
         assert!(scan.dynamic_usages.is_empty());
     }
 
