@@ -324,6 +324,7 @@ impl TranslatorObjectBinding {
 struct TranslatorArgumentArray {
     bindings: Vec<Option<TranslatorBinding>>,
     safe_layout: bool,
+    optional: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3559,6 +3560,27 @@ fn merge_translator_argument_arrays(
     TranslatorArgumentArray {
         bindings,
         safe_layout: same_length && left.safe_layout && right.safe_layout,
+        optional: left.optional || right.optional,
+    }
+}
+
+fn merge_param_argument_arrays(
+    left: ParamArgumentArray,
+    right: ParamArgumentArray,
+) -> ParamArgumentArray {
+    let same_length = left.bindings.len() == right.bindings.len();
+    let length = left.bindings.len().max(right.bindings.len());
+    let mut bindings = Vec::with_capacity(length);
+    for index in 0..length {
+        let mut indexes = left.bindings.get(index).cloned().unwrap_or_default();
+        if let Some(right) = right.bindings.get(index) {
+            indexes.extend(right);
+        }
+        bindings.push(indexes);
+    }
+    ParamArgumentArray {
+        bindings,
+        safe_layout: same_length && left.safe_layout && right.safe_layout,
     }
 }
 
@@ -5513,29 +5535,45 @@ impl HelperBodyCollector {
                 .get(identifier.name.as_str())
                 .cloned(),
             Expression::ConditionalExpression(conditional) => {
-                let consequent =
-                    self.param_argument_array_from_expression(&conditional.consequent)?;
-                let alternate =
-                    self.param_argument_array_from_expression(&conditional.alternate)?;
-                if consequent.bindings.len() != alternate.bindings.len() {
-                    return Some(ParamArgumentArray {
-                        bindings: Vec::new(),
-                        safe_layout: false,
-                    });
+                let consequent = self.param_argument_array_from_expression(&conditional.consequent);
+                let alternate = self.param_argument_array_from_expression(&conditional.alternate);
+                match (consequent, alternate) {
+                    (Some(consequent), Some(alternate)) => {
+                        Some(merge_param_argument_arrays(consequent, alternate))
+                    }
+                    (Some(mut array), None) | (None, Some(mut array)) => {
+                        array.safe_layout = false;
+                        Some(array)
+                    }
+                    (None, None) => None,
                 }
-                let bindings = consequent
-                    .bindings
-                    .into_iter()
-                    .zip(alternate.bindings)
-                    .map(|(mut left, right)| {
-                        left.extend(right);
-                        left
-                    })
-                    .collect();
-                Some(ParamArgumentArray {
-                    bindings,
-                    safe_layout: consequent.safe_layout && alternate.safe_layout,
-                })
+            }
+            Expression::LogicalExpression(logical) => {
+                let left = self.param_argument_array_from_expression(&logical.left);
+                let right = self.param_argument_array_from_expression(&logical.right);
+                match logical.operator {
+                    LogicalOperator::And => match (left, right) {
+                        (Some(left), right) if left.safe_layout => right,
+                        (_, Some(mut right)) => {
+                            right.safe_layout = false;
+                            Some(right)
+                        }
+                        (_, None) => None,
+                    },
+                    LogicalOperator::Or | LogicalOperator::Coalesce => match (left, right) {
+                        (Some(left), _) if left.safe_layout => Some(left),
+                        (Some(left), Some(right)) => Some(merge_param_argument_arrays(left, right)),
+                        (Some(mut left), None) => {
+                            left.safe_layout = false;
+                            Some(left)
+                        }
+                        (None, Some(mut right)) => {
+                            right.safe_layout = false;
+                            Some(right)
+                        }
+                        (None, None) => None,
+                    },
+                }
             }
             _ => None,
         }
@@ -9561,22 +9599,29 @@ impl SourceUsageCollector {
             Expression::LogicalExpression(logical) => {
                 let left = self.translator_object_bindings_from_expression(&logical.left);
                 let right = self.translator_object_bindings_from_expression(&logical.right);
+                let left_is_known_truthy = matches!(
+                    logical.left.get_inner_expression(),
+                    Expression::ObjectExpression(_) | Expression::ArrayExpression(_)
+                ) || left.as_ref().is_some_and(|bindings| {
+                    !bindings.resolved_properties.is_empty() && !bindings.unknown_paths.contains("")
+                }) || self
+                    .translator_binding_from_expression(&logical.left)
+                    .is_some_and(|binding| !binding.dynamic_namespace);
                 let (mut result, unresolved) = match logical.operator {
                     LogicalOperator::And => {
                         let mut result = right?;
-                        let left_is_known_truthy = matches!(
-                            logical.left.get_inner_expression(),
-                            Expression::ObjectExpression(_) | Expression::ArrayExpression(_)
-                        ) || self
-                            .translator_binding_from_expression(&logical.left)
-                            .is_some_and(|binding| !binding.dynamic_namespace);
                         if !left_is_known_truthy {
                             result.resolved_properties.clear();
                         }
                         (result, None)
                     }
                     LogicalOperator::Or | LogicalOperator::Coalesce => match (left, right) {
-                        (Some(left), _) => (left, None),
+                        (Some(left), _) if left_is_known_truthy => (left, None),
+                        (Some(left), Some(right)) => (left.merge_alternative(right), None),
+                        (Some(mut left), None) => {
+                            left.mark_unknown("");
+                            (left, None)
+                        }
                         (None, Some(result)) => (result, Some(&logical.left)),
                         (None, None) => return None,
                     },
@@ -9706,6 +9751,7 @@ impl SourceUsageCollector {
                     }
                     (Some(mut array), None) | (None, Some(mut array)) => {
                         array.safe_layout = false;
+                        array.optional = true;
                         Some(array)
                     }
                     (None, None) => None,
@@ -9715,11 +9761,25 @@ impl SourceUsageCollector {
                 let left = self.translator_argument_array_from_expression(&logical.left);
                 let right = self.translator_argument_array_from_expression(&logical.right);
                 match logical.operator {
-                    LogicalOperator::And => right,
+                    LogicalOperator::And => match (left, right) {
+                        (Some(left), right) if !left.optional => right,
+                        (_, Some(mut right)) => {
+                            right.optional = true;
+                            Some(right)
+                        }
+                        (_, None) => None,
+                    },
                     LogicalOperator::Or | LogicalOperator::Coalesce => match (left, right) {
-                        (Some(left), _) => Some(left),
+                        (Some(left), _) if !left.optional => Some(left),
+                        (Some(left), Some(right)) => {
+                            let optional = left.optional && right.optional;
+                            let mut merged = merge_translator_argument_arrays(left, right);
+                            merged.optional = optional;
+                            Some(merged)
+                        }
+                        (Some(left), None) => Some(left),
                         (None, Some(mut right)) => {
-                            right.safe_layout = false;
+                            right.optional = true;
                             Some(right)
                         }
                         (None, None) => None,
@@ -9754,6 +9814,7 @@ impl SourceUsageCollector {
         TranslatorArgumentArray {
             bindings,
             safe_layout,
+            optional: false,
         }
     }
 
@@ -9782,6 +9843,7 @@ impl SourceUsageCollector {
         TranslatorArgumentArray {
             bindings,
             safe_layout,
+            optional: false,
         }
     }
 
@@ -11447,6 +11509,7 @@ impl SourceUsageCollector {
                         array.bindings.clone()
                     },
                     safe_layout: array.safe_layout,
+                    optional: false,
                 },
             );
         }
@@ -11791,6 +11854,7 @@ impl SourceUsageCollector {
                             array.bindings.clone()
                         },
                         safe_layout: array.safe_layout,
+                        optional: false,
                     },
                 );
             }
@@ -12240,6 +12304,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                         .unwrap_or(TranslatorArgumentArray {
                             bindings: Vec::new(),
                             safe_layout: false,
+                            optional: true,
                         });
                     self.apply_helper_summary_from_bindings(
                         &argument_array,
@@ -15350,6 +15415,55 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
     }
 
     #[test]
+    fn optional_logical_translator_arrays_merge_fallbacks() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const translators = (enabled && [common]) || [settings];
+            const [render] = translators;
+            render('title');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.used_ids.contains("settings.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn helper_logical_arrays_preserve_translator_parameters() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function invoke(translate) {
+                translate('title');
+            }
+            function render(enabled, common, settings) {
+                const translators = (enabled && [common]) || [settings];
+                invoke.apply(null, translators);
+            }
+            function invokePartial(translate) {
+                translate('partial');
+            }
+            function renderPartial(enabled, common) {
+                const translators = enabled ? [common] : runtimeTranslators;
+                invokePartial.apply(null, translators);
+            }
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            render(enabled, common, settings);
+            renderPartial(enabled, common);
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.used_ids.contains("settings.title"));
+        assert!(scan.used_ids.contains("common.partial"));
+    }
+
+    #[test]
     fn array_destructuring_binds_translators_and_rest_arrays() {
         let scan = scan(
             r#"
@@ -15554,6 +15668,25 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
                 render: settings,
                 ...(enabled && {render: common}),
             };
+            const {render} = source;
+            render('title');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.used_ids.contains("settings.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn optional_logical_objects_merge_reachable_fallbacks() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const source =
+                (enabled && {render: common}) || {render: settings};
             const {render} = source;
             render('title');
             "#,
