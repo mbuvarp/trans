@@ -79,6 +79,7 @@ type FiniteRecords = Vec<FiniteRecord>;
 type FiniteRecordBindings = BTreeMap<String, FiniteRecords>;
 type FiniteRecordMaps = BTreeMap<String, FiniteRecords>;
 type TranslatorObjectBindings = BTreeMap<String, TranslatorObjectBinding>;
+type TranslatorArrayAliases = BTreeMap<String, BTreeSet<String>>;
 type TypeDomains = BTreeMap<String, FiniteStrings>;
 type TypePropertyDomains = BTreeMap<String, BTreeMap<String, FiniteStrings>>;
 type PropertyDomains = BTreeMap<String, FiniteStrings>;
@@ -2767,6 +2768,7 @@ struct SourceUsageCollector {
     translators: BTreeMap<String, TranslatorBinding>,
     translator_object_bindings: TranslatorObjectBindings,
     translator_argument_arrays: BTreeMap<String, TranslatorArgumentArray>,
+    translator_array_aliases: TranslatorArrayAliases,
     potential_translators: BTreeSet<String>,
     shadowed_react_bindings: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
@@ -2798,6 +2800,7 @@ struct BindingEnvironment {
     translators: BTreeMap<String, TranslatorBinding>,
     translator_object_bindings: TranslatorObjectBindings,
     translator_argument_arrays: BTreeMap<String, TranslatorArgumentArray>,
+    translator_array_aliases: TranslatorArrayAliases,
     potential_translators: BTreeSet<String>,
     shadowed_react_bindings: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
@@ -8357,6 +8360,7 @@ impl SourceUsageCollector {
             translators: BTreeMap::new(),
             translator_object_bindings: BTreeMap::new(),
             translator_argument_arrays: BTreeMap::new(),
+            translator_array_aliases: BTreeMap::new(),
             potential_translators: BTreeSet::new(),
             shadowed_react_bindings: BTreeSet::new(),
             message_key_helpers: BTreeMap::new(),
@@ -8389,6 +8393,7 @@ impl SourceUsageCollector {
             translators: self.translators.clone(),
             translator_object_bindings: self.translator_object_bindings.clone(),
             translator_argument_arrays: self.translator_argument_arrays.clone(),
+            translator_array_aliases: self.translator_array_aliases.clone(),
             potential_translators: self.potential_translators.clone(),
             shadowed_react_bindings: self.shadowed_react_bindings.clone(),
             message_key_helpers: self.message_key_helpers.clone(),
@@ -8416,6 +8421,7 @@ impl SourceUsageCollector {
         self.translators = environment.translators;
         self.translator_object_bindings = environment.translator_object_bindings;
         self.translator_argument_arrays = environment.translator_argument_arrays;
+        self.translator_array_aliases = environment.translator_array_aliases;
         self.potential_translators = environment.potential_translators;
         self.shadowed_react_bindings = environment.shadowed_react_bindings;
         self.message_key_helpers = environment.message_key_helpers;
@@ -8443,10 +8449,68 @@ impl SourceUsageCollector {
         self.translators.remove(name);
         self.translator_object_bindings.remove(name);
         self.translator_argument_arrays.remove(name);
+        self.remove_translator_array_alias(name);
         self.potential_translators.remove(name);
         self.message_key_helpers.remove(name);
         self.next_intl_namespaces.remove(name);
         self.next_intl_server_namespaces.remove(name);
+    }
+
+    fn remove_translator_array_alias(&mut self, name: &str) {
+        self.translator_array_aliases.remove(name);
+        for aliases in self.translator_array_aliases.values_mut() {
+            aliases.remove(name);
+        }
+        self.translator_array_aliases
+            .retain(|_, aliases| !aliases.is_empty());
+    }
+
+    fn register_translator_array_alias(&mut self, alias: &str, source: &str) {
+        let mut aliases = BTreeSet::from([alias.to_string(), source.to_string()]);
+        if let Some(existing) = self.translator_array_aliases.get(alias) {
+            aliases.extend(existing.iter().cloned());
+        }
+        if let Some(existing) = self.translator_array_aliases.get(source) {
+            aliases.extend(existing.iter().cloned());
+        }
+        for name in aliases.clone() {
+            self.translator_array_aliases.insert(name, aliases.clone());
+        }
+        self.mark_translator_array_layout_unsafe(alias);
+    }
+
+    fn translator_array_alias_group(&self, name: &str) -> BTreeSet<String> {
+        self.translator_array_aliases
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| BTreeSet::from([name.to_string()]))
+    }
+
+    fn mark_translator_array_layout_unsafe(&mut self, name: &str) {
+        for alias in self.translator_array_alias_group(name) {
+            if let Some(array) = self.translator_argument_arrays.get_mut(&alias) {
+                array.safe_layout = false;
+            }
+        }
+    }
+
+    fn mark_translator_array_contents_unknown(&mut self, name: &str) {
+        let aliases = self.translator_array_alias_group(name);
+        if !aliases
+            .iter()
+            .any(|alias| self.translator_argument_arrays.contains_key(alias))
+        {
+            return;
+        }
+        for alias in aliases {
+            if let Some(array) = self.translator_argument_arrays.get_mut(&alias) {
+                array.safe_layout = false;
+                array.unknown_contents = true;
+            }
+            if let Some(bindings) = self.translator_object_bindings.get_mut(&alias) {
+                bindings.mark_unknown("");
+            }
+        }
     }
 
     fn file_binding_is_react_import(&self, name: &str) -> bool {
@@ -9881,10 +9945,7 @@ impl SourceUsageCollector {
                 continue;
             };
             for name in referenced_identifier_names(expression) {
-                if let Some(array) = self.translator_argument_arrays.get_mut(&name) {
-                    array.safe_layout = false;
-                    array.unknown_contents = true;
-                }
+                self.mark_translator_array_contents_unknown(&name);
             }
         }
     }
@@ -12052,12 +12113,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             .and_then(|init| init.get_inner_expression().get_identifier_reference())
             .map(|identifier| identifier.name.to_string());
         let translator_argument_array = translator_argument_array.map(|mut array| {
-            if let Some(source) = &translator_argument_array_alias {
-                array.safe_layout = false;
-                if let Some(source_array) = self.translator_argument_arrays.get_mut(source) {
-                    source_array.safe_layout = false;
-                }
-            }
+            array.safe_layout &= translator_argument_array_alias.is_none();
             array
         });
         self.mask_binding_pattern(&declarator.id);
@@ -12095,6 +12151,9 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         ) {
             self.translator_argument_arrays
                 .insert(name.to_string(), bindings);
+            if let Some(source) = &translator_argument_array_alias {
+                self.register_translator_array_alias(name, source);
+            }
         }
         if declarator.kind == VariableDeclarationKind::Const {
             if let Some(init) = &declarator.init {
@@ -12198,12 +12257,13 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             && let Some(method) = member.static_property_name()
             && ARRAY_MUTATING_METHODS.contains(&method)
             && let Some(identifier) = member.object().get_identifier_reference()
-            && let Some(array) = self
-                .translator_argument_arrays
-                .get_mut(identifier.name.as_str())
         {
-            array.safe_layout = false;
-            array.unknown_contents |= ARRAY_CONTENT_WRITING_METHODS.contains(&method);
+            let name = identifier.name.as_str();
+            if ARRAY_CONTENT_WRITING_METHODS.contains(&method) {
+                self.mark_translator_array_contents_unknown(name);
+            } else {
+                self.mark_translator_array_layout_unsafe(name);
+            }
         }
 
         self.invalidate_escaped_translator_argument_arrays(call);
@@ -12386,14 +12446,12 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             let object_bindings =
                 self.translator_object_bindings_from_expression(&expression.right);
             let argument_array = self.translator_argument_array_from_expression(&expression.right);
-            if argument_array.is_some()
-                && let Some(source) = expression.right.get_identifier_reference()
-                && let Some(source_array) = self
-                    .translator_argument_arrays
-                    .get_mut(source.name.as_str())
-            {
-                source_array.safe_layout = false;
-            }
+            let argument_array_alias = argument_array.as_ref().and_then(|_| {
+                expression
+                    .right
+                    .get_identifier_reference()
+                    .map(|source| source.name.to_string())
+            });
             let name = identifier.name.as_str();
             self.mask_binding_name(name);
             if let Some(binding) = translator {
@@ -12407,13 +12465,13 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 array.safe_layout = false;
                 self.translator_argument_arrays
                     .insert(name.to_string(), array);
+                if let Some(source) = &argument_array_alias {
+                    self.register_translator_array_alias(name, source);
+                }
             }
         }
-        if let Some(name) = assignment_target_member_object_name(&expression.left)
-            && let Some(array) = self.translator_argument_arrays.get_mut(name)
-        {
-            array.safe_layout = false;
-            array.unknown_contents = true;
+        if let Some(name) = assignment_target_member_object_name(&expression.left) {
+            self.mark_translator_array_contents_unknown(name);
         }
         let assigned_binding = self.translator_binding_from_expression(&expression.right);
         let assigned_object = self.translator_object_bindings_from_expression(&expression.right);
@@ -13123,6 +13181,42 @@ mod tests {
         );
 
         assert!(mutated.dynamic_usages.iter().any(|usage| usage.line == 6));
+    }
+
+    #[test]
+    fn content_mutations_propagate_through_translator_array_aliases() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const translators = [common];
+            const alias = translators;
+            let assigned;
+            assigned = alias;
+            assigned.fill(runtimeTranslator);
+            translators[0]('mutated');
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 9));
+    }
+
+    #[test]
+    fn escaped_array_aliases_invalidate_nested_translator_bindings() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const nested = [[common]];
+            const alias = nested;
+            runtimeConsumer(alias);
+            let render;
+            [[render]] = nested;
+            render('escaped');
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 9));
     }
 
     #[test]
