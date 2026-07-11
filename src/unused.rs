@@ -4941,7 +4941,7 @@ fn finite_record_property_iterable(
     }
 }
 
-fn call_is_callback_value_wrapper(call: &CallExpression<'_>, name: &str) -> bool {
+fn call_is_named_callback_value_wrapper(call: &CallExpression<'_>, name: &str) -> bool {
     if call
         .callee
         .get_identifier_reference()
@@ -4949,24 +4949,100 @@ fn call_is_callback_value_wrapper(call: &CallExpression<'_>, name: &str) -> bool
     {
         return true;
     }
-
     call.callee
         .get_member_expr()
         .and_then(|member| member.static_property_name())
         .is_some_and(|property| property == name)
 }
 
-struct CallbackReturnExpressionCollector<'callback, F> {
-    callback: &'callback mut F,
+#[derive(Clone, Default)]
+struct CallbackLocalValue {
+    binding: Option<TranslatorBinding>,
+    object: Option<TranslatorObjectBinding>,
+    map: Option<TranslatorObjectBinding>,
+    entries: Option<TranslatorObjectBinding>,
+    entry: Option<TranslatorObjectBinding>,
+    array: Option<TranslatorArgumentArray>,
 }
 
-impl<'a, F> Visit<'a> for CallbackReturnExpressionCollector<'_, F>
+struct CallbackReturnExpressionCollector<'source, 'callback, F> {
+    source: &'source SourceUsageCollector,
+    callback: &'callback mut F,
+    locals: BTreeMap<String, CallbackLocalValue>,
+    scopes: Vec<BTreeMap<String, CallbackLocalValue>>,
+}
+
+impl<F> CallbackReturnExpressionCollector<'_, '_, F> {
+    fn local_value_from_expression(&self, expression: &Expression<'_>) -> CallbackLocalValue {
+        if let Some(identifier) = expression.get_identifier_reference()
+            && let Some(local) = self.locals.get(identifier.name.as_str())
+        {
+            return local.clone();
+        }
+        let object = self
+            .source
+            .translator_object_bindings_from_expression(expression);
+        let array = self
+            .source
+            .translator_argument_array_from_expression(expression);
+        let binding = self
+            .source
+            .translator_binding_from_expression(expression)
+            .or_else(|| {
+                object
+                    .clone()
+                    .and_then(TranslatorObjectBinding::aggregate_binding)
+            })
+            .or_else(|| {
+                array
+                    .clone()
+                    .and_then(SourceUsageCollector::aggregate_translator_argument_array)
+            });
+        CallbackLocalValue {
+            binding,
+            object,
+            map: self.source.translator_map_from_expression(expression),
+            entries: self
+                .source
+                .translator_map_entries_from_expression(expression),
+            entry: self.source.translator_map_entry_from_expression(expression),
+            array,
+        }
+    }
+}
+
+impl<'a, F> Visit<'a> for CallbackReturnExpressionCollector<'_, '_, F>
 where
-    F: FnMut(&Expression<'a>),
+    F: FnMut(&Expression<'a>, Option<&CallbackLocalValue>),
 {
+    fn enter_scope(&mut self, _flags: ScopeFlags, _scope_id: &Cell<Option<ScopeId>>) {
+        self.scopes.push(self.locals.clone());
+    }
+
+    fn leave_scope(&mut self) {
+        if let Some(locals) = self.scopes.pop() {
+            self.locals = locals;
+        }
+    }
+
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        let Some(name) = binding_identifier_name(&declarator.id) else {
+            return;
+        };
+        let value = declarator
+            .init
+            .as_ref()
+            .map(|init| self.local_value_from_expression(init))
+            .unwrap_or_default();
+        self.locals.insert(name.to_string(), value);
+    }
+
     fn visit_return_statement(&mut self, statement: &ReturnStatement<'a>) {
         if let Some(argument) = &statement.argument {
-            (self.callback)(argument);
+            let local = argument
+                .get_identifier_reference()
+                .and_then(|identifier| self.locals.get(identifier.name.as_str()));
+            (self.callback)(argument, local);
         }
     }
 
@@ -4976,8 +5052,9 @@ where
 }
 
 fn for_each_callback_return_expression<'a>(
+    source: &SourceUsageCollector,
     callback: &Argument<'a>,
-    mut visit: impl FnMut(&Expression<'a>),
+    mut visit: impl FnMut(&Expression<'a>, Option<&CallbackLocalValue>),
 ) {
     let (body, expression) = match callback {
         Argument::ArrowFunctionExpression(arrow) => (&arrow.body, arrow.expression),
@@ -4990,11 +5067,14 @@ fn for_each_callback_return_expression<'a>(
         _ => return,
     };
     if expression && let Some(Statement::ExpressionStatement(statement)) = body.statements.first() {
-        visit(&statement.expression);
+        visit(&statement.expression, None);
         return;
     }
     let mut collector = CallbackReturnExpressionCollector {
+        source,
         callback: &mut visit,
+        locals: BTreeMap::new(),
+        scopes: Vec::new(),
     };
     for statement in &body.statements {
         collector.visit_statement(statement);
@@ -5306,7 +5386,7 @@ fn finite_record_iterable_from_expression(
             ) {
                 return Some(records);
             }
-            if call_is_callback_value_wrapper(call, "useMemo") {
+            if call_is_named_callback_value_wrapper(call, "useMemo") {
                 return call.arguments.first().and_then(|callback| {
                     finite_records_from_callback_argument(
                         callback,
@@ -7495,6 +7575,12 @@ fn translator_return_callable_forwards(
             forwards.extend(translator_return_callable_forwards(&logical.right));
             forwards
         }
+        Expression::CallExpression(call) => call
+            .callee
+            .get_member_expr()
+            .filter(|member| member.static_property_name() == Some("bind"))
+            .map(|member| translator_return_callable_forwards(member.object()))
+            .unwrap_or_default(),
         _ => BTreeSet::new(),
     }
 }
@@ -8540,15 +8626,25 @@ impl SourceIndexCollector {
             return self.imports.get(identifier.name.as_str()).is_some_and(|target| {
                 target.source == "react"
                     && matches!(&target.imported, ImportedName::Named(imported) if imported == name)
-            }) || identifier.name.as_str() == name;
+            });
         }
         call.callee.get_member_expr().is_some_and(|member| {
             member.static_property_name() == Some(name)
                 && member
                     .object()
                     .get_identifier_reference()
-                    .and_then(|namespace| self.namespace_imports.get(namespace.name.as_str()))
-                    .is_some_and(|source| source == "react")
+                    .is_some_and(|object| {
+                        self.namespace_imports
+                            .get(object.name.as_str())
+                            .is_some_and(|source| source == "react")
+                            || self
+                                .imports
+                                .get(object.name.as_str())
+                                .is_some_and(|target| {
+                                    target.source == "react"
+                                        && matches!(target.imported, ImportedName::Default)
+                                })
+                    })
         })
     }
 
@@ -9533,7 +9629,13 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                                     self.translator_return_summary_from_body(body, &function.params)
                                 })
                             }
-                            _ => None,
+                            _ => callback.as_expression().and_then(|expression| {
+                                let forwards = translator_return_callable_forwards(expression);
+                                (!forwards.is_empty()).then_some(TranslatorReturnSummary {
+                                    forwards,
+                                    ..TranslatorReturnSummary::default()
+                                })
+                            }),
                         })
                     }
                     _ => {
@@ -9583,13 +9685,16 @@ impl<'a> Visit<'a> for SourceIndexCollector {
 
 impl SourceUsageCollector {
     fn call_is_react_callback_wrapper(&self, call: &CallExpression<'_>, name: &str) -> bool {
-        if call_is_callback_value_wrapper(call, name) {
-            return true;
-        }
         let Some(file) = &self.file_index else {
             return false;
         };
         if let Some(identifier) = call.callee.get_identifier_reference() {
+            if self
+                .shadowed_react_bindings
+                .contains(identifier.name.as_str())
+            {
+                return false;
+            }
             return file.imports.get(identifier.name.as_str()).is_some_and(|target| {
                 target.source == "react"
                     && matches!(&target.imported, ImportedName::Named(imported) if imported == name)
@@ -9600,8 +9705,20 @@ impl SourceUsageCollector {
                 && member
                     .object()
                     .get_identifier_reference()
-                    .and_then(|namespace| file.namespace_imports.get(namespace.name.as_str()))
-                    .is_some_and(|source| source == "react")
+                    .is_some_and(|object| {
+                        !self.shadowed_react_bindings.contains(object.name.as_str())
+                            && (file
+                                .namespace_imports
+                                .get(object.name.as_str())
+                                .is_some_and(|source| source == "react")
+                                || file
+                                    .imports
+                                    .get(object.name.as_str())
+                                    .is_some_and(|target| {
+                                        target.source == "react"
+                                            && matches!(target.imported, ImportedName::Default)
+                                    }))
+                    })
         })
     }
 
@@ -10988,15 +11105,35 @@ impl SourceUsageCollector {
             {
                 let callback = call.arguments.first()?;
                 let mut object: Option<TranslatorObjectBinding> = None;
-                for_each_callback_return_expression(callback, |result| {
-                    if let Some(alternate) = self.translator_object_bindings_from_expression(result)
-                    {
+                let mut unresolved = false;
+                for_each_callback_return_expression(self, callback, |result, local| {
+                    let alternate = local
+                        .and_then(|local| local.object.clone())
+                        .or_else(|| self.translator_object_bindings_from_expression(result));
+                    if let Some(alternate) = alternate {
                         object = Some(match object.take() {
                             Some(current) => current.merge_alternative(alternate),
                             None => alternate,
                         });
+                    } else {
+                        unresolved = true;
                     }
                 });
+                if let Some(object) = object.as_mut()
+                    && unresolved
+                {
+                    object.mark_unknown("");
+                }
+                if object.is_none()
+                    && let Some(expression) = callback.as_expression()
+                    && let Some(binding) =
+                        self.translator_binding_from_callback_reference(expression)
+                {
+                    let mut fallback = TranslatorObjectBinding::default();
+                    fallback.bindings.insert("@callback".to_string(), binding);
+                    fallback.mark_unknown("");
+                    object = Some(fallback);
+                }
                 object
             }
             Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_) => {
@@ -11233,15 +11370,35 @@ impl SourceUsageCollector {
                     && let Some(callback) = call.arguments.first()
                 {
                     let mut map: Option<TranslatorObjectBinding> = None;
-                    for_each_callback_return_expression(callback, |result| {
-                        if let Some(alternate) = self.translator_map_from_expression(result) {
+                    let mut unresolved = false;
+                    for_each_callback_return_expression(self, callback, |result, local| {
+                        let alternate = local
+                            .and_then(|local| local.map.clone())
+                            .or_else(|| self.translator_map_from_expression(result));
+                        if let Some(alternate) = alternate {
                             map = Some(match map.take() {
                                 Some(current) => current.merge_alternative(alternate),
                                 None => alternate,
                             });
+                        } else {
+                            unresolved = true;
                         }
                     });
+                    if let Some(map) = map.as_mut()
+                        && unresolved
+                    {
+                        map.mark_unknown("");
+                    }
                     if let Some(map) = map {
+                        return Some(map);
+                    }
+                    if let Some(expression) = callback.as_expression()
+                        && let Some(binding) =
+                            self.translator_binding_from_callback_reference(expression)
+                    {
+                        let mut map = TranslatorObjectBinding::default();
+                        map.bindings.insert("@entry".to_string(), binding);
+                        map.mark_unknown("");
                         return Some(map);
                     }
                 }
@@ -11323,29 +11480,43 @@ impl SourceUsageCollector {
                 }
                 if matches!(method, "map" | "flatMap") {
                     let callback = call.arguments.first()?;
-                    let mut result = TranslatorObjectBinding::default();
-                    let mut found = false;
-                    for_each_callback_return_expression(callback, |returned| {
+                    let mut result: Option<TranslatorObjectBinding> = None;
+                    let mut unresolved = false;
+                    for_each_callback_return_expression(self, callback, |returned, local| {
                         let entries = if method == "flatMap" {
-                            self.translator_map_entries_from_expression(returned)
+                            local
+                                .and_then(|local| local.entries.clone())
+                                .or_else(|| self.translator_map_entries_from_expression(returned))
                         } else {
-                            self.translator_map_entry_from_expression(returned)
+                            local
+                                .and_then(|local| local.entry.clone())
+                                .or_else(|| self.translator_map_entry_from_expression(returned))
                         };
                         if let Some(entries) = entries {
-                            Self::extend_translator_map_entries(&mut result, entries);
-                            found = true;
+                            result = Some(match result.take() {
+                                Some(current) => current.merge_alternative(entries),
+                                None => entries,
+                            });
+                        } else {
+                            unresolved = true;
                         }
                     });
-                    if !found
+                    if let Some(result) = result.as_mut()
+                        && unresolved
+                    {
+                        result.mark_unknown("");
+                    }
+                    if result.is_none()
                         && let Some(expression) = callback.as_expression()
                         && let Some(binding) =
                             self.translator_binding_from_callback_reference(expression)
                     {
-                        result.bindings.insert("@entry".to_string(), binding);
-                        result.mark_unknown("");
-                        found = true;
+                        let mut fallback = TranslatorObjectBinding::default();
+                        fallback.bindings.insert("@entry".to_string(), binding);
+                        fallback.mark_unknown("");
+                        result = Some(fallback);
                     }
-                    return found.then_some(result);
+                    return result;
                 }
                 let mut result = self.translator_map_entries_from_expression(member.object())?;
                 match method.as_ref() {
@@ -11379,6 +11550,8 @@ impl SourceUsageCollector {
                             };
                             if let Some(entry) = entry {
                                 Self::extend_translator_map_entries(&mut result, entry);
+                            } else {
+                                result.mark_unknown("");
                             }
                         }
                         Some(result)
@@ -11579,14 +11752,38 @@ impl SourceUsageCollector {
         if self.call_is_react_callback_wrapper(call, "useMemo") {
             let callback = call.arguments.first()?;
             let mut array = None;
-            for_each_callback_return_expression(callback, |result| {
-                if let Some(alternate) = self.translator_argument_array_from_expression(result) {
+            let mut unresolved = false;
+            for_each_callback_return_expression(self, callback, |result, local| {
+                let alternate = local
+                    .and_then(|local| local.array.clone())
+                    .or_else(|| self.translator_argument_array_from_expression(result));
+                if let Some(alternate) = alternate {
                     array = Some(match array.take() {
                         Some(current) => merge_translator_argument_arrays(current, alternate),
                         None => alternate,
                     });
+                } else {
+                    unresolved = true;
                 }
             });
+            if let Some(array) = array.as_mut()
+                && unresolved
+            {
+                array.safe_layout = false;
+                array.unknown_contents = true;
+            }
+            if array.is_none()
+                && let Some(expression) = callback.as_expression()
+                && let Some(binding) = self.translator_binding_from_callback_reference(expression)
+            {
+                array = Some(TranslatorArgumentArray {
+                    bindings: vec![Some(binding)],
+                    safe_layout: false,
+                    set_like: false,
+                    optional: false,
+                    unknown_contents: true,
+                });
+            }
             return array;
         }
         if self.is_promise_all_call(call) {
@@ -12351,9 +12548,11 @@ impl SourceUsageCollector {
         if self.call_is_react_callback_wrapper(call, "useMemo") {
             let callback = call.arguments.first()?;
             let mut bindings = Vec::new();
-            for_each_callback_return_expression(callback, |result| {
-                if let Some(binding) = self
-                    .translator_binding_from_expression(result)
+            let mut unresolved = false;
+            for_each_callback_return_expression(self, callback, |result, local| {
+                let binding = local
+                    .and_then(|local| local.binding.clone())
+                    .or_else(|| self.translator_binding_from_expression(result))
                     .or_else(|| {
                         self.translator_object_bindings_from_expression(result)
                             .and_then(TranslatorObjectBinding::aggregate_binding)
@@ -12361,12 +12560,28 @@ impl SourceUsageCollector {
                     .or_else(|| {
                         self.translator_argument_array_from_expression(result)
                             .and_then(Self::aggregate_translator_argument_array)
-                    })
-                {
+                    });
+                if let Some(binding) = binding {
                     bindings.push(binding);
+                } else {
+                    unresolved = true;
                 }
             });
-            if let Some(binding) = merge_translator_binding_iter(bindings) {
+            let mut binding = merge_translator_binding_iter(bindings);
+            if let Some(current) = binding.as_mut()
+                && unresolved
+            {
+                *current = merge_translator_bindings(
+                    current,
+                    &translator_binding_from_namespace_arg(NamespaceArg::Dynamic),
+                );
+            }
+            if binding.is_none()
+                && let Some(expression) = callback.as_expression()
+            {
+                binding = self.translator_binding_from_callback_reference(expression);
+            }
+            if let Some(binding) = binding {
                 return Some(binding);
             }
         }
@@ -14334,9 +14549,11 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             && self.call_is_react_callback_wrapper(call, "useCallback")
             && let Some(callback) = call.arguments.first()
         {
-            for_each_callback_return_expression(callback, |result| {
-                if let Some(binding) = self
-                    .translator_binding_from_expression(result)
+            let mut unresolved = false;
+            for_each_callback_return_expression(self, callback, |result, local| {
+                let binding = local
+                    .and_then(|local| local.binding.clone())
+                    .or_else(|| self.translator_binding_from_expression(result))
                     .or_else(|| {
                         self.translator_object_bindings_from_expression(result)
                             .and_then(TranslatorObjectBinding::aggregate_binding)
@@ -14344,11 +14561,23 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     .or_else(|| {
                         self.translator_argument_array_from_expression(result)
                             .and_then(Self::aggregate_translator_argument_array)
-                    })
-                {
+                    });
+                if let Some(binding) = binding {
                     callback_return_bindings.push(binding);
+                } else {
+                    unresolved = true;
                 }
             });
+            if unresolved && !callback_return_bindings.is_empty() {
+                callback_return_bindings
+                    .push(translator_binding_from_namespace_arg(NamespaceArg::Dynamic));
+            }
+            if callback_return_bindings.is_empty()
+                && let Some(expression) = callback.as_expression()
+                && let Some(binding) = self.translator_binding_from_callback_reference(expression)
+            {
+                callback_return_bindings.push(binding);
+            }
         }
         let callback_return = merge_translator_binding_iter(callback_return_bindings);
         let state_name = match &declarator.id {
@@ -14363,6 +14592,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         let mut state_array: Option<TranslatorArgumentArray> = None;
         let mut state_object: Option<TranslatorObjectBinding> = None;
         let mut state_bindings = Vec::new();
+        let mut state_map_unresolved = false;
+        let mut state_array_unresolved = false;
+        let mut state_object_unresolved = false;
+        let mut state_binding_unresolved = false;
         if state_name.is_some()
             && let Some(Expression::CallExpression(call)) = declarator
                 .init
@@ -14371,29 +14604,99 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             && self.call_is_react_callback_wrapper(call, "useState")
             && let Some(callback) = call.arguments.first()
         {
-            for_each_callback_return_expression(callback, |result| {
-                if let Some(alternate) = self.translator_map_from_expression(result) {
+            for_each_callback_return_expression(self, callback, |result, local| {
+                let map = local
+                    .and_then(|local| local.map.clone())
+                    .or_else(|| self.translator_map_from_expression(result));
+                if let Some(alternate) = map {
                     state_map = Some(match state_map.take() {
                         Some(current) => current.merge_alternative(alternate),
                         None => alternate,
                     });
+                } else {
+                    state_map_unresolved = true;
                 }
-                if let Some(alternate) = self.translator_argument_array_from_expression(result) {
+                let array = local
+                    .and_then(|local| local.array.clone())
+                    .or_else(|| self.translator_argument_array_from_expression(result));
+                if let Some(alternate) = array {
                     state_array = Some(match state_array.take() {
                         Some(current) => merge_translator_argument_arrays(current, alternate),
                         None => alternate,
                     });
+                } else {
+                    state_array_unresolved = true;
                 }
-                if let Some(alternate) = self.translator_object_bindings_from_expression(result) {
+                let object = local
+                    .and_then(|local| local.object.clone())
+                    .or_else(|| self.translator_object_bindings_from_expression(result));
+                if let Some(alternate) = object {
                     state_object = Some(match state_object.take() {
                         Some(current) => current.merge_alternative(alternate),
                         None => alternate,
                     });
+                } else {
+                    state_object_unresolved = true;
                 }
-                if let Some(binding) = self.translator_binding_from_expression(result) {
+                let binding = local
+                    .and_then(|local| local.binding.clone())
+                    .or_else(|| self.translator_binding_from_expression(result));
+                if let Some(binding) = binding {
                     state_bindings.push(binding);
+                } else {
+                    state_binding_unresolved = true;
                 }
             });
+            let named_binding = callback
+                .as_expression()
+                .and_then(|expression| self.translator_binding_from_callback_reference(expression));
+            if let Some(binding) = named_binding {
+                if state_map.is_none() {
+                    let mut map = TranslatorObjectBinding::default();
+                    map.bindings.insert("@entry".to_string(), binding.clone());
+                    map.mark_unknown("");
+                    state_map = Some(map);
+                }
+                if state_array.is_none() {
+                    state_array = Some(TranslatorArgumentArray {
+                        bindings: vec![Some(binding.clone())],
+                        safe_layout: false,
+                        set_like: false,
+                        optional: false,
+                        unknown_contents: true,
+                    });
+                }
+                if state_object.is_none() {
+                    let mut object = TranslatorObjectBinding::default();
+                    object
+                        .bindings
+                        .insert("@callback".to_string(), binding.clone());
+                    object.mark_unknown("");
+                    state_object = Some(object);
+                }
+                if state_bindings.is_empty() {
+                    state_bindings.push(binding);
+                }
+            }
+            if let Some(map) = state_map.as_mut()
+                && state_map_unresolved
+            {
+                map.mark_unknown("");
+            }
+            if let Some(array) = state_array.as_mut()
+                && state_array_unresolved
+            {
+                array.safe_layout = false;
+                array.unknown_contents = true;
+            }
+            if let Some(object) = state_object.as_mut()
+                && state_object_unresolved
+            {
+                object.mark_unknown("");
+            }
+            if state_binding_unresolved && !state_bindings.is_empty() {
+                state_bindings.push(translator_binding_from_namespace_arg(NamespaceArg::Dynamic));
+            }
         }
         let translator_map = declarator
             .init
@@ -16702,6 +17005,124 @@ mod tests {
         assert!(scan.used_ids.contains("settings.memo-branch"));
         assert!(scan.used_ids.contains("common.state"));
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 15));
+    }
+
+    #[test]
+    fn unresolved_react_wrapper_returns_remain_dynamic() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const formatters = useMemo(() => {
+              if (enabled) return new Map([['format', common]]);
+              return runtimeMap();
+            }, [enabled, common]);
+            formatters.get('format')('runtime-branch');
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 9));
+    }
+
+    #[test]
+    fn alternative_map_entry_returns_merge_translators() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const entries = [1].map(() => {
+              if (enabled) return ['format', common];
+              return ['format', settings];
+            });
+            const formatters = new Map(entries);
+            formatters.get('format')('entry-branch');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.entry-branch"));
+        assert!(scan.used_ids.contains("settings.entry-branch"));
+    }
+
+    #[test]
+    fn named_react_wrapper_callbacks_preserve_translators() {
+        let scan = scan(
+            r#"
+            import {useCallback, useMemo} from 'react';
+            import {getTranslations} from 'next-intl/server';
+            function makeCommon() { return getTranslations('common'); }
+            function makeSettings() { return getTranslations('settings'); }
+            const callback = useCallback(enabled ? makeCommon.bind(null) : makeSettings, []);
+            const values = [1].map(callback);
+            values[0]('callback-wrapper');
+            const common = useMemo(makeCommon, []);
+            common('memo-factory');
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 8));
+        assert!(scan.used_ids.contains("common.memo-factory"));
+    }
+
+    #[test]
+    fn callback_local_container_aliases_are_resolved() {
+        let scan = scan(
+            r#"
+            import {useMemo, useState} from 'react';
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const formatters = useMemo(() => {
+              const local = new Map([['format', common]]);
+              return local;
+            }, [common]);
+            const [values] = useState(() => {
+              const local = [settings];
+              return local;
+            });
+            formatters.get('format')('local-map');
+            values[0]('local-state');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.local-map"));
+        assert!(scan.used_ids.contains("settings.local-state"));
+    }
+
+    #[test]
+    fn unresolved_copying_entries_make_maps_dynamic() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const base = [['common', common]];
+            const entries = base.toSpliced(0, 0, ...runtimeEntries);
+            const formatters = new Map(entries);
+            formatters.get('common')('copied-runtime');
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 7));
+    }
+
+    #[test]
+    fn react_callback_wrappers_require_react_import_identity() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'runtime-library';
+            import React from 'react';
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const phantom = useMemo(() => new Map([['format', common]]));
+            phantom.get('format')('not-react');
+            const real = React.useMemo(() => new Map([['format', common]]), [common]);
+            real.get('format')('default-import');
+            "#,
+        );
+
+        assert!(!scan.used_ids.contains("common.not-react"));
+        assert!(scan.used_ids.contains("common.default-import"));
     }
 
     #[test]
