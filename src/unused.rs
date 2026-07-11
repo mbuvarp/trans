@@ -9,15 +9,15 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, ArrowFunctionExpression, AssignmentExpression,
     AssignmentTarget, BindingPattern, CallExpression, CatchParameter, ComputedMemberExpression,
-    ConditionalExpression, Declaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
-    ExportNamedDeclaration, Expression, ForOfStatement, ForStatementLeft, Function, FunctionBody,
-    FunctionType, IdentifierReference, ImportDeclaration, ImportDeclarationSpecifier,
-    JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXElementName, JSXExpression,
-    JSXOpeningElement, ModuleExportName, ObjectExpression, ObjectPropertyKind, PropertyKind,
-    ReturnStatement, Statement, StaticMemberExpression, TSInterfaceDeclaration, TSLiteral,
-    TSSignature, TSType, TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator,
-    TSTypeQueryExprName, TemplateLiteral, VariableDeclaration, VariableDeclarationKind,
-    VariableDeclarator,
+    ConditionalExpression, Declaration, ExportAllDeclaration, ExportDefaultDeclaration,
+    ExportDefaultDeclarationKind, ExportNamedDeclaration, Expression, ForOfStatement,
+    ForStatementLeft, Function, FunctionBody, FunctionType, IdentifierReference, ImportDeclaration,
+    ImportDeclarationSpecifier, JSXAttributeItem, JSXAttributeName, JSXAttributeValue,
+    JSXElementName, JSXExpression, JSXOpeningElement, ModuleExportName, ObjectExpression,
+    ObjectPropertyKind, PropertyKind, ReturnStatement, Statement, StaticMemberExpression,
+    TSInterfaceDeclaration, TSLiteral, TSSignature, TSType, TSTypeAliasDeclaration, TSTypeName,
+    TSTypeOperatorOperator, TSTypeQueryExprName, TemplateLiteral, VariableDeclaration,
+    VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -68,6 +68,7 @@ type FiniteObjectMaps = BTreeMap<String, FiniteObjectMap>;
 type FiniteRecords = Vec<FiniteRecord>;
 type FiniteRecordBindings = BTreeMap<String, FiniteRecords>;
 type FiniteRecordMaps = BTreeMap<String, FiniteRecords>;
+type TranslatorObjectBindings = BTreeMap<String, BTreeMap<String, TranslatorBinding>>;
 type TypeDomains = BTreeMap<String, FiniteStrings>;
 type TypePropertyDomains = BTreeMap<String, BTreeMap<String, FiniteStrings>>;
 type PropertyDomains = BTreeMap<String, FiniteStrings>;
@@ -154,6 +155,7 @@ struct ProjectIndex {
 struct SourceFileIndex {
     imports: BTreeMap<String, ImportTarget>,
     re_exports: BTreeMap<String, ImportTarget>,
+    star_re_exports: Vec<String>,
     dependency_sources: BTreeSet<String>,
     helpers: BTreeMap<String, HelperSummary>,
     jsx_components: BTreeMap<String, JsxComponentSummary>,
@@ -1275,15 +1277,34 @@ impl ProjectIndex {
                 if let Some(summary) = file.named_exports.get(name).cloned() {
                     Some(self.expand_helper_summary(&path, summary, depth + 1))
                 } else {
-                    file.re_exports.get(name).and_then(|target| {
-                        self.helper_for_import_at_depth(&path, target, depth + 1)
-                    })
+                    file.re_exports
+                        .get(name)
+                        .and_then(|target| {
+                            self.helper_for_import_at_depth(&path, target, depth + 1)
+                        })
+                        .or_else(|| {
+                            file.star_re_exports.iter().find_map(|source| {
+                                self.helper_for_import_at_depth(
+                                    &path,
+                                    &ImportTarget {
+                                        source: source.clone(),
+                                        imported: ImportedName::Named(name.clone()),
+                                    },
+                                    depth + 1,
+                                )
+                            })
+                        })
                 }
             }
             ImportedName::Default => file
                 .default_export
                 .clone()
-                .map(|summary| self.expand_helper_summary(&path, summary, depth + 1)),
+                .map(|summary| self.expand_helper_summary(&path, summary, depth + 1))
+                .or_else(|| {
+                    file.re_exports.get("default").and_then(|target| {
+                        self.helper_for_import_at_depth(&path, target, depth + 1)
+                    })
+                }),
         }
     }
 
@@ -1318,11 +1339,28 @@ impl ProjectIndex {
                     file.re_exports.get(name).and_then(|target| {
                         self.jsx_component_target_for_import(&path, target, depth + 1)
                     })
+                })
+                .or_else(|| {
+                    file.star_re_exports.iter().find_map(|source| {
+                        self.jsx_component_target_for_import(
+                            &path,
+                            &ImportTarget {
+                                source: source.clone(),
+                                imported: ImportedName::Named(name.clone()),
+                            },
+                            depth + 1,
+                        )
+                    })
                 }),
             ImportedName::Default => file
                 .default_jsx_export
                 .clone()
-                .map(|summary| (path, summary)),
+                .map(|summary| (path.clone(), summary))
+                .or_else(|| {
+                    file.re_exports.get("default").and_then(|target| {
+                        self.jsx_component_target_for_import(&path, target, depth + 1)
+                    })
+                }),
         }
     }
 
@@ -1429,14 +1467,32 @@ impl ProjectIndex {
         let path = self.resolve_module(from, &target.source)?;
         let file = self.files.get(&path)?;
         match &target.imported {
-            ImportedName::Named(name) => {
-                file.named_return_exports.get(name).cloned().or_else(|| {
+            ImportedName::Named(name) => file
+                .named_return_exports
+                .get(name)
+                .cloned()
+                .or_else(|| {
                     file.re_exports.get(name).and_then(|target| {
                         self.return_helper_for_import_at_depth(&path, target, depth + 1)
                     })
                 })
-            }
-            ImportedName::Default => file.default_return_export.clone(),
+                .or_else(|| {
+                    file.star_re_exports.iter().find_map(|source| {
+                        self.return_helper_for_import_at_depth(
+                            &path,
+                            &ImportTarget {
+                                source: source.clone(),
+                                imported: ImportedName::Named(name.clone()),
+                            },
+                            depth + 1,
+                        )
+                    })
+                }),
+            ImportedName::Default => file.default_return_export.clone().or_else(|| {
+                file.re_exports.get("default").and_then(|target| {
+                    self.return_helper_for_import_at_depth(&path, target, depth + 1)
+                })
+            }),
         }
     }
 
@@ -1460,14 +1516,32 @@ impl ProjectIndex {
         let path = self.resolve_module(from, &target.source)?;
         let file = self.files.get(&path)?;
         match &target.imported {
-            ImportedName::Named(name) => {
-                file.named_iterable_exports.get(name).cloned().or_else(|| {
+            ImportedName::Named(name) => file
+                .named_iterable_exports
+                .get(name)
+                .cloned()
+                .or_else(|| {
                     file.re_exports.get(name).and_then(|target| {
                         self.finite_iterable_for_import_at_depth(&path, target, depth + 1)
                     })
                 })
-            }
-            ImportedName::Default => file.default_iterable_export.clone(),
+                .or_else(|| {
+                    file.star_re_exports.iter().find_map(|source| {
+                        self.finite_iterable_for_import_at_depth(
+                            &path,
+                            &ImportTarget {
+                                source: source.clone(),
+                                imported: ImportedName::Named(name.clone()),
+                            },
+                            depth + 1,
+                        )
+                    })
+                }),
+            ImportedName::Default => file.default_iterable_export.clone().or_else(|| {
+                file.re_exports.get("default").and_then(|target| {
+                    self.finite_iterable_for_import_at_depth(&path, target, depth + 1)
+                })
+            }),
         }
     }
 
@@ -1499,8 +1573,24 @@ impl ProjectIndex {
                     file.re_exports.get(name).and_then(|target| {
                         self.finite_record_iterable_for_import_at_depth(&path, target, depth + 1)
                     })
+                })
+                .or_else(|| {
+                    file.star_re_exports.iter().find_map(|source| {
+                        self.finite_record_iterable_for_import_at_depth(
+                            &path,
+                            &ImportTarget {
+                                source: source.clone(),
+                                imported: ImportedName::Named(name.clone()),
+                            },
+                            depth + 1,
+                        )
+                    })
                 }),
-            ImportedName::Default => file.default_record_iterable_export.clone(),
+            ImportedName::Default => file.default_record_iterable_export.clone().or_else(|| {
+                file.re_exports.get("default").and_then(|target| {
+                    self.finite_record_iterable_for_import_at_depth(&path, target, depth + 1)
+                })
+            }),
         }
     }
 
@@ -1532,8 +1622,24 @@ impl ProjectIndex {
                     file.re_exports.get(name).and_then(|target| {
                         self.return_record_helper_for_import_at_depth(&path, target, depth + 1)
                     })
+                })
+                .or_else(|| {
+                    file.star_re_exports.iter().find_map(|source| {
+                        self.return_record_helper_for_import_at_depth(
+                            &path,
+                            &ImportTarget {
+                                source: source.clone(),
+                                imported: ImportedName::Named(name.clone()),
+                            },
+                            depth + 1,
+                        )
+                    })
                 }),
-            ImportedName::Default => file.default_record_return_export.clone(),
+            ImportedName::Default => file.default_record_return_export.clone().or_else(|| {
+                file.re_exports.get("default").and_then(|target| {
+                    self.return_record_helper_for_import_at_depth(&path, target, depth + 1)
+                })
+            }),
         }
     }
 
@@ -1931,6 +2037,7 @@ struct SourceUsageCollector {
     zod_schema_property_domains: TypePropertyDomains,
     enum_member_domains: TypeDomains,
     translators: BTreeMap<String, TranslatorBinding>,
+    translator_object_bindings: TranslatorObjectBindings,
     translator_argument_arrays: BTreeMap<String, TranslatorArgumentArray>,
     potential_translators: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
@@ -1956,6 +2063,7 @@ struct BindingEnvironment {
     zod_schema_property_domains: TypePropertyDomains,
     enum_member_domains: TypeDomains,
     translators: BTreeMap<String, TranslatorBinding>,
+    translator_object_bindings: TranslatorObjectBindings,
     translator_argument_arrays: BTreeMap<String, TranslatorArgumentArray>,
     potential_translators: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
@@ -5559,6 +5667,7 @@ struct SourceIndexCollector {
     source_context: SourceQueryContext,
     imports: BTreeMap<String, ImportTarget>,
     re_exports: BTreeMap<String, ImportTarget>,
+    star_re_exports: Vec<String>,
     dependency_sources: BTreeSet<String>,
     helpers: BTreeMap<String, HelperSummary>,
     jsx_components: BTreeMap<String, JsxComponentSummary>,
@@ -5669,6 +5778,7 @@ impl SourceIndexCollector {
         SourceFileIndex {
             imports: self.imports,
             re_exports: self.re_exports,
+            star_re_exports: self.star_re_exports,
             dependency_sources: self.dependency_sources,
             helpers: self.helpers,
             jsx_components: self.jsx_components,
@@ -6316,6 +6426,15 @@ impl<'a> Visit<'a> for SourceIndexCollector {
         walk::walk_export_named_declaration(self, declaration);
     }
 
+    fn visit_export_all_declaration(&mut self, declaration: &ExportAllDeclaration<'a>) {
+        let source = declaration.source.value.to_string();
+        self.dependency_sources.insert(source.clone());
+        if declaration.exported.is_none() && !declaration.export_kind.is_type() {
+            self.star_re_exports.push(source);
+        }
+        walk::walk_export_all_declaration(self, declaration);
+    }
+
     fn visit_export_default_declaration(&mut self, declaration: &ExportDefaultDeclaration<'a>) {
         self.record_default_export(declaration);
         walk::walk_export_default_declaration(self, declaration);
@@ -6356,6 +6475,7 @@ impl SourceUsageCollector {
             zod_schema_property_domains: BTreeMap::new(),
             enum_member_domains: BTreeMap::new(),
             translators: BTreeMap::new(),
+            translator_object_bindings: BTreeMap::new(),
             translator_argument_arrays: BTreeMap::new(),
             potential_translators: BTreeSet::new(),
             message_key_helpers: BTreeMap::new(),
@@ -6382,6 +6502,7 @@ impl SourceUsageCollector {
             zod_schema_property_domains: self.zod_schema_property_domains.clone(),
             enum_member_domains: self.enum_member_domains.clone(),
             translators: self.translators.clone(),
+            translator_object_bindings: self.translator_object_bindings.clone(),
             translator_argument_arrays: self.translator_argument_arrays.clone(),
             potential_translators: self.potential_translators.clone(),
             message_key_helpers: self.message_key_helpers.clone(),
@@ -6403,6 +6524,7 @@ impl SourceUsageCollector {
         self.zod_schema_property_domains = environment.zod_schema_property_domains;
         self.enum_member_domains = environment.enum_member_domains;
         self.translators = environment.translators;
+        self.translator_object_bindings = environment.translator_object_bindings;
         self.translator_argument_arrays = environment.translator_argument_arrays;
         self.potential_translators = environment.potential_translators;
         self.message_key_helpers = environment.message_key_helpers;
@@ -6421,6 +6543,7 @@ impl SourceUsageCollector {
         self.zod_schema_property_domains.remove(name);
         self.enum_member_domains.remove(name);
         self.translators.remove(name);
+        self.translator_object_bindings.remove(name);
         self.translator_argument_arrays.remove(name);
         self.potential_translators.remove(name);
         self.message_key_helpers.remove(name);
@@ -7083,13 +7206,34 @@ impl SourceUsageCollector {
         }
 
         let member = expression.get_member_expr()?;
-        let method = member.static_property_name()?;
-        if !TRANSLATOR_METHODS.contains(&method) {
-            return None;
+        let property = member.static_property_name()?;
+        let property: &str = property.as_ref();
+        if let Some(object) = member.object().get_identifier_reference() {
+            let name = object.name.as_str();
+            if TRANSLATOR_METHODS.contains(&property)
+                && let Some(binding) = self.translators.get(name)
+            {
+                return Some(binding.clone());
+            }
+            if let Some(binding) = self
+                .translator_object_bindings
+                .get(name)
+                .and_then(|bindings| bindings.get(property))
+            {
+                return Some(binding.clone());
+            }
+            if let Ok(index) = property.parse::<usize>() {
+                return self
+                    .translator_argument_arrays
+                    .get(name)
+                    .filter(|array| array.safe_layout)
+                    .and_then(|array| array.bindings.get(index))
+                    .and_then(Clone::clone);
+            }
         }
-        let object = member.object().get_identifier_reference()?;
-        let name = object.name.as_str();
-        self.translators.get(name).cloned()
+        self.translator_object_bindings_from_expression(member.object())?
+            .get(property)
+            .cloned()
     }
 
     fn maybe_translation_factory(&self, expression: &Expression<'_>) -> Option<bool> {
@@ -7154,6 +7298,62 @@ impl SourceUsageCollector {
             Expression::CallExpression(call) => self.translator_binding_from_call(call),
             Expression::AwaitExpression(await_expression) => {
                 self.translator_binding_from_expression(&await_expression.argument)
+            }
+            _ => None,
+        }
+    }
+
+    fn translator_object_bindings_from_expression(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<BTreeMap<String, TranslatorBinding>> {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => self
+                .translator_object_bindings
+                .get(identifier.name.as_str())
+                .cloned(),
+            Expression::ObjectExpression(object) => {
+                let mut bindings = BTreeMap::new();
+                for property in &object.properties {
+                    match property {
+                        ObjectPropertyKind::ObjectProperty(property) => {
+                            if property.kind != PropertyKind::Init || property.method {
+                                continue;
+                            }
+                            let Some(name) = property.key.static_name() else {
+                                continue;
+                            };
+                            if let Some(binding) =
+                                self.translator_binding_from_expression(&property.value)
+                            {
+                                bindings.insert(name.to_string(), binding);
+                            }
+                        }
+                        ObjectPropertyKind::SpreadProperty(spread) => {
+                            if let Some(spread_bindings) =
+                                self.translator_object_bindings_from_expression(&spread.argument)
+                            {
+                                bindings.extend(spread_bindings);
+                            }
+                        }
+                    }
+                }
+                Some(bindings).filter(|bindings| !bindings.is_empty())
+            }
+            Expression::ConditionalExpression(conditional) => {
+                let mut consequent =
+                    self.translator_object_bindings_from_expression(&conditional.consequent)?;
+                let alternate =
+                    self.translator_object_bindings_from_expression(&conditional.alternate)?;
+                for (property, alternate_binding) in alternate {
+                    consequent
+                        .entry(property)
+                        .and_modify(|binding| {
+                            *binding = merge_translator_bindings(binding, &alternate_binding)
+                        })
+                        .or_insert(alternate_binding);
+                }
+                Some(consequent)
             }
             _ => None,
         }
@@ -7414,7 +7614,7 @@ impl SourceUsageCollector {
 
     fn callee_is_potential_helper(&self, expression: &Expression<'_>) -> bool {
         let Some(callee) = self.callee_identifier(expression) else {
-            return false;
+            return expression.get_member_expr().is_some();
         };
         if self.use_translations.contains(callee)
             || self.get_translations.contains(callee)
@@ -8248,6 +8448,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     }
 
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        let translator_object_bindings = declarator
+            .init
+            .as_ref()
+            .and_then(|init| self.translator_object_bindings_from_expression(init));
         let translator_argument_array = (declarator.kind == VariableDeclarationKind::Const)
             .then(|| declarator.init.as_ref())
             .flatten()
@@ -8268,6 +8472,13 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         });
         self.mask_binding_pattern(&declarator.id);
         self.track_destructured_translator_bindings(&declarator.id);
+        if let (Some(name), Some(bindings)) = (
+            binding_identifier_name(&declarator.id),
+            translator_object_bindings,
+        ) {
+            self.translator_object_bindings
+                .insert(name.to_string(), bindings);
+        }
         if let (Some(name), Some(bindings)) = (
             binding_identifier_name(&declarator.id),
             translator_argument_array,
@@ -8494,6 +8705,9 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         if let Some(name) = assignment_target_member_object_name(&expression.left) {
             if let Some(array) = self.translator_argument_arrays.get_mut(name) {
                 array.safe_layout = false;
+            }
+            if let Some(binding) = self.translator_binding_from_expression(&expression.right) {
+                self.record_dynamic_key_for_binding(&binding, expression.span.start, None);
             }
         }
         walk::walk_assignment_expression(self, expression);
@@ -9009,6 +9223,57 @@ mod tests {
             scan.dynamic_usages
                 .iter()
                 .any(|usage| usage.namespace == "server")
+        );
+    }
+
+    #[test]
+    fn translator_functions_stored_in_objects_preserve_used_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('common');
+            const translators = {common: t};
+            translators.common('title');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+    }
+
+    #[test]
+    fn translator_functions_assigned_to_objects_are_conservatively_dynamic() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('common');
+            const translators = {};
+            translators.common = t;
+            translators.common('title');
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn unresolved_member_helpers_protect_translator_arguments() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            import * as helpers from './helpers';
+            const t = useTranslations('common');
+            helpers.label(t, runtimeKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
         );
     }
 

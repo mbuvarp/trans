@@ -926,6 +926,76 @@ fn unused_traces_translator_props_into_imported_jsx_components() {
 }
 
 #[test]
+fn unused_traces_jsx_component_through_star_re_export() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.noDescription", "No description"),
+            ("projects.unused", "Unused"),
+        ],
+    );
+    std::fs::create_dir_all(dir.path().join("components")).expect("mkdir components");
+    std::fs::write(
+        dir.path().join("components/card.tsx"),
+        "export function Card({tProjects}) { return <p>{tProjects('noDescription')}</p>; }\n",
+    )
+    .expect("write component");
+    std::fs::write(
+        dir.path().join("components/index.ts"),
+        "export * from './card';\n",
+    )
+    .expect("write barrel");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {Card} from './components';\nconst tProjects = useTranslations('projects');\nexport default function Page() { return <Card tProjects={tProjects} />; }\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("projects.unused\n");
+}
+
+#[test]
+fn unused_traces_default_jsx_component_through_re_export() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.noDescription", "No description"),
+            ("projects.unused", "Unused"),
+        ],
+    );
+    std::fs::create_dir_all(dir.path().join("components")).expect("mkdir components");
+    std::fs::write(
+        dir.path().join("components/card.tsx"),
+        "export default function Card({tProjects}) { return <p>{tProjects('noDescription')}</p>; }\n",
+    )
+    .expect("write component");
+    std::fs::write(
+        dir.path().join("components/index.ts"),
+        "export {default} from './card';\n",
+    )
+    .expect("write barrel");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport Card from './components';\nconst tProjects = useTranslations('projects');\nexport default function Page() { return <Card tProjects={tProjects} />; }\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("projects.unused\n");
+}
+
+#[test]
 fn unused_conservatively_protects_keys_from_unknown_jsx_translator_namespaces() {
     let dir = tempdir().expect("tempdir");
     setup_next_intl_project_with_keys(
@@ -1855,6 +1925,70 @@ fn unused_traces_helper_import_via_index_file() {
     std::fs::write(
         dir.path().join("page.tsx"),
         "import {useTranslations} from 'next-intl';\nimport {getTitle} from './helpers';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_traces_helper_import_through_star_re_export() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("settings.title", "Title"), ("settings.unused", "Unused")],
+    );
+    std::fs::create_dir_all(dir.path().join("helpers")).expect("mkdir helpers");
+    std::fs::write(
+        dir.path().join("helpers/get-title.ts"),
+        "export function getTitle(tSettings) { return tSettings('title'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("helpers/index.ts"),
+        "export * from './get-title';\n",
+    )
+    .expect("write barrel");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getTitle} from './helpers';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_traces_default_helper_through_re_export() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("settings.title", "Title"), ("settings.unused", "Unused")],
+    );
+    std::fs::create_dir_all(dir.path().join("helpers")).expect("mkdir helpers");
+    std::fs::write(
+        dir.path().join("helpers/get-title.ts"),
+        "export default function getTitle(tSettings) { return tSettings('title'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("helpers/index.ts"),
+        "export {default} from './get-title';\n",
+    )
+    .expect("write barrel");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport getTitle from './helpers';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
     )
     .expect("write source");
 
