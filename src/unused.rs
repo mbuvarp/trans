@@ -56,6 +56,7 @@ const ARRAY_MUTATING_METHODS: &[&str] = &[
 ];
 const ARRAY_CONTENT_WRITING_METHODS: &[&str] = &["fill", "push", "splice", "unshift"];
 const ARRAY_RECEIVER_RETURNING_METHODS: &[&str] = &["copyWithin", "fill", "reverse", "sort"];
+const ARRAY_COPYING_METHODS: &[&str] = &["toReversed", "toSorted", "toSpliced", "with"];
 const MAX_FINITE_STRINGS: usize = 128;
 
 fn is_translator_like_name(name: &str) -> bool {
@@ -7240,6 +7241,7 @@ struct TranslatorReturnCollector {
     local_bindings: BTreeMap<String, TranslatorBinding>,
     local_array_bindings: BTreeMap<String, TranslatorBinding>,
     local_array_params: BTreeMap<String, ParamIndexes>,
+    local_object_bindings: BTreeMap<String, TranslatorBinding>,
     local_parameter_calls: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     dynamic_callables: BTreeSet<String>,
     parameter_callables: BTreeMap<String, usize>,
@@ -7258,6 +7260,7 @@ struct TranslatorReturnNameState {
     local_binding: Option<TranslatorBinding>,
     local_array_binding: Option<TranslatorBinding>,
     local_array_params: Option<ParamIndexes>,
+    local_object_binding: Option<TranslatorBinding>,
     local_parameter_calls: Option<BTreeSet<TranslatorReturnForward>>,
     dynamic_callable: bool,
     parameter_callable: Option<usize>,
@@ -7582,9 +7585,16 @@ impl TranslatorReturnCollector {
                             .and_then(|callback| self.callback_binding_from_argument(callback));
                         merge_translator_binding_iter(receiver.into_iter().chain(callback))
                     }
-                    "slice" | "filter" | "splice" | "copyWithin" | "fill" | "reverse" | "sort" => {
-                        receiver
+                    "toSpliced" | "with" => {
+                        let arguments = call.arguments.iter().filter_map(|argument| {
+                            argument
+                                .as_expression()
+                                .and_then(|expression| self.binding_from_expression(expression))
+                        });
+                        merge_translator_binding_iter(receiver.into_iter().chain(arguments))
                     }
+                    "slice" | "filter" | "splice" | "copyWithin" | "fill" | "reverse" | "sort"
+                    | "toReversed" | "toSorted" => receiver,
                     _ => None,
                 }
             }
@@ -7593,37 +7603,90 @@ impl TranslatorReturnCollector {
     }
 
     fn callback_binding_from_argument(&self, callback: &Argument<'_>) -> Option<TranslatorBinding> {
-        let Argument::ArrowFunctionExpression(arrow) = callback else {
-            return None;
+        let (params, body, expression) = match callback {
+            Argument::ArrowFunctionExpression(arrow) => {
+                (&arrow.params, Some(&arrow.body), arrow.expression)
+            }
+            Argument::FunctionExpression(function) => {
+                (&function.params, function.body.as_ref(), false)
+            }
+            _ => return None,
         };
-        if !arrow.expression {
-            return None;
+        let mut collector = TranslatorReturnCollector {
+            factories: self.factories.clone(),
+            client_namespaces: self.client_namespaces.clone(),
+            server_namespaces: self.server_namespaces.clone(),
+            bindings: Vec::new(),
+            array_bindings: Vec::new(),
+            array_param_indexes: BTreeSet::new(),
+            forwards: BTreeSet::new(),
+            local_bindings: self.local_bindings.clone(),
+            local_array_bindings: self.local_array_bindings.clone(),
+            local_array_params: self.local_array_params.clone(),
+            local_object_bindings: self.local_object_bindings.clone(),
+            local_parameter_calls: self.local_parameter_calls.clone(),
+            dynamic_callables: self.dynamic_callables.clone(),
+            parameter_callables: self.parameter_callables.clone(),
+            binding_scopes: Vec::new(),
+        };
+        for parameter in &params.items {
+            for identifier in parameter.pattern.get_binding_identifiers() {
+                collector.mask_name(identifier.name.as_str());
+            }
         }
-        let Statement::ExpressionStatement(statement) = arrow.body.statements.first()? else {
-            return None;
-        };
-        self.binding_from_expression(&statement.expression)
-            .or_else(|| self.array_binding_from_expression(&statement.expression))
+        if let Some(rest) = &params.rest {
+            for identifier in rest.rest.argument.get_binding_identifiers() {
+                collector.mask_name(identifier.name.as_str());
+            }
+        }
+        let body = body?;
+        if expression
+            && let Some(Statement::ExpressionStatement(statement)) = body.statements.first()
+        {
+            return collector
+                .binding_from_expression(&statement.expression)
+                .or_else(|| collector.array_binding_from_expression(&statement.expression));
+        }
+        collector.hoist_var_bindings(body);
+        for statement in &body.statements {
+            collector.visit_statement(statement);
+        }
+        let summary = collector.summary();
+        merge_translator_binding_iter(summary.binding.into_iter().chain(summary.array_binding))
     }
 
     fn object_binding_from_expression(
         &self,
         expression: &Expression<'_>,
     ) -> Option<TranslatorBinding> {
-        let Expression::ObjectExpression(object) = expression.get_inner_expression() else {
-            return None;
-        };
-        merge_translator_binding_iter(object.properties.iter().filter_map(|property| {
-            match property {
-                ObjectPropertyKind::ObjectProperty(property) => self
-                    .binding_from_expression(&property.value)
-                    .or_else(|| self.array_binding_from_expression(&property.value))
-                    .or_else(|| self.object_binding_from_expression(&property.value)),
-                ObjectPropertyKind::SpreadProperty(spread) => {
-                    self.object_binding_from_expression(&spread.argument)
-                }
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => self
+                .local_object_bindings
+                .get(identifier.name.as_str())
+                .cloned(),
+            Expression::ObjectExpression(object) => {
+                merge_translator_binding_iter(object.properties.iter().filter_map(|property| {
+                    match property {
+                        ObjectPropertyKind::ObjectProperty(property) => self
+                            .binding_from_expression(&property.value)
+                            .or_else(|| self.array_binding_from_expression(&property.value))
+                            .or_else(|| self.object_binding_from_expression(&property.value)),
+                        ObjectPropertyKind::SpreadProperty(spread) => {
+                            self.object_binding_from_expression(&spread.argument)
+                        }
+                    }
+                }))
             }
-        }))
+            Expression::ConditionalExpression(conditional) => merge_optional_translator_bindings(
+                self.object_binding_from_expression(&conditional.consequent),
+                self.object_binding_from_expression(&conditional.alternate),
+            ),
+            Expression::LogicalExpression(logical) => merge_optional_translator_bindings(
+                self.object_binding_from_expression(&logical.left),
+                self.object_binding_from_expression(&logical.right),
+            ),
+            _ => None,
+        }
     }
 
     fn array_params_from_expression(&self, expression: &Expression<'_>) -> ParamIndexes {
@@ -7692,6 +7755,10 @@ impl TranslatorReturnCollector {
                             | "fill"
                             | "reverse"
                             | "sort"
+                            | "toReversed"
+                            | "toSorted"
+                            | "toSpliced"
+                            | "with"
                     );
                 if !recognized {
                     return BTreeSet::new();
@@ -7729,6 +7796,7 @@ impl TranslatorReturnCollector {
             local_binding: self.local_bindings.get(name).cloned(),
             local_array_binding: self.local_array_bindings.get(name).cloned(),
             local_array_params: self.local_array_params.get(name).cloned(),
+            local_object_binding: self.local_object_bindings.get(name).cloned(),
             local_parameter_calls: self.local_parameter_calls.get(name).cloned(),
             dynamic_callable: self.dynamic_callables.contains(name),
             parameter_callable: self.parameter_callables.get(name).copied(),
@@ -7742,6 +7810,7 @@ impl TranslatorReturnCollector {
         self.local_bindings.remove(name);
         self.local_array_bindings.remove(name);
         self.local_array_params.remove(name);
+        self.local_object_bindings.remove(name);
         self.local_parameter_calls.remove(name);
         self.dynamic_callables.remove(name);
         self.parameter_callables.remove(name);
@@ -7754,6 +7823,7 @@ impl TranslatorReturnCollector {
         self.local_bindings.remove(name);
         self.local_array_bindings.remove(name);
         self.local_array_params.remove(name);
+        self.local_object_bindings.remove(name);
         self.local_parameter_calls.remove(name);
         self.dynamic_callables.remove(name);
         self.parameter_callables.remove(name);
@@ -7830,6 +7900,11 @@ impl<'a> Visit<'a> for TranslatorReturnCollector {
                 } else {
                     self.local_array_params.remove(&name);
                 }
+                if let Some(binding) = state.local_object_binding {
+                    self.local_object_bindings.insert(name.clone(), binding);
+                } else {
+                    self.local_object_bindings.remove(&name);
+                }
                 if let Some(calls) = state.local_parameter_calls {
                     self.local_parameter_calls.insert(name.clone(), calls);
                 } else {
@@ -7900,6 +7975,7 @@ impl<'a> Visit<'a> for TranslatorReturnCollector {
             let has_binding = binding.is_some();
             let array_binding = self.array_binding_from_expression(init);
             let array_params = self.array_params_from_expression(init);
+            let object_binding = self.object_binding_from_expression(init);
             let parameter_calls = self.parameter_calls_from_expression(init);
             if declarator.kind == VariableDeclarationKind::Var {
                 if let Some(binding) = binding {
@@ -7939,6 +8015,16 @@ impl<'a> Visit<'a> for TranslatorReturnCollector {
                         .or_default()
                         .extend(array_params);
                 }
+                if let Some(binding) = object_binding {
+                    self.local_object_bindings
+                        .entry(name.to_string())
+                        .and_modify(|existing| {
+                            *existing = merge_translator_bindings(existing, &binding)
+                        })
+                        .or_insert(binding);
+                } else {
+                    self.local_object_bindings.remove(name);
+                }
             } else {
                 self.mask_name(name);
                 if let Some(binding) = binding {
@@ -7950,6 +8036,9 @@ impl<'a> Visit<'a> for TranslatorReturnCollector {
                 if !array_params.is_empty() {
                     self.local_array_params
                         .insert(name.to_string(), array_params);
+                }
+                if let Some(binding) = object_binding {
+                    self.local_object_bindings.insert(name.to_string(), binding);
                 }
                 if !parameter_calls.is_empty() {
                     self.local_parameter_calls
@@ -7970,6 +8059,7 @@ impl<'a> Visit<'a> for TranslatorReturnCollector {
             let binding = self.binding_from_expression(&expression.right);
             let array_binding = self.array_binding_from_expression(&expression.right);
             let array_params = self.array_params_from_expression(&expression.right);
+            let object_binding = self.object_binding_from_expression(&expression.right);
             let parameter_calls = self.parameter_calls_from_expression(&expression.right);
             if let Some(binding) = binding {
                 self.local_bindings
@@ -8007,6 +8097,16 @@ impl<'a> Visit<'a> for TranslatorReturnCollector {
                     .entry(name.to_string())
                     .or_default()
                     .extend(array_params);
+            }
+            if let Some(binding) = object_binding {
+                self.local_object_bindings
+                    .entry(name.to_string())
+                    .and_modify(|existing| {
+                        *existing = merge_translator_bindings(existing, &binding)
+                    })
+                    .or_insert(binding);
+            } else {
+                self.local_object_bindings.remove(name);
             }
         }
         walk::walk_assignment_expression(self, expression);
@@ -8119,6 +8219,7 @@ impl SourceIndexCollector {
             local_bindings: BTreeMap::new(),
             local_array_bindings: BTreeMap::new(),
             local_array_params: BTreeMap::new(),
+            local_object_bindings: BTreeMap::new(),
             local_parameter_calls: BTreeMap::new(),
             dynamic_callables: BTreeSet::new(),
             parameter_callables: BTreeMap::new(),
@@ -10770,6 +10871,18 @@ impl SourceUsageCollector {
                         .and_then(|argument| self.translator_binding_from_argument(argument))
                     {
                         array.bindings.push(Some(binding));
+                    }
+                    array.unknown_contents = true;
+                }
+                Some(array)
+            }
+            method if ARRAY_COPYING_METHODS.contains(&method) => {
+                array.safe_layout = false;
+                if matches!(method, "toSpliced" | "with") {
+                    for argument in &call.arguments {
+                        if let Some(binding) = self.translator_binding_from_argument(argument) {
+                            array.bindings.push(Some(binding));
+                        }
                     }
                     array.unknown_contents = true;
                 }
@@ -14769,6 +14882,70 @@ mod tests {
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 8));
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 9));
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 10));
+    }
+
+    #[test]
+    fn imported_helpers_preserve_callback_and_local_object_array_returns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("main.ts");
+        let helper = dir.path().join("helper.ts");
+        fs::write(
+            &main,
+            r#"
+            import {getMapped, getValues} from './helper';
+            const mapped = getMapped();
+            const values = getValues();
+            mapped[0]('mapped');
+            values[0]('values');
+            "#,
+        )
+        .expect("write main source");
+        fs::write(
+            &helper,
+            r#"
+            import {getTranslations} from 'next-intl/server';
+            export const getMapped = () => [1].map(() => {
+              return getTranslations('common');
+            });
+            export function getValues() {
+              const bundle = {format: getTranslations('settings')};
+              return Object.values(bundle);
+            }
+            "#,
+        )
+        .expect("write helper source");
+
+        let scan = collect_usage_from_files(dir.path(), &[main, helper]).expect("scan project");
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 5));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 6));
+    }
+
+    #[test]
+    fn immutable_array_methods_preserve_translator_evidence() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const source = [common, settings];
+            const reversed = source.toReversed();
+            const sorted = source.toSorted();
+            const spliced = source.toSpliced(0, 1, common);
+            const replaced = source.with(0, settings);
+            reversed[0]('reversed');
+            sorted[0]('sorted');
+            spliced[0]('spliced');
+            replaced[0]('replaced');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.reversed"));
+        assert!(scan.used_ids.contains("settings.reversed"));
+        assert!(scan.used_ids.contains("common.sorted"));
+        assert!(scan.used_ids.contains("settings.sorted"));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 12));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 13));
     }
 
     #[test]
