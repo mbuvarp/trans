@@ -9777,8 +9777,12 @@ impl SourceUsageCollector {
                             merged.optional = optional;
                             Some(merged)
                         }
-                        (Some(left), None) => Some(left),
+                        (Some(mut left), None) => {
+                            left.safe_layout = false;
+                            Some(left)
+                        }
                         (None, Some(mut right)) => {
+                            right.safe_layout = false;
                             right.optional = true;
                             Some(right)
                         }
@@ -15430,6 +15434,34 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
         assert!(scan.used_ids.contains("common.title"));
         assert!(scan.used_ids.contains("settings.title"));
         assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn one_sided_logical_translator_arrays_remain_dynamic() {
+        let optional_left = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const translators =
+                (enabled && [common]) || runtimeTranslators;
+            const [render] = translators;
+            render('left');
+            "#,
+        );
+
+        assert!(!optional_left.dynamic_usages.is_empty());
+
+        let unknown_left = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const translators = runtimeTranslators || [common];
+            const [render] = translators;
+            render('right');
+            "#,
+        );
+
+        assert!(!unknown_left.dynamic_usages.is_empty());
     }
 
     #[test]
