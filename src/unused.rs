@@ -9312,6 +9312,49 @@ impl SourceUsageCollector {
                 }
                 Some(result)
             }
+            Expression::ArrayExpression(array) => {
+                let mut result = TranslatorObjectBinding::default();
+                for (index, element) in array.elements.iter().enumerate() {
+                    if matches!(element, ArrayExpressionElement::SpreadElement(_)) {
+                        result.mark_unknown("");
+                        continue;
+                    }
+                    let Some(expression) = element.as_expression() else {
+                        continue;
+                    };
+                    let property = index.to_string();
+                    result.remove_property(&property);
+                    result.resolved_properties.insert(property.clone());
+                    if let Some(binding) = self.translator_binding_from_expression(expression) {
+                        result.bindings.insert(property, binding);
+                    } else if let Some(nested) =
+                        self.translator_object_bindings_from_expression(expression)
+                    {
+                        result.bindings.extend(
+                            nested
+                                .bindings
+                                .into_iter()
+                                .map(|(path, binding)| (format!("{property}.{path}"), binding)),
+                        );
+                        result
+                            .unknown_paths
+                            .extend(nested.unknown_paths.into_iter().map(|path| {
+                                if path.is_empty() {
+                                    property.clone()
+                                } else {
+                                    format!("{property}.{path}")
+                                }
+                            }));
+                        result.resolved_properties.extend(
+                            nested
+                                .resolved_properties
+                                .into_iter()
+                                .map(|path| format!("{property}.{path}")),
+                        );
+                    }
+                }
+                Some(result)
+            }
             Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_) => {
                 let member = expression.get_member_expr()?;
                 let properties = member
@@ -10982,6 +11025,89 @@ impl SourceUsageCollector {
         self.bind_pattern_translator_object_path(pattern, bindings, &[]);
     }
 
+    fn bind_pattern_translator_expression_path(
+        &mut self,
+        pattern: &BindingPattern<'_>,
+        expression: &Expression<'_>,
+        path: &[String],
+    ) {
+        match pattern {
+            BindingPattern::BindingIdentifier(identifier) => {
+                if let Some(binding) =
+                    self.translator_binding_from_expression_path(expression, path)
+                {
+                    self.translators
+                        .entry(identifier.name.to_string())
+                        .and_modify(|current| {
+                            *current = merge_translator_bindings(current, &binding)
+                        })
+                        .or_insert(binding);
+                }
+            }
+            BindingPattern::AssignmentPattern(assignment) => {
+                if let Some(binding) = self
+                    .translator_binding_from_expression_path(expression, path)
+                    .or_else(|| self.translator_binding_from_expression(&assignment.right))
+                    && let Some(name) = binding_identifier_name(&assignment.left)
+                {
+                    self.translators
+                        .entry(name.to_string())
+                        .and_modify(|current| {
+                            *current = merge_translator_bindings(current, &binding)
+                        })
+                        .or_insert(binding);
+                } else {
+                    self.bind_pattern_translator_expression_path(
+                        &assignment.left,
+                        &assignment.right,
+                        &[],
+                    );
+                }
+            }
+            BindingPattern::ObjectPattern(object) => {
+                for property in &object.properties {
+                    let names = if property.computed {
+                        property
+                            .key
+                            .as_expression()
+                            .and_then(|key| self.finite_strings_from_expression(key))
+                    } else {
+                        property
+                            .key
+                            .static_name()
+                            .map(|name| finite_string(name.to_string()))
+                    };
+                    let Some(names) = names else {
+                        continue;
+                    };
+                    for name in names {
+                        let mut property_path = path.to_vec();
+                        property_path.push(name);
+                        self.bind_pattern_translator_expression_path(
+                            &property.value,
+                            expression,
+                            &property_path,
+                        );
+                    }
+                }
+            }
+            BindingPattern::ArrayPattern(array) => {
+                for (index, element) in array.elements.iter().enumerate() {
+                    let Some(element) = element else {
+                        continue;
+                    };
+                    let mut element_path = path.to_vec();
+                    element_path.push(index.to_string());
+                    self.bind_pattern_translator_expression_path(
+                        element,
+                        expression,
+                        &element_path,
+                    );
+                }
+            }
+        }
+    }
+
     fn bind_pattern_translator_object_path(
         &mut self,
         pattern: &BindingPattern<'_>,
@@ -11020,19 +11146,29 @@ impl SourceUsageCollector {
             }
             BindingPattern::ObjectPattern(object) => {
                 for property in &object.properties {
-                    if property.computed {
-                        continue;
-                    }
-                    let Some(property_name) = property.key.static_name() else {
+                    let names = if property.computed {
+                        property
+                            .key
+                            .as_expression()
+                            .and_then(|key| self.finite_strings_from_expression(key))
+                    } else {
+                        property
+                            .key
+                            .static_name()
+                            .map(|name| finite_string(name.to_string()))
+                    };
+                    let Some(names) = names else {
                         continue;
                     };
-                    let mut property_path = path.to_vec();
-                    property_path.push(property_name.to_string());
-                    self.bind_pattern_translator_object_path(
-                        &property.value,
-                        bindings,
-                        &property_path,
-                    );
+                    for name in names {
+                        let mut property_path = path.to_vec();
+                        property_path.push(name);
+                        self.bind_pattern_translator_object_path(
+                            &property.value,
+                            bindings,
+                            &property_path,
+                        );
+                    }
                 }
                 if let Some(rest) = &object.rest
                     && let Some(rest_name) = binding_identifier_name(&rest.argument)
@@ -11046,11 +11182,21 @@ impl SourceUsageCollector {
                     };
                     if let Some(residual) = residual.as_mut() {
                         for property in &object.properties {
-                            if property.computed {
-                                continue;
-                            }
-                            if let Some(property_name) = property.key.static_name() {
-                                residual.remove_property(property_name.as_ref());
+                            let names = if property.computed {
+                                property
+                                    .key
+                                    .as_expression()
+                                    .and_then(|key| self.finite_strings_from_expression(key))
+                            } else {
+                                property
+                                    .key
+                                    .static_name()
+                                    .map(|name| finite_string(name.to_string()))
+                            };
+                            if let Some(names) = names {
+                                for name in names {
+                                    residual.remove_property(&name);
+                                }
                             }
                         }
                     }
@@ -11139,6 +11285,116 @@ impl SourceUsageCollector {
         }
     }
 
+    fn bind_assignment_target_expression_path(
+        &mut self,
+        target: &AssignmentTarget<'_>,
+        expression: &Expression<'_>,
+        path: &[String],
+    ) {
+        match target {
+            AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                let binding = self.translator_binding_from_expression_path(expression, path);
+                self.bind_assignment_identifier(identifier, binding);
+            }
+            AssignmentTarget::ObjectAssignmentTarget(target) => {
+                for property in &target.properties {
+                    match property {
+                        AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(property) => {
+                            let mut property_path = path.to_vec();
+                            property_path.push(property.binding.name.to_string());
+                            let binding = self
+                                .translator_binding_from_expression_path(expression, &property_path)
+                                .or_else(|| {
+                                    property.init.as_ref().and_then(|init| {
+                                        self.translator_binding_from_expression(init)
+                                    })
+                                });
+                            self.bind_assignment_identifier(&property.binding, binding);
+                        }
+                        AssignmentTargetProperty::AssignmentTargetPropertyProperty(property) => {
+                            let names = if property.computed {
+                                property
+                                    .name
+                                    .as_expression()
+                                    .and_then(|key| self.finite_strings_from_expression(key))
+                            } else {
+                                property
+                                    .name
+                                    .static_name()
+                                    .map(|name| finite_string(name.to_string()))
+                            };
+                            let Some(names) = names else {
+                                continue;
+                            };
+                            for name in names {
+                                let mut property_path = path.to_vec();
+                                property_path.push(name);
+                                self.bind_assignment_maybe_default_expression_path(
+                                    &property.binding,
+                                    expression,
+                                    &property_path,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            AssignmentTarget::ArrayAssignmentTarget(target) => {
+                for (index, element) in target.elements.iter().enumerate() {
+                    let Some(element) = element else {
+                        continue;
+                    };
+                    let mut element_path = path.to_vec();
+                    element_path.push(index.to_string());
+                    self.bind_assignment_maybe_default_expression_path(
+                        element,
+                        expression,
+                        &element_path,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn bind_assignment_maybe_default_expression_path(
+        &mut self,
+        target: &AssignmentTargetMaybeDefault<'_>,
+        expression: &Expression<'_>,
+        path: &[String],
+    ) {
+        match target {
+            AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(default) => {
+                if let Some(binding) = self
+                    .translator_binding_from_expression_path(expression, path)
+                    .or_else(|| self.translator_binding_from_expression(&default.init))
+                    && let AssignmentTarget::AssignmentTargetIdentifier(identifier) =
+                        &default.binding
+                {
+                    self.bind_assignment_identifier(identifier, Some(binding));
+                } else {
+                    self.bind_assignment_target_expression_path(
+                        &default.binding,
+                        &default.init,
+                        &[],
+                    );
+                }
+            }
+            AssignmentTargetMaybeDefault::AssignmentTargetIdentifier(identifier) => {
+                let binding = self.translator_binding_from_expression_path(expression, path);
+                self.bind_assignment_identifier(identifier, binding);
+            }
+            AssignmentTargetMaybeDefault::ObjectAssignmentTarget(_)
+            | AssignmentTargetMaybeDefault::ArrayAssignmentTarget(_) => self
+                .bind_assignment_target_expression_path(
+                    target.to_assignment_target(),
+                    expression,
+                    path,
+                ),
+            _ => {}
+        }
+    }
+
     fn bind_assignment_maybe_default(
         &mut self,
         target: &AssignmentTargetMaybeDefault<'_>,
@@ -11175,6 +11431,13 @@ impl SourceUsageCollector {
                 }
                 AssignmentTargetProperty::AssignmentTargetPropertyProperty(property) => {
                     if property.computed {
+                        if let Some(names) = property
+                            .name
+                            .as_expression()
+                            .and_then(|key| self.finite_strings_from_expression(key))
+                        {
+                            removed.extend(names);
+                        }
                         continue;
                     }
                     let Some(name) = property.name.static_name() else {
@@ -11436,6 +11699,9 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             }
         }
         self.track_destructured_translator_bindings(&declarator.id);
+        if let Some(init) = &declarator.init {
+            self.bind_pattern_translator_expression_path(&declarator.id, init, &[]);
+        }
         if let Some(bindings) = translator_object_bindings {
             self.bind_pattern_translator_properties(&declarator.id, &bindings);
             if let Some(name) = binding_identifier_name(&declarator.id) {
@@ -11717,11 +11983,21 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         if expression.operator == AssignmentOperator::Assign {
             match &expression.left {
                 AssignmentTarget::ObjectAssignmentTarget(target) => {
+                    self.bind_assignment_target_expression_path(
+                        &expression.left,
+                        &expression.right,
+                        &[],
+                    );
                     let bindings =
                         self.translator_object_bindings_from_expression(&expression.right);
                     self.bind_object_assignment_target(target, bindings.as_ref());
                 }
                 AssignmentTarget::ArrayAssignmentTarget(target) => {
+                    self.bind_assignment_target_expression_path(
+                        &expression.left,
+                        &expression.right,
+                        &[],
+                    );
                     let array = self.translator_argument_array_from_expression(&expression.right);
                     self.bind_array_assignment_target(target, array.as_ref());
                 }
@@ -14819,6 +15095,43 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
     }
 
     #[test]
+    fn finite_computed_destructuring_binds_and_excludes_translators() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const property = 'common';
+            const bundle = {common, settings};
+            const {[property]: render, ...rest} = bundle;
+            render('computed');
+            Object.values(rest).forEach(format => format('rest'));
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.computed"));
+        assert!(scan.used_ids.contains("settings.rest"));
+        assert!(!scan.used_ids.contains("common.rest"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn nested_array_destructuring_resolves_array_aliases() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const nested = [[common]];
+            const [[render]] = nested;
+            render('title');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
     fn destructuring_defaults_bind_known_translators() {
         let scan = scan(
             r#"
@@ -14857,6 +15170,30 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
         assert!(scan.used_ids.contains("common.object"));
         assert!(scan.used_ids.contains("common.array"));
         assert!(scan.used_ids.contains("settings.rest"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn nested_and_computed_destructuring_assignments_bind_translators() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const property = 'group';
+            const objectBundle = {group: {format: common}};
+            const arrayBundle = [[settings]];
+            let objectRender;
+            let arrayRender;
+            ({[property]: {format: objectRender}} = objectBundle);
+            [[arrayRender]] = arrayBundle;
+            objectRender('object');
+            arrayRender('array');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.object"));
+        assert!(scan.used_ids.contains("settings.array"));
         assert!(scan.dynamic_usages.is_empty());
     }
 
