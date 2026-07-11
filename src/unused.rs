@@ -11,12 +11,13 @@ use oxc_ast::ast::{
     AssignmentTarget, BindingPattern, CallExpression, CatchParameter, ComputedMemberExpression,
     ConditionalExpression, Declaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
     ExportNamedDeclaration, Expression, ForOfStatement, ForStatementLeft, Function, FunctionBody,
-    FunctionType, ImportDeclaration, ImportDeclarationSpecifier, JSXAttributeItem,
-    JSXAttributeName, JSXAttributeValue, JSXElementName, JSXExpression, JSXOpeningElement,
-    ModuleExportName, ObjectExpression, ObjectPropertyKind, PropertyKind, ReturnStatement,
-    Statement, StaticMemberExpression, TSInterfaceDeclaration, TSLiteral, TSSignature, TSType,
-    TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator, TSTypeQueryExprName,
-    TemplateLiteral, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    FunctionType, IdentifierReference, ImportDeclaration, ImportDeclarationSpecifier,
+    JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXElementName, JSXExpression,
+    JSXOpeningElement, ModuleExportName, ObjectExpression, ObjectPropertyKind, PropertyKind,
+    ReturnStatement, Statement, StaticMemberExpression, TSInterfaceDeclaration, TSLiteral,
+    TSSignature, TSType, TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator,
+    TSTypeQueryExprName, TemplateLiteral, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -1882,6 +1883,7 @@ fn helper_summary_from_expression_with_context(
             enum_member_domains,
             source_context,
         ),
+        Expression::Identifier(identifier) => helpers.get(identifier.name.as_str()).cloned(),
         Expression::CallExpression(call) => bound_helper_summary_from_call(call, helpers),
         _ => None,
     }
@@ -1902,13 +1904,26 @@ fn bound_helper_summary_from_call(
         .name
         .as_str();
     let summary = helpers.get(helper_name)?;
-    if call
+    let has_spread = call
         .arguments
         .iter()
         .skip(1)
-        .any(|argument| matches!(argument, Argument::SpreadElement(_)))
-    {
-        return None;
+        .any(|argument| matches!(argument, Argument::SpreadElement(_)));
+    if has_spread {
+        return Some(HelperSummary {
+            param_usages: summary
+                .param_usages
+                .iter()
+                .flat_map(|usage| {
+                    (0..=usage.param_index).map(|param_index| HelperParamUsage {
+                        param_index,
+                        keys: usage.keys.clone(),
+                        query: usage.query.clone(),
+                        translator_like: usage.translator_like,
+                    })
+                })
+                .collect(),
+        });
     }
     let bound_count = call.arguments.len().saturating_sub(1);
     Some(HelperSummary {
@@ -3967,6 +3982,23 @@ struct MessageKeyHelperCollector {
 }
 
 #[derive(Default)]
+struct IdentifierReferenceCollector {
+    names: BTreeSet<String>,
+}
+
+impl<'a> Visit<'a> for IdentifierReferenceCollector {
+    fn visit_identifier_reference(&mut self, identifier: &IdentifierReference<'a>) {
+        self.names.insert(identifier.name.to_string());
+    }
+}
+
+fn referenced_identifier_names(expression: &Expression<'_>) -> BTreeSet<String> {
+    let mut collector = IdentifierReferenceCollector::default();
+    collector.visit_expression(expression);
+    collector.names
+}
+
+#[derive(Default)]
 struct FunctionVarBindingCollector {
     names: BTreeSet<String>,
 }
@@ -4309,15 +4341,13 @@ impl HelperBodyCollector {
             if safe_apply_index == Some(index) {
                 continue;
             }
-            let Some(identifier) = argument
-                .as_expression()
-                .map(Expression::get_inner_expression)
-                .and_then(Expression::get_identifier_reference)
-            else {
+            let Some(expression) = argument.as_expression() else {
                 continue;
             };
-            if let Some(array) = self.param_argument_arrays.get_mut(identifier.name.as_str()) {
-                array.safe_layout = false;
+            for name in referenced_identifier_names(expression) {
+                if let Some(array) = self.param_argument_arrays.get_mut(&name) {
+                    array.safe_layout = false;
+                }
             }
         }
     }
@@ -4761,11 +4791,19 @@ impl<'a> Visit<'a> for HelperBodyCollector {
             .as_ref()
             .and_then(Expression::get_identifier_reference)
             .and_then(|source| self.param_names.get(source.name.as_str()).copied());
-        let bound_helper = declarator.init.as_ref().and_then(|init| {
-            let Expression::CallExpression(call) = init.get_inner_expression() else {
-                return None;
-            };
-            bound_helper_summary_from_call(call, &self.helpers)
+        let derived_helper = declarator.init.as_ref().and_then(|init| {
+            helper_summary_from_expression_with_context(
+                init,
+                &self.helpers,
+                &self.finite_constants,
+                &self.finite_iterables,
+                &self.finite_object_maps,
+                &self.finite_record_constants,
+                &self.finite_record_iterables,
+                &self.finite_record_maps,
+                &self.enum_member_domains,
+                self.source_context.as_ref(),
+            )
         });
         let param_argument_array = (declarator.kind == VariableDeclarationKind::Const)
             .then(|| declarator.init.as_ref())
@@ -4792,7 +4830,8 @@ impl<'a> Visit<'a> for HelperBodyCollector {
                     .insert(identifier.name.to_string(), param_index);
             }
         }
-        if let (Some(name), Some(summary)) = (binding_identifier_name(&declarator.id), bound_helper)
+        if let (Some(name), Some(summary)) =
+            (binding_identifier_name(&declarator.id), derived_helper)
         {
             self.helpers.insert(name.to_string(), summary);
         }
@@ -7012,18 +7051,13 @@ impl SourceUsageCollector {
             if safe_apply_index == Some(index) {
                 continue;
             }
-            let Some(identifier) = argument
-                .as_expression()
-                .map(Expression::get_inner_expression)
-                .and_then(Expression::get_identifier_reference)
-            else {
+            let Some(expression) = argument.as_expression() else {
                 continue;
             };
-            if let Some(array) = self
-                .translator_argument_arrays
-                .get_mut(identifier.name.as_str())
-            {
-                array.safe_layout = false;
+            for name in referenced_identifier_names(expression) {
+                if let Some(array) = self.translator_argument_arrays.get_mut(&name) {
+                    array.safe_layout = false;
+                }
             }
         }
     }
@@ -8782,6 +8816,56 @@ mod tests {
     }
 
     #[test]
+    fn spread_bound_helpers_preserve_remaining_parameter_usages() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function inner(prefix, translate, key) {
+              return translate(key);
+            }
+            function outer(translate, key) {
+              const prefix = ['prefix'] as const;
+              const bound = inner.bind(null, ...prefix);
+              return bound(translate, key);
+            }
+            const t = useTranslations('common');
+            outer(t, runtimeKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn helper_identifier_aliases_preserve_parameter_usages() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function inner(prefix, translate, key) {
+              return translate(key);
+            }
+            function outer(translate, key) {
+              const bound = inner.bind(null, 'prefix');
+              const alias = bound;
+              return alias(translate, key);
+            }
+            const t = useTranslations('common');
+            outer(t, runtimeKey);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
     fn helper_apply_resolves_constant_argument_arrays() {
         let scan = scan(
             r#"
@@ -8856,6 +8940,31 @@ mod tests {
             const t = useTranslations('common');
             const args = [t];
             prepareArguments(args);
+            label.apply(null, args);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace.is_empty())
+        );
+    }
+
+    #[test]
+    fn wrapped_escaped_helper_apply_arrays_are_conservatively_dynamic() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function label(translate) {
+              return translate('title');
+            }
+            function prepareArguments(wrapper) {
+              wrapper.args.reverse();
+            }
+            const t = useTranslations('common');
+            const args = [t];
+            prepareArguments({args});
             label.apply(null, args);
             "#,
         );
