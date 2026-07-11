@@ -1789,6 +1789,7 @@ struct SourceUsageCollector {
     zod_schema_property_domains: TypePropertyDomains,
     enum_member_domains: TypeDomains,
     translators: BTreeMap<String, TranslatorBinding>,
+    translator_argument_arrays: BTreeMap<String, Vec<Option<TranslatorBinding>>>,
     potential_translators: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
     binding_scopes: Vec<BindingEnvironment>,
@@ -1813,6 +1814,7 @@ struct BindingEnvironment {
     zod_schema_property_domains: TypePropertyDomains,
     enum_member_domains: TypeDomains,
     translators: BTreeMap<String, TranslatorBinding>,
+    translator_argument_arrays: BTreeMap<String, Vec<Option<TranslatorBinding>>>,
     potential_translators: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
     next_intl_namespaces: BTreeSet<String>,
@@ -1964,6 +1966,7 @@ fn helper_summary_from_body_with_context(
         finite_record_iterables,
         finite_record_maps,
         enum_member_domains,
+        param_argument_arrays: BTreeMap::new(),
         source_context: source_context.cloned(),
         usages: Vec::new(),
         jsx_forwards: Vec::new(),
@@ -2031,6 +2034,7 @@ fn jsx_component_summary_from_body(
         finite_record_iterables: finite_record_iterables.clone(),
         finite_record_maps: finite_record_maps.clone(),
         enum_member_domains: enum_member_domains.clone(),
+        param_argument_arrays: BTreeMap::new(),
         source_context: Some(source_context.clone()),
         usages: Vec::new(),
         jsx_forwards: Vec::new(),
@@ -3850,6 +3854,7 @@ struct HelperBodyCollector {
     finite_record_iterables: FiniteRecordBindings,
     finite_record_maps: FiniteRecordMaps,
     enum_member_domains: TypeDomains,
+    param_argument_arrays: BTreeMap<String, Vec<Option<usize>>>,
     usages: Vec<HelperParamUsage>,
     jsx_forwards: Vec<HelperJsxForward>,
     binding_scopes: Vec<HelperScopeFrame>,
@@ -3872,6 +3877,7 @@ struct HelperBindingValues {
     finite_record_iterable: Option<FiniteRecords>,
     finite_record_map: Option<FiniteRecords>,
     enum_member_domain: Option<FiniteStrings>,
+    param_argument_array: Option<Vec<Option<usize>>>,
 }
 
 struct HelperJsxForward {
@@ -3962,6 +3968,7 @@ impl HelperBodyCollector {
             finite_record_iterable: self.finite_record_iterables.remove(name),
             finite_record_map: self.finite_record_maps.remove(name),
             enum_member_domain: self.enum_member_domains.remove(name),
+            param_argument_array: self.param_argument_arrays.remove(name),
         };
         if let Some(scope) = self.binding_scopes.last_mut() {
             scope.bindings.insert(name.to_string(), values);
@@ -4023,6 +4030,11 @@ impl HelperBodyCollector {
                 &name,
                 values.enum_member_domain,
             );
+            restore(
+                &mut self.param_argument_arrays,
+                &name,
+                values.param_argument_array,
+            );
         }
         for (name, values) in scope.enum_domains {
             restore(&mut self.enum_member_domains, &name, values);
@@ -4039,6 +4051,7 @@ impl HelperBodyCollector {
         self.finite_record_iterables.remove(name);
         self.finite_record_maps.remove(name);
         self.enum_member_domains.remove(name);
+        self.param_argument_arrays.remove(name);
     }
 
     fn mask_binding_name(&mut self, name: &str) {
@@ -4089,10 +4102,41 @@ impl HelperBodyCollector {
     }
 
     fn param_index_from_argument(&self, argument: &Argument<'_>) -> Option<usize> {
-        let Argument::Identifier(identifier) = argument else {
+        self.param_index_from_expression(argument.as_expression()?)
+    }
+
+    fn param_index_from_expression(&self, expression: &Expression<'_>) -> Option<usize> {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => {
+                self.param_names.get(identifier.name.as_str()).copied()
+            }
+            Expression::ConditionalExpression(conditional) => {
+                let consequent = self.param_index_from_expression(&conditional.consequent)?;
+                let alternate = self.param_index_from_expression(&conditional.alternate)?;
+                (consequent == alternate).then_some(consequent)
+            }
+            _ => None,
+        }
+    }
+
+    fn param_argument_array_from_expression(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<Vec<Option<usize>>> {
+        let Expression::ArrayExpression(array) = expression.get_inner_expression() else {
             return None;
         };
-        self.param_names.get(identifier.name.as_str()).copied()
+        Some(
+            array
+                .elements
+                .iter()
+                .map(|element| {
+                    element
+                        .as_expression()
+                        .and_then(|expression| self.param_index_from_expression(expression))
+                })
+                .collect(),
+        )
     }
 
     fn apply_helper_summary_with_offset(
@@ -4124,16 +4168,36 @@ impl HelperBodyCollector {
         _start: u32,
     ) {
         for usage in &summary.param_usages {
-            let Some(ArrayExpressionElement::Identifier(identifier)) =
-                array.elements.get(usage.param_index)
+            let Some(expression) = array
+                .elements
+                .get(usage.param_index)
+                .and_then(ArrayExpressionElement::as_expression)
             else {
                 continue;
             };
-            let Some(param_index) = self.param_names.get(identifier.name.as_str()).copied() else {
+            let Some(param_index) = self.param_index_from_expression(expression) else {
                 continue;
             };
             self.usages.push(HelperParamUsage {
                 param_index,
+                keys: usage.keys.clone(),
+                query: usage.query.clone(),
+                translator_like: usage.translator_like,
+            });
+        }
+    }
+
+    fn apply_helper_summary_from_param_array(
+        &mut self,
+        bindings: &[Option<usize>],
+        summary: &HelperSummary,
+    ) {
+        for usage in &summary.param_usages {
+            let Some(Some(param_index)) = bindings.get(usage.param_index) else {
+                continue;
+            };
+            self.usages.push(HelperParamUsage {
+                param_index: *param_index,
                 keys: usage.keys.clone(),
                 query: usage.query.clone(),
                 translator_like: usage.translator_like,
@@ -4539,12 +4603,23 @@ impl<'a> Visit<'a> for HelperBodyCollector {
             .as_ref()
             .and_then(Expression::get_identifier_reference)
             .and_then(|source| self.param_names.get(source.name.as_str()).copied());
+        let param_argument_array = (declarator.kind == VariableDeclarationKind::Const)
+            .then(|| declarator.init.as_ref())
+            .flatten()
+            .and_then(|init| self.param_argument_array_from_expression(init));
         self.mask_binding_pattern(&declarator.id);
         if let Some(param_index) = aliased_param {
             for identifier in declarator.id.get_binding_identifiers() {
                 self.param_names
                     .insert(identifier.name.to_string(), param_index);
             }
+        }
+        if let (Some(name), Some(bindings)) = (
+            binding_identifier_name(&declarator.id),
+            param_argument_array,
+        ) {
+            self.param_argument_arrays
+                .insert(name.to_string(), bindings);
         }
         if declarator.kind == VariableDeclarationKind::Const {
             if let Some(name) = binding_identifier_name(&declarator.id) {
@@ -4624,11 +4699,21 @@ impl<'a> Visit<'a> for HelperBodyCollector {
         if let Some((method, summary)) = member_helper {
             match method.as_str() {
                 "call" | "bind" => self.apply_helper_summary_with_offset(call, &summary, 1),
-                "apply" => {
-                    if let Some(Argument::ArrayExpression(array)) = call.arguments.get(1) {
+                "apply" => match call.arguments.get(1) {
+                    Some(Argument::ArrayExpression(array)) => {
                         self.apply_helper_summary_from_array(array, &summary, call.span.start);
                     }
-                }
+                    Some(Argument::Identifier(identifier)) => {
+                        if let Some(bindings) = self
+                            .param_argument_arrays
+                            .get(identifier.name.as_str())
+                            .cloned()
+                        {
+                            self.apply_helper_summary_from_param_array(&bindings, &summary);
+                        }
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         } else if let Some(summary) = self.helper_summary_for_callee(&call.callee) {
@@ -5743,6 +5828,7 @@ impl SourceUsageCollector {
             zod_schema_property_domains: BTreeMap::new(),
             enum_member_domains: BTreeMap::new(),
             translators: BTreeMap::new(),
+            translator_argument_arrays: BTreeMap::new(),
             potential_translators: BTreeSet::new(),
             message_key_helpers: BTreeMap::new(),
             binding_scopes: Vec::new(),
@@ -5768,6 +5854,7 @@ impl SourceUsageCollector {
             zod_schema_property_domains: self.zod_schema_property_domains.clone(),
             enum_member_domains: self.enum_member_domains.clone(),
             translators: self.translators.clone(),
+            translator_argument_arrays: self.translator_argument_arrays.clone(),
             potential_translators: self.potential_translators.clone(),
             message_key_helpers: self.message_key_helpers.clone(),
             next_intl_namespaces: self.next_intl_namespaces.clone(),
@@ -5788,6 +5875,7 @@ impl SourceUsageCollector {
         self.zod_schema_property_domains = environment.zod_schema_property_domains;
         self.enum_member_domains = environment.enum_member_domains;
         self.translators = environment.translators;
+        self.translator_argument_arrays = environment.translator_argument_arrays;
         self.potential_translators = environment.potential_translators;
         self.message_key_helpers = environment.message_key_helpers;
         self.next_intl_namespaces = environment.next_intl_namespaces;
@@ -5805,6 +5893,7 @@ impl SourceUsageCollector {
         self.zod_schema_property_domains.remove(name);
         self.enum_member_domains.remove(name);
         self.translators.remove(name);
+        self.translator_argument_arrays.remove(name);
         self.potential_translators.remove(name);
         self.message_key_helpers.remove(name);
         self.next_intl_namespaces.remove(name);
@@ -6597,34 +6686,23 @@ impl SourceUsageCollector {
         &self,
         element: &ArrayExpressionElement<'_>,
     ) -> Option<TranslatorBinding> {
-        match element {
-            ArrayExpressionElement::Identifier(identifier) => {
-                self.translators.get(identifier.name.as_str()).cloned()
-            }
-            ArrayExpressionElement::CallExpression(call) => self.translator_binding_from_call(call),
-            ArrayExpressionElement::AwaitExpression(await_expression) => {
-                self.translator_binding_from_expression(&await_expression.argument)
-            }
-            ArrayExpressionElement::ParenthesizedExpression(parenthesized) => {
-                self.translator_binding_from_expression(&parenthesized.expression)
-            }
-            ArrayExpressionElement::TSAsExpression(expression) => {
-                self.translator_binding_from_expression(&expression.expression)
-            }
-            ArrayExpressionElement::TSSatisfiesExpression(expression) => {
-                self.translator_binding_from_expression(&expression.expression)
-            }
-            ArrayExpressionElement::TSNonNullExpression(expression) => {
-                self.translator_binding_from_expression(&expression.expression)
-            }
-            ArrayExpressionElement::TSInstantiationExpression(expression) => {
-                self.translator_binding_from_expression(&expression.expression)
-            }
-            ArrayExpressionElement::TSTypeAssertion(expression) => {
-                self.translator_binding_from_expression(&expression.expression)
-            }
-            _ => None,
-        }
+        self.translator_binding_from_expression(element.as_expression()?)
+    }
+
+    fn translator_argument_array_from_expression(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<Vec<Option<TranslatorBinding>>> {
+        let Expression::ArrayExpression(array) = expression.get_inner_expression() else {
+            return None;
+        };
+        Some(
+            array
+                .elements
+                .iter()
+                .map(|element| self.translator_binding_from_array_element(element))
+                .collect(),
+        )
     }
 
     fn maybe_extraction_call(&self, call: &CallExpression<'_>) -> bool {
@@ -6711,13 +6789,7 @@ impl SourceUsageCollector {
         &self,
         argument: &Argument<'_>,
     ) -> Option<TranslatorBinding> {
-        match argument {
-            Argument::Identifier(identifier) => {
-                self.translators.get(identifier.name.as_str()).cloned()
-            }
-            Argument::CallExpression(call) => self.translator_binding_from_call(call),
-            _ => None,
-        }
+        self.translator_binding_from_expression(argument.as_expression()?)
     }
 
     fn translator_binding_from_call(&self, call: &CallExpression<'_>) -> Option<TranslatorBinding> {
@@ -6733,12 +6805,9 @@ impl SourceUsageCollector {
     fn record_used_key_for_binding(&mut self, binding: &TranslatorBinding, key: &str) {
         if let Some(namespaces) = &binding.namespaces {
             for namespace in namespaces {
-                let id = if key.is_empty() {
-                    namespace.clone()
-                } else {
-                    format!("{namespace}.{key}")
-                };
-                self.scan.used_ids.insert(id);
+                if let Some(id) = resolved_translation_id(namespace, key) {
+                    self.scan.used_ids.insert(id);
+                }
             }
             return;
         }
@@ -6870,6 +6939,20 @@ impl SourceUsageCollector {
                 continue;
             };
             self.record_helper_usage_for_binding(usage, &binding, start);
+        }
+    }
+
+    fn apply_helper_summary_from_bindings(
+        &mut self,
+        bindings: &[Option<TranslatorBinding>],
+        summary: &HelperSummary,
+        start: u32,
+    ) {
+        for usage in &summary.param_usages {
+            let Some(Some(binding)) = bindings.get(usage.param_index) else {
+                continue;
+            };
+            self.record_helper_usage_for_binding(usage, binding, start);
         }
     }
 
@@ -7543,8 +7626,19 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     }
 
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        let translator_argument_array = (declarator.kind == VariableDeclarationKind::Const)
+            .then(|| declarator.init.as_ref())
+            .flatten()
+            .and_then(|init| self.translator_argument_array_from_expression(init));
         self.mask_binding_pattern(&declarator.id);
         self.track_destructured_translator_bindings(&declarator.id);
+        if let (Some(name), Some(bindings)) = (
+            binding_identifier_name(&declarator.id),
+            translator_argument_array,
+        ) {
+            self.translator_argument_arrays
+                .insert(name.to_string(), bindings);
+        }
         if declarator.kind == VariableDeclarationKind::Const {
             if let Some(init) = &declarator.init {
                 if let Some(records) = self.finite_record_from_expression(init) {
@@ -7713,11 +7807,25 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         if let Some((method, summary)) = member_helper {
             match method.as_str() {
                 "call" | "bind" => self.apply_helper_summary_with_offset(call, &summary, 1),
-                "apply" => {
-                    if let Some(Argument::ArrayExpression(array)) = call.arguments.get(1) {
+                "apply" => match call.arguments.get(1) {
+                    Some(Argument::ArrayExpression(array)) => {
                         self.apply_helper_summary_from_array(array, &summary, call.span.start);
                     }
-                }
+                    Some(Argument::Identifier(identifier)) => {
+                        if let Some(bindings) = self
+                            .translator_argument_arrays
+                            .get(identifier.name.as_str())
+                            .cloned()
+                        {
+                            self.apply_helper_summary_from_bindings(
+                                &bindings,
+                                &summary,
+                                call.span.start,
+                            );
+                        }
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         } else if let Some(summary) = self.helper_summary_for_callee(&call.callee) {
@@ -8143,6 +8251,40 @@ mod tests {
     }
 
     #[test]
+    fn conditional_translator_aliases_preserve_unscoped_and_scoped_keys() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const tGlobal = useTranslations();
+            const tCommon = useTranslations('common');
+            const translate = compact ? tGlobal : tCommon;
+            translate('title');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("title"));
+        assert!(scan.used_ids.contains("common.title"));
+    }
+
+    #[test]
+    fn helper_arguments_resolve_conditional_translator_expressions() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function label(translate) {
+              return translate('title');
+            }
+            const tCommon = useTranslations('common');
+            const tSettings = useTranslations('settings');
+            label(compact ? (tCommon as typeof tCommon) : tSettings);
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.used_ids.contains("settings.title"));
+    }
+
+    #[test]
     fn namespace_imported_translation_factories_create_bindings() {
         let scan = scan(
             r#"
@@ -8179,6 +8321,51 @@ mod tests {
             label.call(null, t, runtimeCallKey);
             label.bind(null, t);
             label.apply(null, [t, runtimeApplyKey]);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn helper_apply_resolves_constant_argument_arrays() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function label(translate, key) {
+              return translate(key);
+            }
+            const t = useTranslations('common');
+            const args = [t, runtimeKey] as const;
+            label.apply(null, args);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn nested_helper_apply_propagates_constant_argument_arrays() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function inner(translate, key) {
+              return translate(key);
+            }
+            function outer(translate, key) {
+              const args = [translate, key] as const;
+              return inner.apply(null, args);
+            }
+            const t = useTranslations('common');
+            outer(t, runtimeKey);
             "#,
         );
 
