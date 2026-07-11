@@ -161,9 +161,12 @@ struct SourceFileIndex {
     helpers: BTreeMap<String, HelperSummary>,
     jsx_components: BTreeMap<String, JsxComponentSummary>,
     jsx_aliases: BTreeMap<String, Vec<JsxAliasTarget>>,
+    jsx_export_locals: BTreeMap<String, String>,
     return_helpers: BTreeMap<String, FiniteStrings>,
     return_record_helpers: BTreeMap<String, FiniteRecords>,
     translator_return_helpers: BTreeMap<String, TranslatorBinding>,
+    translator_return_forwards: BTreeMap<String, BTreeSet<String>>,
+    translator_return_export_locals: BTreeMap<String, String>,
     named_exports: BTreeMap<String, HelperSummary>,
     named_jsx_exports: BTreeMap<String, JsxComponentSummary>,
     named_return_exports: BTreeMap<String, FiniteStrings>,
@@ -173,11 +176,13 @@ struct SourceFileIndex {
     named_translator_return_exports: BTreeMap<String, TranslatorBinding>,
     default_export: Option<HelperSummary>,
     default_jsx_export: Option<JsxComponentSummary>,
+    default_local_export: Option<String>,
     default_return_export: Option<FiniteStrings>,
     default_iterable_export: Option<FiniteStrings>,
     default_record_iterable_export: Option<FiniteRecords>,
     default_record_return_export: Option<FiniteRecords>,
     default_translator_return_export: Option<TranslatorBinding>,
+    default_translator_return_forwards: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1202,11 +1207,36 @@ impl ProjectIndex {
     }
 
     fn translator_return_for_local(&self, path: &Path, name: &str) -> Option<TranslatorBinding> {
-        self.files
-            .get(path)?
+        self.translator_return_for_local_at_depth(path, name, 0)
+    }
+
+    fn translator_return_for_local_at_depth(
+        &self,
+        path: &Path,
+        name: &str,
+        depth: usize,
+    ) -> Option<TranslatorBinding> {
+        if depth > 16 {
+            return None;
+        }
+        let file = self.files.get(path)?;
+        let mut bindings = file
             .translator_return_helpers
             .get(name)
             .cloned()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(forwards) = file.translator_return_forwards.get(name) {
+            bindings.extend(forwards.iter().filter_map(|forward| {
+                file.imports
+                    .get(forward)
+                    .and_then(|target| {
+                        self.translator_return_for_import_at_depth(path, target, depth + 1)
+                    })
+                    .or_else(|| self.translator_return_for_local_at_depth(path, forward, depth + 1))
+            }));
+        }
+        merge_translator_binding_iter(bindings)
     }
 
     fn translator_return_for_import(
@@ -1230,9 +1260,12 @@ impl ProjectIndex {
         let file = self.files.get(&path)?;
         match &target.imported {
             ImportedName::Named(name) => file
-                .named_translator_return_exports
+                .translator_return_export_locals
                 .get(name)
-                .cloned()
+                .and_then(|local| {
+                    self.translator_return_for_local_at_depth(&path, local, depth + 1)
+                })
+                .or_else(|| file.named_translator_return_exports.get(name).cloned())
                 .or_else(|| {
                     file.re_exports.get(name).and_then(|target| {
                         self.translator_return_for_import_at_depth(&path, target, depth + 1)
@@ -1250,11 +1283,44 @@ impl ProjectIndex {
                         )
                     })
                 }),
-            ImportedName::Default => file.default_translator_return_export.clone().or_else(|| {
-                file.re_exports.get("default").and_then(|target| {
-                    self.translator_return_for_import_at_depth(&path, target, depth + 1)
+            ImportedName::Default => file
+                .default_local_export
+                .as_ref()
+                .and_then(|local| {
+                    self.translator_return_for_local_at_depth(&path, local, depth + 1)
                 })
-            }),
+                .or_else(|| {
+                    let bindings = file
+                        .default_translator_return_export
+                        .clone()
+                        .into_iter()
+                        .chain(file.default_translator_return_forwards.iter().filter_map(
+                            |forward| {
+                                file.imports
+                                    .get(forward)
+                                    .and_then(|target| {
+                                        self.translator_return_for_import_at_depth(
+                                            &path,
+                                            target,
+                                            depth + 1,
+                                        )
+                                    })
+                                    .or_else(|| {
+                                        self.translator_return_for_local_at_depth(
+                                            &path,
+                                            forward,
+                                            depth + 1,
+                                        )
+                                    })
+                            },
+                        ));
+                    merge_translator_binding_iter(bindings)
+                })
+                .or_else(|| {
+                    file.re_exports.get("default").and_then(|target| {
+                        self.translator_return_for_import_at_depth(&path, target, depth + 1)
+                    })
+                }),
         }
     }
 
@@ -1465,6 +1531,12 @@ impl ProjectIndex {
                 .cloned()
                 .map(|summary| (path.clone(), summary))
                 .or_else(|| {
+                    file.jsx_export_locals.get(name).and_then(|local| {
+                        self.jsx_component_for_local_at_depth(&path, local, depth + 1)
+                            .map(|summary| (path.clone(), summary))
+                    })
+                })
+                .or_else(|| {
                     file.re_exports.get(name).and_then(|target| {
                         self.jsx_component_target_for_import(&path, target, depth + 1)
                     })
@@ -1485,6 +1557,12 @@ impl ProjectIndex {
                 .default_jsx_export
                 .clone()
                 .map(|summary| (path.clone(), summary))
+                .or_else(|| {
+                    file.default_local_export.as_ref().and_then(|local| {
+                        self.jsx_component_for_local_at_depth(&path, local, depth + 1)
+                            .map(|summary| (path.clone(), summary))
+                    })
+                })
                 .or_else(|| {
                     file.re_exports.get("default").and_then(|target| {
                         self.jsx_component_target_for_import(&path, target, depth + 1)
@@ -1531,6 +1609,9 @@ impl ProjectIndex {
             };
             let child = if let Some(child) = file.jsx_components.get(&forward.component_name) {
                 Some((path.to_path_buf(), child.clone()))
+            } else if file.jsx_aliases.contains_key(&forward.component_name) {
+                self.jsx_component_for_local_at_depth(path, &forward.component_name, depth + 1)
+                    .map(|summary| (path.to_path_buf(), summary))
             } else {
                 file.imports
                     .get(&forward.component_name)
@@ -5920,12 +6001,42 @@ struct TranslatorReturnCollector {
     client_namespaces: BTreeSet<String>,
     server_namespaces: BTreeSet<String>,
     bindings: Vec<TranslatorBinding>,
+    forwards: BTreeSet<String>,
+    local_bindings: BTreeMap<String, TranslatorBinding>,
+}
+
+fn translator_return_forward_callees(expression: &Expression<'_>) -> BTreeSet<String> {
+    match expression.get_inner_expression() {
+        Expression::CallExpression(call) => call
+            .callee
+            .get_identifier_reference()
+            .map(|identifier| BTreeSet::from([identifier.name.to_string()]))
+            .unwrap_or_default(),
+        Expression::AwaitExpression(await_expression) => {
+            translator_return_forward_callees(&await_expression.argument)
+        }
+        Expression::ConditionalExpression(conditional) => {
+            let mut forwards = translator_return_forward_callees(&conditional.consequent);
+            forwards.extend(translator_return_forward_callees(&conditional.alternate));
+            forwards
+        }
+        _ => BTreeSet::new(),
+    }
 }
 
 impl TranslatorReturnCollector {
-    fn summary(self) -> Option<TranslatorBinding> {
-        merge_translator_binding_iter(self.bindings)
+    fn summary(self) -> TranslatorReturnSummary {
+        TranslatorReturnSummary {
+            binding: merge_translator_binding_iter(self.bindings),
+            forwards: self.forwards,
+        }
     }
+}
+
+#[derive(Default)]
+struct TranslatorReturnSummary {
+    binding: Option<TranslatorBinding>,
+    forwards: BTreeSet<String>,
 }
 
 impl<'a> Visit<'a> for TranslatorReturnCollector {
@@ -5937,14 +6048,47 @@ impl<'a> Visit<'a> for TranslatorReturnCollector {
                 &self.client_namespaces,
                 &self.server_namespaces,
             )
+            .or_else(|| {
+                argument
+                    .get_identifier_reference()
+                    .and_then(|identifier| self.local_bindings.get(identifier.name.as_str()))
+                    .cloned()
+            })
         }) {
             self.bindings.push(binding);
+        }
+        if let Some(argument) = &statement.argument {
+            self.forwards
+                .extend(translator_return_forward_callees(argument));
         }
     }
 
     fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
 
     fn visit_arrow_function_expression(&mut self, _arrow: &ArrowFunctionExpression<'a>) {}
+
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if let (Some(name), Some(init)) = (
+            binding_identifier_name(&declarator.id),
+            declarator.init.as_ref(),
+        ) {
+            let binding = translator_factory_binding_from_expression(
+                init,
+                &self.factories,
+                &self.client_namespaces,
+                &self.server_namespaces,
+            )
+            .or_else(|| {
+                init.get_identifier_reference()
+                    .and_then(|identifier| self.local_bindings.get(identifier.name.as_str()))
+                    .cloned()
+            });
+            if let Some(binding) = binding {
+                self.local_bindings.insert(name.to_string(), binding);
+            }
+        }
+        walk::walk_variable_declarator(self, declarator);
+    }
 }
 
 #[derive(Default)]
@@ -5967,6 +6111,7 @@ struct SourceIndexCollector {
     finite_record_maps: FiniteRecordMaps,
     return_record_helpers: BTreeMap<String, FiniteRecords>,
     translator_return_helpers: BTreeMap<String, TranslatorBinding>,
+    translator_return_forwards: BTreeMap<String, BTreeSet<String>>,
     enum_member_domains: TypeDomains,
     translation_factories: BTreeSet<String>,
     next_intl_namespaces: BTreeSet<String>,
@@ -5980,6 +6125,7 @@ struct SourceIndexCollector {
     default_record_iterable_export: Option<FiniteRecords>,
     default_record_return_summary: Option<FiniteRecords>,
     default_translator_return_summary: Option<TranslatorBinding>,
+    default_translator_return_forwards: BTreeSet<String>,
     binding_scopes: Vec<IndexBindingEnvironment>,
     scope_depth: usize,
 }
@@ -5988,6 +6134,7 @@ struct SourceIndexCollector {
 struct IndexBindingEnvironment {
     helpers: BTreeMap<String, HelperSummary>,
     jsx_components: BTreeMap<String, JsxComponentSummary>,
+    jsx_aliases: BTreeMap<String, Vec<JsxAliasTarget>>,
     return_helpers: BTreeMap<String, FiniteStrings>,
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
@@ -5996,6 +6143,8 @@ struct IndexBindingEnvironment {
     finite_record_iterables: FiniteRecordBindings,
     finite_record_maps: FiniteRecordMaps,
     return_record_helpers: BTreeMap<String, FiniteRecords>,
+    translator_return_helpers: BTreeMap<String, TranslatorBinding>,
+    translator_return_forwards: BTreeMap<String, BTreeSet<String>>,
     enum_member_domains: TypeDomains,
 }
 
@@ -6007,15 +6156,28 @@ impl SourceIndexCollector {
         }
     }
 
+    fn record_translator_return_summary(&mut self, name: &str, summary: TranslatorReturnSummary) {
+        if let Some(binding) = summary.binding {
+            self.translator_return_helpers
+                .insert(name.to_string(), binding);
+        }
+        if !summary.forwards.is_empty() {
+            self.translator_return_forwards
+                .insert(name.to_string(), summary.forwards);
+        }
+    }
+
     fn translator_return_summary_from_body(
         &self,
         body: &FunctionBody<'_>,
-    ) -> Option<TranslatorBinding> {
+    ) -> TranslatorReturnSummary {
         let mut collector = TranslatorReturnCollector {
             factories: self.translation_factories.clone(),
             client_namespaces: self.next_intl_namespaces.clone(),
             server_namespaces: self.next_intl_server_namespaces.clone(),
             bindings: Vec::new(),
+            forwards: BTreeSet::new(),
+            local_bindings: BTreeMap::new(),
         };
         for statement in &body.statements {
             collector.visit_statement(statement);
@@ -6026,21 +6188,25 @@ impl SourceIndexCollector {
     fn translator_return_summary_from_arrow(
         &self,
         arrow: &ArrowFunctionExpression<'_>,
-    ) -> Option<TranslatorBinding> {
+    ) -> TranslatorReturnSummary {
         if arrow.expression
             && let Some(Statement::ExpressionStatement(statement)) = arrow.body.statements.first()
         {
-            return translator_factory_binding_from_expression(
+            let binding = translator_factory_binding_from_expression(
                 &statement.expression,
                 &self.translation_factories,
                 &self.next_intl_namespaces,
                 &self.next_intl_server_namespaces,
             );
+            let forwards = translator_return_forward_callees(&statement.expression);
+            return TranslatorReturnSummary { binding, forwards };
         }
         self.translator_return_summary_from_body(&arrow.body)
     }
 
     fn finish(self) -> SourceFileIndex {
+        let jsx_export_locals = self.export_locals.clone();
+        let translator_return_export_locals = self.export_locals.clone();
         let mut named_exports = BTreeMap::new();
         let mut named_jsx_exports = BTreeMap::new();
         let mut named_return_exports = BTreeMap::new();
@@ -6073,6 +6239,7 @@ impl SourceIndexCollector {
         }
 
         let default_local = self.default_local;
+        let default_local_export = default_local.clone();
         let default_export = self.default_summary.or_else(|| {
             default_local
                 .as_ref()
@@ -6119,9 +6286,12 @@ impl SourceIndexCollector {
             helpers: self.helpers,
             jsx_components: self.jsx_components,
             jsx_aliases: self.jsx_aliases,
+            jsx_export_locals,
             return_helpers: self.return_helpers,
             return_record_helpers: self.return_record_helpers,
             translator_return_helpers: self.translator_return_helpers,
+            translator_return_forwards: self.translator_return_forwards,
+            translator_return_export_locals,
             named_exports,
             named_jsx_exports,
             named_return_exports,
@@ -6131,11 +6301,13 @@ impl SourceIndexCollector {
             named_translator_return_exports,
             default_export,
             default_jsx_export,
+            default_local_export,
             default_return_export,
             default_iterable_export,
             default_record_iterable_export,
             default_record_return_export,
             default_translator_return_export,
+            default_translator_return_forwards: self.default_translator_return_forwards,
         }
     }
 
@@ -6143,6 +6315,7 @@ impl SourceIndexCollector {
         IndexBindingEnvironment {
             helpers: self.helpers.clone(),
             jsx_components: self.jsx_components.clone(),
+            jsx_aliases: self.jsx_aliases.clone(),
             return_helpers: self.return_helpers.clone(),
             finite_constants: self.finite_constants.clone(),
             finite_iterables: self.finite_iterables.clone(),
@@ -6151,6 +6324,8 @@ impl SourceIndexCollector {
             finite_record_iterables: self.finite_record_iterables.clone(),
             finite_record_maps: self.finite_record_maps.clone(),
             return_record_helpers: self.return_record_helpers.clone(),
+            translator_return_helpers: self.translator_return_helpers.clone(),
+            translator_return_forwards: self.translator_return_forwards.clone(),
             enum_member_domains: self.enum_member_domains.clone(),
         }
     }
@@ -6158,6 +6333,7 @@ impl SourceIndexCollector {
     fn restore_binding_environment(&mut self, environment: IndexBindingEnvironment) {
         self.helpers = environment.helpers;
         self.jsx_components = environment.jsx_components;
+        self.jsx_aliases = environment.jsx_aliases;
         self.return_helpers = environment.return_helpers;
         self.finite_constants = environment.finite_constants;
         self.finite_iterables = environment.finite_iterables;
@@ -6166,6 +6342,8 @@ impl SourceIndexCollector {
         self.finite_record_iterables = environment.finite_record_iterables;
         self.finite_record_maps = environment.finite_record_maps;
         self.return_record_helpers = environment.return_record_helpers;
+        self.translator_return_helpers = environment.translator_return_helpers;
+        self.translator_return_forwards = environment.translator_return_forwards;
         self.enum_member_domains = environment.enum_member_domains;
     }
 
@@ -6409,10 +6587,13 @@ impl SourceIndexCollector {
                         &self.enum_member_domains,
                     );
                 self.default_record_return_summary = default_record_return_summary.clone();
-                self.default_translator_return_summary = function
+                let translator_return = function
                     .body
                     .as_ref()
-                    .and_then(|body| self.translator_return_summary_from_body(body));
+                    .map(|body| self.translator_return_summary_from_body(body))
+                    .unwrap_or_default();
+                self.default_translator_return_summary = translator_return.binding.clone();
+                self.default_translator_return_forwards = translator_return.forwards.clone();
                 if let Some(id) = &function.id {
                     self.record_helper(
                         id.name.as_str(),
@@ -6424,10 +6605,7 @@ impl SourceIndexCollector {
                     if let Some(summary) = default_record_return_summary {
                         self.record_return_record_helper(id.name.as_str(), summary);
                     }
-                    if let Some(binding) = self.default_translator_return_summary.clone() {
-                        self.translator_return_helpers
-                            .insert(id.name.to_string(), binding);
-                    }
+                    self.record_translator_return_summary(id.name.as_str(), translator_return);
                 }
             }
             ExportDefaultDeclarationKind::Identifier(identifier) => {
@@ -6465,8 +6643,9 @@ impl SourceIndexCollector {
                 if let Some(summary) = finite_record_return_summary_from_arrow(arrow) {
                     self.default_record_return_summary = Some(summary);
                 }
-                self.default_translator_return_summary =
-                    self.translator_return_summary_from_arrow(arrow);
+                let translator_return = self.translator_return_summary_from_arrow(arrow);
+                self.default_translator_return_summary = translator_return.binding;
+                self.default_translator_return_forwards = translator_return.forwards;
             }
             ExportDefaultDeclarationKind::FunctionExpression(function) => {
                 self.default_jsx_summary = function
@@ -6505,10 +6684,13 @@ impl SourceIndexCollector {
                 if let Some(summary) = finite_record_return_summary_from_function(function) {
                     self.default_record_return_summary = Some(summary);
                 }
-                self.default_translator_return_summary = function
+                let translator_return = function
                     .body
                     .as_ref()
-                    .and_then(|body| self.translator_return_summary_from_body(body));
+                    .map(|body| self.translator_return_summary_from_body(body))
+                    .unwrap_or_default();
+                self.default_translator_return_summary = translator_return.binding;
+                self.default_translator_return_forwards = translator_return.forwards;
             }
             ExportDefaultDeclarationKind::ArrayExpression(array) => {
                 self.default_iterable_summary = finite_iterable_from_array_elements(
@@ -6661,11 +6843,9 @@ impl<'a> Visit<'a> for SourceIndexCollector {
             ) {
                 self.record_return_record_helper(id.name.as_str(), summary);
             }
-            if let Some(body) = &function.body
-                && let Some(binding) = self.translator_return_summary_from_body(body)
-            {
-                self.translator_return_helpers
-                    .insert(id.name.to_string(), binding);
+            if let Some(body) = &function.body {
+                let summary = self.translator_return_summary_from_body(body);
+                self.record_translator_return_summary(id.name.as_str(), summary);
             }
         }
         walk::walk_function(self, function, flags);
@@ -6802,17 +6982,31 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                 }
                 let translator_return = match init.get_inner_expression() {
                     Expression::ArrowFunctionExpression(arrow) => {
-                        self.translator_return_summary_from_arrow(arrow)
+                        Some(self.translator_return_summary_from_arrow(arrow))
                     }
                     Expression::FunctionExpression(function) => function
                         .body
                         .as_ref()
-                        .and_then(|body| self.translator_return_summary_from_body(body)),
+                        .map(|body| self.translator_return_summary_from_body(body)),
+                    Expression::Identifier(identifier) => Some(TranslatorReturnSummary {
+                        binding: None,
+                        forwards: BTreeSet::from([identifier.name.to_string()]),
+                    }),
+                    Expression::ConditionalExpression(conditional) => {
+                        let forwards = [&conditional.consequent, &conditional.alternate]
+                            .into_iter()
+                            .filter_map(Expression::get_identifier_reference)
+                            .map(|identifier| identifier.name.to_string())
+                            .collect();
+                        Some(TranslatorReturnSummary {
+                            binding: None,
+                            forwards,
+                        })
+                    }
                     _ => None,
                 };
-                if let Some(binding) = translator_return {
-                    self.translator_return_helpers
-                        .insert(name.to_string(), binding);
+                if let Some(summary) = translator_return {
+                    self.record_translator_return_summary(name, summary);
                 }
             }
         }
@@ -8395,7 +8589,7 @@ impl SourceUsageCollector {
             };
             matches!(
                 (object.name.as_str(), member.static_property_name()),
-                ("Promise", Some("all" | "allSettled")) | ("Object", Some("values" | "entries"))
+                ("Promise", Some("all" | "allSettled")) | ("Object", Some("values"))
             )
         }) {
             return;
@@ -8689,6 +8883,13 @@ impl SourceUsageCollector {
     ) -> Option<TranslatorBinding> {
         let mut bindings = Vec::new();
         if let Some(array) = self.translator_argument_array_from_expression(expression) {
+            if !array.safe_layout {
+                return array
+                    .bindings
+                    .iter()
+                    .any(Option::is_some)
+                    .then(|| translator_binding_from_namespace_arg(NamespaceArg::Dynamic));
+            }
             bindings.extend(array.bindings.into_iter().flatten());
         }
         if let Expression::CallExpression(call) = expression.get_inner_expression()
@@ -9449,6 +9650,9 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         if let Some(name) = assignment_target_member_object_name(&expression.left) {
             if let Some(array) = self.translator_argument_arrays.get_mut(name) {
                 array.safe_layout = false;
+            }
+            if self.translator_object_bindings.remove(name).is_some() {
+                self.record_dynamic_usage(None, expression.span.start);
             }
             if let Some(binding) = self.translator_binding_from_expression(&expression.right) {
                 self.record_dynamic_key_for_binding(&binding, expression.span.start, None);
@@ -12143,6 +12347,147 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
 
         assert!(scan.used_ids.contains("common.title"));
         assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn nested_alias_and_translator_return_summaries_do_not_escape_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("main.tsx");
+        fs::write(
+            &main,
+            r#"
+            import {useTranslations} from 'next-intl';
+            const getFormatter = () => useTranslations('common');
+            const Card = ({format}) => format('card');
+            const Selected = Card;
+            function shadow() {
+              const getFormatter = () => useTranslations('settings');
+              const Other = ({format}) => format('other');
+              const Selected = Other;
+              return Selected;
+            }
+            const format = getFormatter();
+            format('title');
+            <Selected format={format} />;
+            "#,
+        )
+        .expect("write source");
+
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.used_ids.contains("common.card"));
+        assert!(!scan.used_ids.contains("settings.title"));
+        assert!(!scan.used_ids.contains("common.other"));
+    }
+
+    #[test]
+    fn jsx_aliases_resolve_through_exports_and_wrapper_forwards() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("main.tsx");
+        let components = dir.path().join("components.tsx");
+        fs::write(
+            &main,
+            r#"
+            import {useTranslations} from 'next-intl';
+            import {Alias, Wrapper} from './components';
+            const format = useTranslations('common');
+            <Alias format={format} />;
+            <Wrapper format={format} />;
+            "#,
+        )
+        .expect("write main source");
+        fs::write(
+            &components,
+            r#"
+            function Card({format}) {
+              return format('title');
+            }
+            export const Alias = Card;
+            export function Wrapper({format}) {
+              return <Alias format={format} />;
+            }
+            "#,
+        )
+        .expect("write components source");
+
+        let scan = collect_usage_from_files(dir.path(), &[main, components]).expect("scan project");
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn translator_return_aliases_and_wrappers_resolve_across_imports() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("main.ts");
+        let helper = dir.path().join("helper.ts");
+        fs::write(
+            &main,
+            r#"
+            import {getWrappedFormatter} from './helper';
+            const format = await getWrappedFormatter();
+            format('title');
+            "#,
+        )
+        .expect("write main source");
+        fs::write(
+            &helper,
+            r#"
+            import {getTranslations} from 'next-intl/server';
+            const getFormatter = () => getTranslations('common');
+            const alias = getFormatter;
+            export async function getWrappedFormatter() {
+              return await alias();
+            }
+            "#,
+        )
+        .expect("write helper source");
+
+        let scan = collect_usage_from_files(dir.path(), &[main, helper]).expect("scan project");
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn object_entries_with_translators_remains_conservatively_dynamic() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            Object.entries({common}).forEach(([, format]) => format('title'));
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+    }
+
+    #[test]
+    fn mutated_translator_aggregates_are_conservatively_dynamic_when_iterated() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const translators = [common];
+            translators[1] = settings;
+            translators.forEach(format => format('title'));
+            const byNamespace = {common};
+            byNamespace.settings = settings;
+            Object.values(byNamespace).forEach(format => format('description'));
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace.is_empty())
+        );
     }
 
     #[test]
