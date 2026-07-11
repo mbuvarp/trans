@@ -76,7 +76,7 @@ type FiniteObjectMaps = BTreeMap<String, FiniteObjectMap>;
 type FiniteRecords = Vec<FiniteRecord>;
 type FiniteRecordBindings = BTreeMap<String, FiniteRecords>;
 type FiniteRecordMaps = BTreeMap<String, FiniteRecords>;
-type TranslatorObjectBindings = BTreeMap<String, BTreeMap<String, TranslatorBinding>>;
+type TranslatorObjectBindings = BTreeMap<String, TranslatorObjectBinding>;
 type TypeDomains = BTreeMap<String, FiniteStrings>;
 type TypePropertyDomains = BTreeMap<String, BTreeMap<String, FiniteStrings>>;
 type PropertyDomains = BTreeMap<String, FiniteStrings>;
@@ -129,6 +129,28 @@ struct TranslatorBinding {
     namespace: Option<String>,
     namespaces: Option<FiniteStrings>,
     dynamic_namespace: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TranslatorObjectBinding {
+    bindings: BTreeMap<String, TranslatorBinding>,
+    unknown_properties: bool,
+    resolved_properties: BTreeSet<String>,
+}
+
+impl TranslatorObjectBinding {
+    fn aggregate_binding(self) -> Option<TranslatorBinding> {
+        merge_translator_binding_iter(self.bindings.into_values())
+    }
+
+    fn remove_property(&mut self, property: &str) {
+        self.bindings.retain(|path, _| {
+            path != property
+                && !path
+                    .strip_prefix(property)
+                    .is_some_and(|remaining| remaining.starts_with('.'))
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2588,6 +2610,10 @@ struct SourceUsageCollector {
 
 #[derive(Debug, Clone)]
 struct BindingEnvironment {
+    use_translations: BTreeSet<String>,
+    get_translations: BTreeSet<String>,
+    use_extracted: BTreeSet<String>,
+    get_extracted: BTreeSet<String>,
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
     finite_object_maps: FiniteObjectMaps,
@@ -8068,6 +8094,10 @@ impl SourceUsageCollector {
 
     fn binding_environment(&self) -> BindingEnvironment {
         BindingEnvironment {
+            use_translations: self.use_translations.clone(),
+            get_translations: self.get_translations.clone(),
+            use_extracted: self.use_extracted.clone(),
+            get_extracted: self.get_extracted.clone(),
             finite_constants: self.finite_constants.clone(),
             finite_iterables: self.finite_iterables.clone(),
             finite_object_maps: self.finite_object_maps.clone(),
@@ -8091,6 +8121,10 @@ impl SourceUsageCollector {
     }
 
     fn restore_binding_environment(&mut self, environment: BindingEnvironment) {
+        self.use_translations = environment.use_translations;
+        self.get_translations = environment.get_translations;
+        self.use_extracted = environment.use_extracted;
+        self.get_extracted = environment.get_extracted;
         self.finite_constants = environment.finite_constants;
         self.finite_iterables = environment.finite_iterables;
         self.finite_object_maps = environment.finite_object_maps;
@@ -8117,6 +8151,10 @@ impl SourceUsageCollector {
             self.shadowed_react_bindings.insert(name.to_string());
         }
         self.finite_constants.remove(name);
+        self.use_translations.remove(name);
+        self.get_translations.remove(name);
+        self.use_extracted.remove(name);
+        self.get_extracted.remove(name);
         self.finite_iterables.remove(name);
         self.finite_object_maps.remove(name);
         self.finite_record_constants.remove(name);
@@ -8897,12 +8935,22 @@ impl SourceUsageCollector {
                 candidates.push(binding.clone());
             }
             if let Some(bindings) = self.translator_object_bindings.get(name) {
-                candidates.extend(bindings.iter().filter_map(|(property, binding)| {
+                candidates.extend(bindings.bindings.iter().filter_map(|(property, binding)| {
                     property_names
                         .as_ref()
                         .is_none_or(|properties| properties.contains(property))
                         .then(|| binding.clone())
                 }));
+                if bindings.unknown_properties
+                    && !bindings.bindings.is_empty()
+                    && property_names.as_ref().is_none_or(|properties| {
+                        properties
+                            .iter()
+                            .any(|property| !bindings.resolved_properties.contains(property))
+                    })
+                {
+                    candidates.push(translator_binding_from_namespace_arg(NamespaceArg::Dynamic));
+                }
             }
             if let Some(array) = self.translator_argument_arrays.get(name) {
                 candidates.extend(array.bindings.iter().enumerate().filter_map(
@@ -8917,12 +8965,28 @@ impl SourceUsageCollector {
                 ));
             }
         } else if let Some(bindings) = self.translator_object_bindings_from_expression(object) {
-            candidates.extend(bindings.into_iter().filter_map(|(property, binding)| {
-                property_names
-                    .as_ref()
-                    .is_none_or(|properties| properties.contains(&property))
-                    .then_some(binding)
-            }));
+            let has_known_binding = !bindings.bindings.is_empty();
+            candidates.extend(
+                bindings
+                    .bindings
+                    .into_iter()
+                    .filter_map(|(property, binding)| {
+                        property_names
+                            .as_ref()
+                            .is_none_or(|properties| properties.contains(&property))
+                            .then_some(binding)
+                    }),
+            );
+            if bindings.unknown_properties
+                && has_known_binding
+                && property_names.as_ref().is_none_or(|properties| {
+                    properties
+                        .iter()
+                        .any(|property| !bindings.resolved_properties.contains(property))
+                })
+            {
+                candidates.push(translator_binding_from_namespace_arg(NamespaceArg::Dynamic));
+            }
         }
 
         if property_names.as_ref().is_some_and(|properties| {
@@ -8940,58 +9004,85 @@ impl SourceUsageCollector {
     fn translator_object_bindings_from_expression(
         &self,
         expression: &Expression<'_>,
-    ) -> Option<BTreeMap<String, TranslatorBinding>> {
+    ) -> Option<TranslatorObjectBinding> {
         match expression.get_inner_expression() {
             Expression::Identifier(identifier) => self
                 .translator_object_bindings
                 .get(identifier.name.as_str())
                 .cloned(),
             Expression::ObjectExpression(object) => {
-                let mut bindings = BTreeMap::new();
+                let mut result = TranslatorObjectBinding::default();
                 for property in &object.properties {
                     match property {
                         ObjectPropertyKind::ObjectProperty(property) => {
+                            let Some(name) = property.key.static_name() else {
+                                result.unknown_properties = true;
+                                result.resolved_properties.clear();
+                                continue;
+                            };
+                            let name = name.to_string();
+                            result.remove_property(&name);
+                            result.resolved_properties.insert(name.clone());
                             if property.kind != PropertyKind::Init || property.method {
                                 continue;
                             }
-                            let Some(name) = property.key.static_name() else {
-                                continue;
-                            };
                             if let Some(binding) =
                                 self.translator_binding_from_expression(&property.value)
                             {
-                                bindings.insert(name.to_string(), binding);
+                                result.bindings.insert(name, binding);
                             } else if let Some(nested) =
                                 self.translator_object_bindings_from_expression(&property.value)
                             {
-                                bindings.extend(
+                                result.bindings.extend(
                                     nested
+                                        .bindings
                                         .into_iter()
                                         .map(|(path, binding)| (format!("{name}.{path}"), binding)),
+                                );
+                                if nested.unknown_properties {
+                                    result.unknown_properties = true;
+                                }
+                                result.resolved_properties.extend(
+                                    nested
+                                        .resolved_properties
+                                        .into_iter()
+                                        .map(|path| format!("{name}.{path}")),
                                 );
                             }
                         }
                         ObjectPropertyKind::SpreadProperty(spread) => {
-                            if let Some(spread_bindings) =
+                            if let Some(spread_result) =
                                 self.translator_object_bindings_from_expression(&spread.argument)
                             {
-                                bindings.extend(spread_bindings);
+                                if spread_result.unknown_properties {
+                                    result.unknown_properties = true;
+                                    result.resolved_properties.clear();
+                                }
+                                for property in &spread_result.resolved_properties {
+                                    result.remove_property(property);
+                                    result.resolved_properties.insert(property.clone());
+                                }
+                                result.bindings.extend(spread_result.bindings);
+                            } else {
+                                result.unknown_properties = true;
+                                result.resolved_properties.clear();
                             }
                         }
                     }
                 }
-                Some(bindings).filter(|bindings| !bindings.is_empty())
+                Some(result)
             }
             Expression::ConditionalExpression(conditional) => {
                 let consequent =
                     self.translator_object_bindings_from_expression(&conditional.consequent);
                 let alternate =
                     self.translator_object_bindings_from_expression(&conditional.alternate);
-                let (mut bindings, unresolved) = match (consequent, alternate) {
+                let (mut result, unresolved) = match (consequent, alternate) {
                     (Some(consequent), Some(alternate)) => {
-                        let mut bindings = consequent;
-                        for (property, alternate_binding) in alternate {
-                            bindings
+                        let mut result = consequent;
+                        for (property, alternate_binding) in alternate.bindings {
+                            result
+                                .bindings
                                 .entry(property)
                                 .and_modify(|binding| {
                                     *binding =
@@ -8999,10 +9090,16 @@ impl SourceUsageCollector {
                                 })
                                 .or_insert(alternate_binding);
                         }
-                        (bindings, None)
+                        result.unknown_properties |= alternate.unknown_properties;
+                        result.resolved_properties = result
+                            .resolved_properties
+                            .intersection(&alternate.resolved_properties)
+                            .cloned()
+                            .collect();
+                        (result, None)
                     }
-                    (Some(bindings), None) => (bindings, Some(&conditional.alternate)),
-                    (None, Some(bindings)) => (bindings, Some(&conditional.consequent)),
+                    (Some(result), None) => (result, Some(&conditional.alternate)),
+                    (None, Some(result)) => (result, Some(&conditional.consequent)),
                     (None, None) => return None,
                 };
                 if unresolved.is_some_and(|expression| {
@@ -9011,12 +9108,10 @@ impl SourceUsageCollector {
                         Expression::ObjectExpression(object) if object.properties.is_empty()
                     )
                 }) {
-                    bindings.insert(
-                        String::new(),
-                        translator_binding_from_namespace_arg(NamespaceArg::Dynamic),
-                    );
+                    result.unknown_properties = true;
+                    result.resolved_properties.clear();
                 }
-                Some(bindings)
+                Some(result)
             }
             _ => None,
         }
@@ -9276,6 +9371,9 @@ impl SourceUsageCollector {
     }
 
     fn callee_is_potential_helper(&self, expression: &Expression<'_>) -> bool {
+        if self.is_unbound_translator_call(expression) {
+            return false;
+        }
         let Some(callee) = self.callee_identifier(expression) else {
             return expression.get_member_expr().is_some();
         };
@@ -9298,8 +9396,7 @@ impl SourceUsageCollector {
         self.translator_binding_from_expression(expression)
             .or_else(|| {
                 self.translator_object_bindings_from_expression(expression)
-                    .map(BTreeMap::into_values)
-                    .and_then(merge_translator_binding_iter)
+                    .and_then(TranslatorObjectBinding::aggregate_binding)
             })
     }
 
@@ -9394,22 +9491,30 @@ impl SourceUsageCollector {
                 let element = array.elements.get(index)?.as_expression()?;
                 self.translator_binding_from_expression_path(element, remaining)
             }
-            Expression::Identifier(identifier) => self
-                .translator_object_bindings
-                .get(identifier.name.as_str())
-                .and_then(|bindings| bindings.get(&path.join(".")))
-                .cloned()
-                .or_else(|| {
-                    if !remaining.is_empty() {
-                        return None;
+            Expression::Identifier(identifier) => {
+                let name = identifier.name.as_str();
+                let joined_path = path.join(".");
+                if let Some(bindings) = self.translator_object_bindings.get(name) {
+                    if let Some(binding) = bindings.bindings.get(&joined_path) {
+                        return Some(binding.clone());
                     }
-                    let index = property.parse::<usize>().ok()?;
-                    self.translator_argument_arrays
-                        .get(identifier.name.as_str())?
-                        .bindings
-                        .get(index)?
-                        .clone()
-                }),
+                    if bindings.unknown_properties
+                        && !bindings.bindings.is_empty()
+                        && !bindings.resolved_properties.contains(&joined_path)
+                    {
+                        return Some(translator_binding_from_namespace_arg(NamespaceArg::Dynamic));
+                    }
+                }
+                if !remaining.is_empty() {
+                    return None;
+                }
+                let index = property.parse::<usize>().ok()?;
+                self.translator_argument_arrays
+                    .get(name)?
+                    .bindings
+                    .get(index)?
+                    .clone()
+            }
             Expression::ConditionalExpression(conditional) => {
                 let consequent =
                     self.translator_binding_from_expression_path(&conditional.consequent, path);
@@ -9740,6 +9845,84 @@ impl SourceUsageCollector {
         }
     }
 
+    fn jsx_translator_prop_resolution(
+        &self,
+        opening: &JSXOpeningElement<'_>,
+        prop_name: &str,
+    ) -> (Option<TranslatorBinding>, bool, bool) {
+        let mut unknown_later_override = false;
+        for attribute in opening.attributes.iter().rev() {
+            match attribute {
+                JSXAttributeItem::Attribute(attribute) => {
+                    let JSXAttributeName::Identifier(name) = &attribute.name else {
+                        continue;
+                    };
+                    if name.name.as_str() != prop_name {
+                        continue;
+                    }
+                    let Some(JSXAttributeValue::ExpressionContainer(container)) = &attribute.value
+                    else {
+                        return (None, false, unknown_later_override);
+                    };
+                    if matches!(&container.expression, JSXExpression::EmptyExpression(_)) {
+                        return (None, false, unknown_later_override);
+                    }
+                    let expression = container.expression.to_expression();
+                    if self.is_tracked_unbound_translator_call(expression) {
+                        return (None, true, unknown_later_override);
+                    }
+                    let binding = self.translator_binding_from_expression(expression);
+                    return (
+                        binding.map(|binding| {
+                            if unknown_later_override {
+                                merge_translator_bindings(
+                                    &binding,
+                                    &translator_binding_from_namespace_arg(NamespaceArg::Dynamic),
+                                )
+                            } else {
+                                binding
+                            }
+                        }),
+                        false,
+                        unknown_later_override,
+                    );
+                }
+                JSXAttributeItem::SpreadAttribute(spread) => {
+                    let Some(bindings) =
+                        self.translator_object_bindings_from_expression(&spread.argument)
+                    else {
+                        unknown_later_override = true;
+                        continue;
+                    };
+                    if let Some(binding) = bindings.bindings.get(prop_name).cloned() {
+                        let unknown = unknown_later_override
+                            || (bindings.unknown_properties
+                                && !bindings.resolved_properties.contains(prop_name));
+                        return (
+                            Some(if unknown {
+                                merge_translator_bindings(
+                                    &binding,
+                                    &translator_binding_from_namespace_arg(NamespaceArg::Dynamic),
+                                )
+                            } else {
+                                binding
+                            }),
+                            false,
+                            false,
+                        );
+                    }
+                    if bindings.resolved_properties.contains(prop_name) {
+                        return (None, false, unknown_later_override);
+                    }
+                    if bindings.unknown_properties {
+                        unknown_later_override = true;
+                    }
+                }
+            }
+        }
+        (None, false, unknown_later_override)
+    }
+
     fn apply_jsx_component_summary(&mut self, opening: &JSXOpeningElement<'_>) {
         let summary = match &opening.name {
             JSXElementName::Identifier(identifier) => {
@@ -9768,50 +9951,18 @@ impl SourceUsageCollector {
             return;
         };
         for usage in summary.usages {
-            let mut unknown_spread = false;
-            let mut unbound_translator_prop = false;
-            let binding =
-                merge_translator_binding_iter(opening.attributes.iter().filter_map(|attribute| {
-                    match attribute {
-                        JSXAttributeItem::Attribute(attribute) => {
-                            let JSXAttributeName::Identifier(name) = &attribute.name else {
-                                return None;
-                            };
-                            if name.name.as_str() != usage.prop_name {
-                                return None;
-                            }
-                            let Some(JSXAttributeValue::ExpressionContainer(container)) =
-                                &attribute.value
-                            else {
-                                return None;
-                            };
-                            if matches!(&container.expression, JSXExpression::EmptyExpression(_)) {
-                                return None;
-                            }
-                            let expression = container.expression.to_expression();
-                            if self.is_tracked_unbound_translator_call(expression) {
-                                unbound_translator_prop = true;
-                            }
-                            self.translator_binding_from_expression(expression)
-                        }
-                        JSXAttributeItem::SpreadAttribute(spread) => {
-                            let Some(bindings) =
-                                self.translator_object_bindings_from_expression(&spread.argument)
-                            else {
-                                unknown_spread = true;
-                                return None;
-                            };
-                            bindings.get(&usage.prop_name).cloned()
-                        }
-                    }
-                }));
-            if unbound_translator_prop && let Some(keys) = &usage.keys {
+            let (binding, unbound_translator_prop, unknown_prop) =
+                self.jsx_translator_prop_resolution(opening, &usage.prop_name);
+            if unbound_translator_prop
+                && !unknown_prop
+                && let Some(keys) = &usage.keys
+            {
                 self.scan.used_key_suffixes.extend(keys.iter().cloned());
                 continue;
             }
-            if (unknown_spread && usage.keys.is_some())
-                || (binding.is_none() && usage.translator_like)
-            {
+            let unknown_translator_prop = unknown_prop
+                && (binding.is_some() || unbound_translator_prop || usage.keys.is_some());
+            if unknown_translator_prop || (binding.is_none() && usage.translator_like) {
                 if let Some(query) = usage.query {
                     self.scan.dynamic_usages.push(DynamicUsage {
                         namespace: String::new(),
@@ -9876,7 +10027,7 @@ impl SourceUsageCollector {
                 JSXAttributeItem::SpreadAttribute(spread) => self
                     .translator_object_bindings_from_expression(&spread.argument)
                     .into_iter()
-                    .flat_map(BTreeMap::into_values)
+                    .filter_map(TranslatorObjectBinding::aggregate_binding)
                     .collect(),
             });
         if let Some(binding) = merge_translator_binding_iter(bindings) {
@@ -9977,7 +10128,9 @@ impl SourceUsageCollector {
             if let Some(object_bindings) =
                 self.translator_object_bindings_from_expression(expression)
             {
-                bindings.extend(object_bindings.into_values());
+                if let Some(binding) = object_bindings.aggregate_binding() {
+                    bindings.push(binding);
+                }
             }
             if let Some(array) = self.translator_argument_array_from_expression(expression) {
                 bindings.extend(array.bindings.into_iter().flatten());
@@ -10268,7 +10421,9 @@ impl SourceUsageCollector {
             && let Some(argument) = call.arguments.first().and_then(Argument::as_expression)
             && let Some(object_bindings) = self.translator_object_bindings_from_expression(argument)
         {
-            bindings.extend(object_bindings.into_values());
+            if let Some(binding) = object_bindings.aggregate_binding() {
+                bindings.push(binding);
+            }
         }
         merge_translator_binding_iter(bindings)
     }
@@ -10735,7 +10890,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         }
         self.track_destructured_translator_bindings(&declarator.id);
         if let Some(bindings) = translator_object_bindings {
-            self.bind_pattern_translator_properties(&declarator.id, &bindings);
+            self.bind_pattern_translator_properties(&declarator.id, &bindings.bindings);
             if let Some(name) = binding_identifier_name(&declarator.id) {
                 self.translator_object_bindings
                     .insert(name.to_string(), bindings);
@@ -11043,7 +11198,11 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             if let Some(array) = self.translator_argument_arrays.get_mut(name) {
                 array.safe_layout = false;
             }
-            if self.translator_object_bindings.remove(name).is_some() {
+            if self
+                .translator_object_bindings
+                .remove(name)
+                .is_some_and(|bindings| !bindings.bindings.is_empty())
+            {
                 self.record_dynamic_usage(None, expression.span.start);
             }
             if let Some(binding) = self.translator_binding_from_expression(&expression.right) {
@@ -13846,6 +14005,24 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
     }
 
     #[test]
+    fn shadowed_translation_factory_imports_do_not_escape_scope() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            function RuntimePage(useTranslations) {
+              const runtime = useTranslations(runtimeNamespace);
+              runtime(runtimeKey);
+            }
+            const real = useTranslations('common');
+            real('title');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
     fn commonjs_translation_factory_aliases_create_bindings() {
         let scan = scan(
             r#"
@@ -13875,6 +14052,57 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
                 .iter()
                 .any(|usage| usage.namespace == "common")
         );
+    }
+
+    #[test]
+    fn unknown_object_spreads_protect_aggregate_translator_namespaces() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const bundle = {format: common, ...runtimeProps};
+            runtimeConsumer(bundle);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+        assert!(
+            !scan
+                .dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace.is_empty())
+        );
+    }
+
+    #[test]
+    fn explicit_members_after_unknown_spreads_remain_exact() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const bundle = {...runtimeProps, format: common};
+            bundle.format('title');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn mutating_non_translator_objects_with_unknown_spreads_is_not_translation_usage() {
+        let scan = scan(
+            r#"
+            const metadata = {...runtimeMetadata};
+            metadata[runtimeKey] = JSON.stringify(runtimeValue);
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.is_empty());
     }
 
     #[test]
@@ -14632,6 +14860,84 @@ Object.entries(groups).map(([resource]) => t(`resources.${resource}`));
         let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
 
         assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn unknown_later_jsx_spreads_protect_dynamic_translator_namespaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("main.tsx");
+        fs::write(
+            &main,
+            r#"
+            import {useTranslations} from 'next-intl';
+            function Card({format, messageKey}) {
+              return format(messageKey);
+            }
+            const common = useTranslations('common');
+            <Card format={common} {...runtimeProps} messageKey={runtimeKey} />;
+            "#,
+        )
+        .expect("write source");
+
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace_unknown)
+        );
+    }
+
+    #[test]
+    fn explicit_jsx_props_after_unknown_spreads_keep_known_namespaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("main.tsx");
+        fs::write(
+            &main,
+            r#"
+            import {useTranslations} from 'next-intl';
+            function Card({format, messageKey}) {
+              return format(messageKey);
+            }
+            const common = useTranslations('common');
+            <Card {...runtimeProps} format={common} messageKey={runtimeKey} />;
+            "#,
+        )
+        .expect("write source");
+
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+        assert!(
+            !scan
+                .dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace_unknown)
+        );
+    }
+
+    #[test]
+    fn unknown_jsx_prop_bags_without_translator_evidence_are_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("main.tsx");
+        fs::write(
+            &main,
+            r#"
+            function Avatar({children, ...props}) {
+              return <RuntimeAvatar {...props}>{children}</RuntimeAvatar>;
+            }
+            <Avatar {...runtimeProps} />;
+            "#,
+        )
+        .expect("write source");
+
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+
         assert!(scan.dynamic_usages.is_empty());
     }
 
