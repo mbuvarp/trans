@@ -55,6 +55,7 @@ const ARRAY_MUTATING_METHODS: &[&str] = &[
     "unshift",
 ];
 const ARRAY_CONTENT_WRITING_METHODS: &[&str] = &["fill", "push", "splice", "unshift"];
+const ARRAY_RECEIVER_RETURNING_METHODS: &[&str] = &["copyWithin", "fill", "reverse", "sort"];
 const MAX_FINITE_STRINGS: usize = 128;
 
 fn is_translator_like_name(name: &str) -> bool {
@@ -9881,11 +9882,53 @@ impl SourceUsageCollector {
     ) -> Option<TranslatorArgumentArray> {
         let member = call.callee.get_member_expr()?;
         let method = member.static_property_name()?;
+        if method == "from" && is_identifier_expression(member.object(), "Array") {
+            let source = call.arguments.first()?.as_expression()?;
+            let mut array = self.translator_argument_array_from_expression(source)?;
+            if call.arguments.len() > 1 {
+                let input_binding =
+                    merge_translator_binding_iter(array.bindings.iter().flatten().cloned());
+                if let Some(binding) = call.arguments.get(1).and_then(|callback| {
+                    self.translator_binding_from_array_callback(callback, input_binding.as_ref())
+                }) {
+                    array.bindings.push(Some(binding));
+                }
+                array.safe_layout = false;
+                array.unknown_contents = true;
+            }
+            return Some(array);
+        }
         let mut array = self.translator_argument_array_from_expression(member.object())?;
         match method.as_ref() {
             "slice" if call.arguments.is_empty() => Some(array),
             "slice" | "filter" | "splice" => {
                 array.safe_layout = false;
+                Some(array)
+            }
+            "map" | "flatMap" => {
+                let input_binding =
+                    merge_translator_binding_iter(array.bindings.iter().flatten().cloned());
+                if let Some(binding) = call.arguments.first().and_then(|callback| {
+                    self.translator_binding_from_array_callback(callback, input_binding.as_ref())
+                }) {
+                    array.bindings.push(Some(binding));
+                }
+                array.safe_layout = false;
+                array.unknown_contents = true;
+                Some(array)
+            }
+            method if ARRAY_RECEIVER_RETURNING_METHODS.contains(&method) => {
+                array.safe_layout = false;
+                if method == "fill" {
+                    if let Some(binding) = call
+                        .arguments
+                        .first()
+                        .and_then(|argument| self.translator_binding_from_argument(argument))
+                    {
+                        array.bindings.push(Some(binding));
+                    }
+                    array.unknown_contents = true;
+                }
                 Some(array)
             }
             "concat" => {
@@ -9909,6 +9952,58 @@ impl SourceUsageCollector {
                 Some(array)
             }
             _ => None,
+        }
+    }
+
+    fn translator_binding_from_array_callback(
+        &self,
+        callback: &Argument<'_>,
+        input_binding: Option<&TranslatorBinding>,
+    ) -> Option<TranslatorBinding> {
+        let Argument::ArrowFunctionExpression(arrow) = callback else {
+            return None;
+        };
+        if !arrow.expression {
+            return None;
+        }
+        let Statement::ExpressionStatement(statement) = arrow.body.statements.first()? else {
+            return None;
+        };
+        let param = arrow
+            .params
+            .items
+            .first()
+            .and_then(|param| binding_identifier_name(&param.pattern));
+        self.translator_binding_from_callback_result(&statement.expression, param, input_binding)
+    }
+
+    fn translator_binding_from_callback_result(
+        &self,
+        expression: &Expression<'_>,
+        param: Option<&str>,
+        input_binding: Option<&TranslatorBinding>,
+    ) -> Option<TranslatorBinding> {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) if param == Some(identifier.name.as_str()) => {
+                input_binding.cloned()
+            }
+            Expression::ArrayExpression(array) => {
+                merge_translator_binding_iter(array.elements.iter().filter_map(|element| {
+                    element.as_expression().and_then(|expression| {
+                        self.translator_binding_from_callback_result(
+                            expression,
+                            param,
+                            input_binding,
+                        )
+                    })
+                }))
+            }
+            _ => self
+                .translator_binding_from_expression(expression)
+                .or_else(|| {
+                    self.translator_object_bindings_from_expression(expression)
+                        .and_then(TranslatorObjectBinding::aggregate_binding)
+                }),
         }
     }
 
@@ -9974,6 +10069,19 @@ impl SourceUsageCollector {
                     }
                 }
             },
+            Expression::CallExpression(call) => {
+                let Some(member) = call.callee.get_member_expr() else {
+                    return BTreeSet::new();
+                };
+                let Some(method) = member.static_property_name() else {
+                    return BTreeSet::new();
+                };
+                if ARRAY_RECEIVER_RETURNING_METHODS.contains(&method.as_ref()) {
+                    self.translator_argument_array_alias_sources(member.object())
+                } else {
+                    BTreeSet::new()
+                }
+            }
             _ => BTreeSet::new(),
         }
     }
@@ -12371,9 +12479,8 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         if let Some(member) = call.callee.get_member_expr()
             && let Some(method) = member.static_property_name()
             && ARRAY_MUTATING_METHODS.contains(&method)
-            && let Some(identifier) = member.object().get_identifier_reference()
         {
-            let name = identifier.name.as_str();
+            let sources = self.translator_argument_array_alias_sources(member.object());
             if ARRAY_CONTENT_WRITING_METHODS.contains(&method) {
                 let offset = match method.as_ref() {
                     "fill" => 0,
@@ -12381,7 +12488,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     "push" | "unshift" => 0,
                     _ => call.arguments.len(),
                 };
-                if let Some(binding) = merge_translator_binding_iter(
+                let binding = merge_translator_binding_iter(
                     call.arguments
                         .iter()
                         .skip(offset)
@@ -12395,12 +12502,17 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                                 }),
                             _ => self.translator_binding_from_argument(argument),
                         }),
-                ) {
-                    self.add_translator_array_content_binding(name, &binding);
+                );
+                for source in &sources {
+                    if let Some(binding) = &binding {
+                        self.add_translator_array_content_binding(source, binding);
+                    }
+                    self.mark_translator_array_contents_unknown(source);
                 }
-                self.mark_translator_array_contents_unknown(name);
             } else {
-                self.mark_translator_array_layout_unsafe(name);
+                for source in sources {
+                    self.mark_translator_array_layout_unsafe(&source);
+                }
             }
         }
 
@@ -13570,6 +13682,102 @@ mod tests {
         assert!(scan.used_ids.contains("settings.filtered"));
         assert!(scan.used_ids.contains("common.removed"));
         assert!(scan.used_ids.contains("settings.removed"));
+    }
+
+    #[test]
+    fn receiver_returning_mutators_preserve_array_aliases() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const translators = [common, settings];
+            const reversed = translators.reverse();
+            const filled = [runtimeCallback].fill(common);
+            reversed[0]('reversed');
+            filled[0]('filled');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.reversed"));
+        assert!(scan.used_ids.contains("settings.reversed"));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 9));
+    }
+
+    #[test]
+    fn transformed_and_copied_arrays_preserve_translator_evidence() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const source = [common, settings];
+            const mapped = source.map(format => format);
+            const flattened = source.flatMap(format => [format]);
+            const copied = Array.from(source);
+            const remapped = Array.from(source, format => format);
+            const values = ['one'];
+            const generated = values.map(() => common);
+            const generatedFlat = values.flatMap(() => [settings]);
+            const generatedFrom = Array.from(values, () => common);
+            mapped[0]('mapped');
+            flattened[0]('flattened');
+            copied[0]('copied');
+            remapped[0]('remapped');
+            generated[0]('generated');
+            generatedFlat[0]('generated-flat');
+            generatedFrom[0]('generated-from');
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 14));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 15));
+        assert!(scan.used_ids.contains("common.copied"));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 17));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 18));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 19));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 20));
+    }
+
+    #[test]
+    fn mutations_invalidate_conditional_and_logical_receivers() {
+        let conditional = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const settings = useTranslations('settings');
+            const commonArray = [common];
+            const settingsArray = [settings];
+            (enabled ? commonArray : settingsArray).fill(runtimeTranslator);
+            commonArray[0]('common');
+            settingsArray[0]('settings');
+            "#,
+        );
+
+        assert!(
+            conditional
+                .dynamic_usages
+                .iter()
+                .any(|usage| usage.line == 8)
+        );
+        assert!(
+            conditional
+                .dynamic_usages
+                .iter()
+                .any(|usage| usage.line == 9)
+        );
+
+        let logical = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const common = useTranslations('common');
+            const commonArray = [common];
+            (enabled && commonArray).fill(runtimeTranslator);
+            commonArray[0]('logical');
+            "#,
+        );
+
+        assert!(logical.dynamic_usages.iter().any(|usage| usage.line == 6));
     }
 
     #[test]
