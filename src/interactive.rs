@@ -387,7 +387,7 @@ pub fn run_interactive(
         println!("{existing}");
         let selection = Select::new()
             .with_prompt(">")
-            .items(&["Update", "Delete", "Cancel"])
+            .items(["Update", "Delete", "Cancel"])
             .default(0)
             .interact()?;
         print_spacer();
@@ -922,10 +922,10 @@ fn should_skip_dir(name: &str) -> bool {
 fn prompt_language_list(default: Option<&[String]>) -> Result<Vec<String>> {
     loop {
         let mut input_prompt = Input::<String>::new().with_prompt(">");
-        if let Some(default) = default {
-            if !default.is_empty() {
-                input_prompt = input_prompt.default(default.join(","));
-            }
+        if let Some(default) = default
+            && !default.is_empty()
+        {
+            input_prompt = input_prompt.default(default.join(","));
         }
         let input = input_prompt.interact_text()?;
         let values: Vec<String> = input
@@ -951,7 +951,7 @@ fn prompt_default_export_format(current: ExportFormat) -> Result<ExportFormat> {
     };
     let selection = Select::new()
         .with_prompt(">")
-        .items(&choices)
+        .items(choices)
         .default(default_index)
         .interact()?;
     print_spacer();
@@ -973,7 +973,7 @@ fn prompt_mode(current: ConfigMode) -> Result<ConfigMode> {
     };
     let selection = Select::new()
         .with_prompt(">")
-        .items(&choices)
+        .items(choices)
         .default(default_index)
         .interact()?;
     print_spacer();
@@ -1191,10 +1191,11 @@ fn gather_reference_translations(
             let translations = load_language_translations(root, config, language)?;
             translations.get(message_id).cloned()
         };
-        if let Some(value) = value {
-            if !value.trim().is_empty() && value != config.default_untranslated_value {
-                references.push((language.clone(), value));
-            }
+        if let Some(value) = value
+            && !value.trim().is_empty()
+            && value != config.default_untranslated_value
+        {
+            references.push((language.clone(), value));
         }
     }
     Ok(references)

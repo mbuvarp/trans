@@ -194,13 +194,12 @@ pub fn import_translations_with_ai(
             if value == config.default_untranslated_value {
                 continue;
             }
-            if let Some(translations) = translations_by_language.get_mut(language) {
-                if let Some(existing) = translations.get_mut(&row.id) {
-                    if existing != &value {
-                        *existing = value;
-                        languages_to_save.insert(language.clone());
-                    }
-                }
+            if let Some(translations) = translations_by_language.get_mut(language)
+                && let Some(existing) = translations.get_mut(&row.id)
+                && existing != &value
+            {
+                *existing = value;
+                languages_to_save.insert(language.clone());
             }
         }
     }
@@ -354,7 +353,7 @@ fn read_xlsx(path: &Path, trim: bool) -> Result<ImportData> {
     {
         header_cells.pop();
     }
-    let (languages, header_len) = parse_header(header_cells.into_iter())?;
+    let (languages, header_len) = parse_header(header_cells)?;
 
     let mut rows = Vec::new();
     let mut duplicates = HashSet::new();
@@ -489,7 +488,7 @@ fn prompt_extra_languages(languages: &[String]) -> Result<ExtraLangsStrategy> {
     ];
     let selection = Select::new()
         .with_prompt(">")
-        .items(&options)
+        .items(options)
         .default(0)
         .interact()?;
     println!();

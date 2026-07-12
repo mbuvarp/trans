@@ -640,11 +640,9 @@ fn format_terminal_link(display: &str, url: &str) -> String {
 }
 
 fn percentage(part: usize, total: usize) -> usize {
-    if total == 0 {
-        0
-    } else {
-        (part * 100 + total / 2) / total
-    }
+    (part * 100 + total / 2)
+        .checked_div(total)
+        .unwrap_or_default()
 }
 
 fn handle_sync(root: &Path, config: &TransConfig) -> Result<()> {
@@ -735,10 +733,10 @@ fn handle_migrate(
     migrate_language_files_to_dir(root, &config, target_mode, out_dir_ref)?;
 
     config.mode = target_mode;
-    if let Some(path) = out_dir_abs {
-        if !no_update_language_files_path {
-            config.language_files_path = normalize_config_path(root, &path);
-        }
+    if let Some(path) = out_dir_abs
+        && !no_update_language_files_path
+    {
+        config.language_files_path = normalize_config_path(root, &path);
     }
     config.save_to_root(root)?;
 
