@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -18,8 +18,8 @@ use oxc_ast::ast::{
     ImportDeclarationSpecifier, ImportExpression, JSXAttributeItem, JSXAttributeName,
     JSXAttributeValue, JSXChild, JSXElement, JSXElementName, JSXExpression,
     JSXMemberExpressionObject, JSXOpeningElement, MemberExpression, ModuleExportName,
-    NewExpression, ObjectAssignmentTarget, ObjectExpression, ObjectPropertyKind, PropertyKey,
-    PropertyKind, ReturnStatement, SimpleAssignmentTarget, SpreadElement, Statement,
+    NewExpression, ObjectAssignmentTarget, ObjectExpression, ObjectPropertyKind, Program,
+    PropertyKey, PropertyKind, ReturnStatement, SimpleAssignmentTarget, SpreadElement, Statement,
     StaticMemberExpression, SwitchStatement, TSInterfaceDeclaration, TSLiteral, TSSignature,
     TSType, TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator, TSTypeQueryExprName,
     TaggedTemplateExpression, TemplateLiteral, ThrowStatement, UnaryExpression, UpdateExpression,
@@ -34,6 +34,7 @@ use oxc_syntax::{
     operator::{AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator},
     scope::{ScopeFlags, ScopeId},
 };
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -885,9 +886,26 @@ function finiteFromExpression(ts, checker, node) {
     { noEmit: true, skipLibCheck: true },
     configPath,
   );
+  const path = require('path');
+  const queryFiles = new Set(input.queries.map(query => path.resolve(query.file)));
+  const rootNames = parsed.fileNames.filter(file => {
+    const resolved = path.resolve(file);
+    if (queryFiles.has(resolved) || /\.d\.[cm]?ts$/i.test(file)) return true;
+    const source = ts.sys.readFile(file);
+    if (source === undefined) return false;
+    if (/\bdeclare\s+(?:global|module)\b/.test(source)) return true;
+    const sourceFile = ts.createSourceFile(
+      file,
+      source,
+      ts.ScriptTarget.Latest,
+      false,
+    );
+    return !ts.isExternalModule(sourceFile);
+  });
   const program = ts.createProgram({
-    rootNames: parsed.fileNames,
+    rootNames,
     options: parsed.options,
+    projectReferences: parsed.projectReferences,
   });
   const checker = program.getTypeChecker();
   const results = [];
@@ -1210,23 +1228,36 @@ fn file_url_path(path: &Path) -> String {
         .collect()
 }
 
+fn merge_usage_scan(combined: &mut UsageScan, scan: UsageScan) {
+    combined.used_ids.extend(scan.used_ids);
+    combined.used_key_suffixes.extend(scan.used_key_suffixes);
+    combined.dynamic_usages.extend(scan.dynamic_usages);
+    combined.extraction_usages.extend(scan.extraction_usages);
+}
+
+fn finish_usage_scan(mut scan: UsageScan) -> UsageScan {
+    scan.dynamic_usages.sort();
+    scan.dynamic_usages.dedup();
+    scan.extraction_usages.sort();
+    scan.extraction_usages.dedup();
+    scan
+}
+
 fn collect_usage_from_files(root: &Path, paths: &[PathBuf]) -> Result<UsageScan> {
     let project = Arc::new(ProjectIndex::build(root, paths)?);
+    let scans = project
+        .files
+        .par_iter()
+        .map(|(path, _)| {
+            let source = fs::read_to_string(path)?;
+            collect_usage_from_source_with_project(&source, path, Some(Arc::clone(&project)))
+        })
+        .collect::<Vec<_>>();
     let mut combined = UsageScan::default();
-    for path in project.files.keys() {
-        let source = fs::read_to_string(path)?;
-        let scan =
-            collect_usage_from_source_with_project(&source, path, Some(Arc::clone(&project)))?;
-        combined.used_ids.extend(scan.used_ids);
-        combined.used_key_suffixes.extend(scan.used_key_suffixes);
-        combined.dynamic_usages.extend(scan.dynamic_usages);
-        combined.extraction_usages.extend(scan.extraction_usages);
+    for scan in scans {
+        merge_usage_scan(&mut combined, scan?);
     }
-    combined.dynamic_usages.sort();
-    combined.dynamic_usages.dedup();
-    combined.extraction_usages.sort();
-    combined.extraction_usages.dedup();
-    Ok(combined)
+    Ok(finish_usage_scan(combined))
 }
 
 fn apply_ts_checker_fallback(root: &Path, scan: &mut UsageScan) -> std::result::Result<(), String> {
@@ -1359,11 +1390,20 @@ fn collect_usage_from_source_with_project(
         )));
     }
 
+    collect_usage_from_program(source, path, &ret.program, project)
+}
+
+fn collect_usage_from_program(
+    source: &str,
+    path: &Path,
+    program: &Program<'_>,
+    project: Option<Arc<ProjectIndex>>,
+) -> Result<UsageScan> {
     let project = match project {
         Some(project) => Some(project),
         None => {
             let mut index_collector = SourceIndexCollector::new(path, source);
-            index_collector.visit_program(&ret.program);
+            index_collector.visit_program(program);
             let mut files = BTreeMap::new();
             files.insert(path.to_path_buf(), index_collector.finish());
             let mut source_files = BTreeSet::new();
@@ -1378,7 +1418,7 @@ fn collect_usage_from_source_with_project(
     };
 
     let mut collector = SourceUsageCollector::new(path, source, project);
-    collector.visit_program(&ret.program);
+    collector.visit_program(program);
     Ok(collector.finish())
 }
 
@@ -1497,45 +1537,57 @@ impl ProjectIndex {
             aliases,
             packages,
         };
-        let mut queue: VecDeque<PathBuf> = paths.iter().map(|path| normalize_path(path)).collect();
+        let mut queue = paths
+            .iter()
+            .map(|path| normalize_path(path))
+            .collect::<Vec<_>>();
+        while !queue.is_empty() {
+            queue.sort();
+            queue.dedup();
+            let batch = std::mem::take(&mut queue)
+                .into_iter()
+                .filter(|path| !project.files.contains_key(path) && is_allowed_source_file(path))
+                .collect::<Vec<_>>();
+            let indexes = batch
+                .par_iter()
+                .map(|path| {
+                    let source = fs::read_to_string(path)?;
+                    let allocator = Allocator::default();
+                    let source_type = SourceType::from_path(path).unwrap_or_default();
+                    let ret = Parser::new(&allocator, &source, source_type).parse();
+                    if !ret.errors.is_empty() {
+                        return Err(TransError::InvalidInput(format!(
+                            "failed to parse source file '{}' ({} parser error(s))",
+                            path.display(),
+                            ret.errors.len()
+                        )));
+                    }
+                    let mut collector = SourceIndexCollector::new(path, &source);
+                    collector.visit_program(&ret.program);
+                    Ok(collector.finish())
+                })
+                .collect::<Vec<Result<SourceFileIndex>>>();
 
-        while let Some(path) = queue.pop_front() {
-            let path = normalize_path(&path);
-            if project.files.contains_key(&path) || !is_allowed_source_file(&path) {
-                continue;
-            }
+            for (path, index) in batch.into_iter().zip(indexes) {
+                let index = index?;
+                let dependency_sources =
+                    index.dependency_sources.iter().cloned().collect::<Vec<_>>();
+                project.source_files.insert(path.clone());
+                project.files.insert(path.clone(), index);
 
-            let source = fs::read_to_string(&path)?;
-            let allocator = Allocator::default();
-            let source_type = SourceType::from_path(&path).unwrap_or_default();
-            let ret = Parser::new(&allocator, &source, source_type).parse();
-            if !ret.errors.is_empty() {
-                return Err(TransError::InvalidInput(format!(
-                    "failed to parse source file '{}' ({} parser error(s))",
-                    path.display(),
-                    ret.errors.len()
-                )));
-            }
-
-            let mut collector = SourceIndexCollector::new(&path, &source);
-            collector.visit_program(&ret.program);
-            let index = collector.finish();
-            let dependency_sources: Vec<_> = index.dependency_sources.iter().cloned().collect();
-            project.source_files.insert(path.clone());
-            project.files.insert(path.clone(), index);
-
-            for source in dependency_sources {
-                let Some(dependency) = project.resolve_module(&path, &source) else {
-                    continue;
-                };
-                if project.files.contains_key(&dependency)
-                    || project.source_files.contains(&dependency)
-                    || !is_allowed_source_file(&dependency)
-                {
-                    continue;
+                for source in dependency_sources {
+                    let Some(dependency) = project.resolve_module(&path, &source) else {
+                        continue;
+                    };
+                    if project.files.contains_key(&dependency)
+                        || project.source_files.contains(&dependency)
+                        || !is_allowed_source_file(&dependency)
+                    {
+                        continue;
+                    }
+                    project.source_files.insert(dependency.clone());
+                    queue.push(dependency);
                 }
-                project.source_files.insert(dependency.clone());
-                queue.push_back(dependency);
             }
         }
 
@@ -8122,6 +8174,13 @@ impl ReactWrapperReturnCollector {
                     .entry(changed.clone())
                     .or_default()
                     .insert(changed_depth);
+                if let Some(scope_ids) = self
+                    .finite_bound_capture_candidate_depths
+                    .get_mut(&dependent)
+                    .and_then(|candidates| candidates.get_mut(&changed))
+                {
+                    scope_ids.remove(&changed_depth);
+                }
                 let (_, resolved_names, _, _, edge_provenance) =
                     self.finite_bound_capture_value_state(&captures);
                 let binding = (changed.clone(), changed_depth);
@@ -8340,16 +8399,662 @@ impl ReactWrapperReturnCollector {
         collector.names
     }
 
-    fn finite_bound_binding_capture_names(pattern: &BindingPattern<'_>) -> BTreeSet<String> {
-        let mut collector = FiniteBoundCaptureNameCollector::default();
-        collector.visit_binding_pattern(pattern);
-        collector.names
+    fn finite_bound_capture_names_from_expression_path(
+        &self,
+        expression: &Expression<'_>,
+        path: &[String],
+    ) -> Option<BTreeSet<String>> {
+        if path.is_empty() {
+            return Some(
+                self.finite_bound_capture_names_from_expression(expression)
+                    .unwrap_or_default(),
+            );
+        }
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => {
+                let binding = self.finite_bound_capture_binding(identifier.name.as_str());
+                self.finite_bound_capture_member_state(&binding, &path.join("."))
+                    .map(|(dependencies, _)| dependencies.into_keys().collect())
+            }
+            Expression::ObjectExpression(object) => {
+                let property_name = &path[0];
+                let mut resolved = None;
+                for property in &object.properties {
+                    match property {
+                        ObjectPropertyKind::ObjectProperty(property)
+                            if !property.computed
+                                && property.key.static_name().as_deref()
+                                    == Some(property_name.as_str()) =>
+                        {
+                            resolved = self.finite_bound_capture_names_from_expression_path(
+                                &property.value,
+                                &path[1..],
+                            );
+                        }
+                        ObjectPropertyKind::SpreadProperty(_) => resolved = None,
+                        _ => {}
+                    }
+                }
+                resolved
+            }
+            Expression::ArrayExpression(array) => {
+                let index = path[0].parse::<usize>().ok()?;
+                let expression = array.elements.get(index)?.as_expression()?;
+                self.finite_bound_capture_names_from_expression_path(expression, &path[1..])
+            }
+            Expression::ConditionalExpression(conditional) => {
+                let mut captures = self.finite_bound_capture_names_from_expression_path(
+                    &conditional.consequent,
+                    path,
+                )?;
+                captures.extend(self.finite_bound_capture_names_from_expression_path(
+                    &conditional.alternate,
+                    path,
+                )?);
+                Some(captures)
+            }
+            Expression::LogicalExpression(logical) => {
+                let mut captures =
+                    self.finite_bound_capture_names_from_expression_path(&logical.left, path)?;
+                captures.extend(
+                    self.finite_bound_capture_names_from_expression_path(&logical.right, path)?,
+                );
+                Some(captures)
+            }
+            Expression::AwaitExpression(await_expression) => self
+                .finite_bound_capture_names_from_expression_path(&await_expression.argument, path),
+            Expression::SequenceExpression(sequence) => {
+                sequence.expressions.last().and_then(|expression| {
+                    self.finite_bound_capture_names_from_expression_path(expression, path)
+                })
+            }
+            Expression::AssignmentExpression(assignment) => {
+                self.finite_bound_capture_names_from_expression_path(&assignment.right, path)
+            }
+            _ => None,
+        }
     }
 
-    fn finite_bound_assignment_capture_names(target: &AssignmentTarget<'_>) -> BTreeSet<String> {
-        let mut collector = FiniteBoundCaptureNameCollector::default();
-        collector.visit_assignment_target(target);
-        collector.names
+    fn finite_bound_argument_provenance_from_expression_path(
+        &self,
+        expression: &Expression<'_>,
+        path: &[String],
+    ) -> Option<BTreeSet<usize>> {
+        if path.is_empty() {
+            return Some(self.finite_bound_argument_provenance(expression));
+        }
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => {
+                let binding = self.finite_bound_capture_binding(identifier.name.as_str());
+                self.finite_bound_capture_member_state(&binding, &path.join("."))
+                    .map(|(_, provenance)| provenance)
+            }
+            Expression::ObjectExpression(object) => {
+                let property_name = &path[0];
+                let mut resolved = None;
+                for property in &object.properties {
+                    match property {
+                        ObjectPropertyKind::ObjectProperty(property)
+                            if !property.computed
+                                && property.key.static_name().as_deref()
+                                    == Some(property_name.as_str()) =>
+                        {
+                            resolved = self.finite_bound_argument_provenance_from_expression_path(
+                                &property.value,
+                                &path[1..],
+                            );
+                        }
+                        ObjectPropertyKind::SpreadProperty(_) => resolved = None,
+                        _ => {}
+                    }
+                }
+                resolved
+            }
+            Expression::ArrayExpression(array) => {
+                let index = path[0].parse::<usize>().ok()?;
+                let expression = array.elements.get(index)?.as_expression()?;
+                self.finite_bound_argument_provenance_from_expression_path(expression, &path[1..])
+            }
+            Expression::ConditionalExpression(conditional) => {
+                let mut provenance = self.finite_bound_argument_provenance_from_expression_path(
+                    &conditional.consequent,
+                    path,
+                )?;
+                provenance.extend(self.finite_bound_argument_provenance_from_expression_path(
+                    &conditional.alternate,
+                    path,
+                )?);
+                Some(provenance)
+            }
+            Expression::LogicalExpression(logical) => {
+                let mut provenance = self
+                    .finite_bound_argument_provenance_from_expression_path(&logical.left, path)?;
+                provenance.extend(
+                    self.finite_bound_argument_provenance_from_expression_path(
+                        &logical.right,
+                        path,
+                    )?,
+                );
+                Some(provenance)
+            }
+            Expression::AwaitExpression(await_expression) => self
+                .finite_bound_argument_provenance_from_expression_path(
+                    &await_expression.argument,
+                    path,
+                ),
+            Expression::SequenceExpression(sequence) => {
+                sequence.expressions.last().and_then(|expression| {
+                    self.finite_bound_argument_provenance_from_expression_path(expression, path)
+                })
+            }
+            Expression::AssignmentExpression(assignment) => {
+                self.finite_bound_argument_provenance_from_expression_path(&assignment.right, path)
+            }
+            _ => None,
+        }
+    }
+
+    fn finite_bound_expression_is_known_object(&self, expression: &Expression<'_>) -> bool {
+        fn object_is_plain(object: &ObjectExpression<'_>) -> bool {
+            object.properties.iter().all(|property| {
+                let ObjectPropertyKind::ObjectProperty(property) = property else {
+                    return false;
+                };
+                property.kind != PropertyKind::Get
+                    && match property.value.get_inner_expression() {
+                        Expression::ObjectExpression(nested) => object_is_plain(nested),
+                        _ => true,
+                    }
+            })
+        }
+
+        match expression.get_inner_expression() {
+            Expression::ObjectExpression(object) => object_is_plain(object),
+            Expression::Identifier(identifier) => {
+                let binding = self.finite_bound_capture_binding(identifier.name.as_str());
+                let aliases = self
+                    .finite_bound_capture_aliases
+                    .get(&binding)
+                    .cloned()
+                    .unwrap_or_else(|| BTreeSet::from([binding]));
+                aliases.iter().any(|alias| {
+                    self.finite_bound_capture_binding_is_current(alias)
+                        && self.finite_bound_capture_object_bindings.contains(alias)
+                }) && aliases.iter().all(|alias| {
+                    !self.finite_bound_capture_binding_is_current(alias)
+                        || self
+                            .finite_bound_capture_unknown_member_paths
+                            .get(alias)
+                            .is_none_or(BTreeSet::is_empty)
+                })
+            }
+            Expression::ConditionalExpression(conditional) => {
+                self.finite_bound_expression_is_known_object(&conditional.consequent)
+                    && self.finite_bound_expression_is_known_object(&conditional.alternate)
+            }
+            Expression::LogicalExpression(logical) => {
+                self.finite_bound_expression_is_known_object(&logical.left)
+                    && self.finite_bound_expression_is_known_object(&logical.right)
+            }
+            Expression::AwaitExpression(await_expression) => {
+                self.finite_bound_expression_is_known_object(&await_expression.argument)
+            }
+            Expression::SequenceExpression(sequence) => sequence
+                .expressions
+                .last()
+                .is_some_and(|expression| self.finite_bound_expression_is_known_object(expression)),
+            Expression::AssignmentExpression(assignment) => {
+                self.finite_bound_expression_is_known_object(&assignment.right)
+            }
+            _ => false,
+        }
+    }
+
+    fn finite_bound_destructured_capture_names(
+        &self,
+        pattern: &BindingPattern<'_>,
+        expression: &Expression<'_>,
+        path: &[String],
+        captures: &mut BTreeMap<String, BTreeSet<String>>,
+    ) {
+        match pattern {
+            BindingPattern::BindingIdentifier(identifier) => {
+                let resolved = self
+                    .finite_bound_capture_names_from_expression_path(expression, path)
+                    .unwrap_or_else(|| {
+                        self.finite_bound_capture_names_from_expression(expression)
+                            .unwrap_or_default()
+                    });
+                captures
+                    .entry(identifier.name.to_string())
+                    .or_default()
+                    .extend(resolved);
+            }
+            BindingPattern::AssignmentPattern(assignment) => {
+                self.finite_bound_destructured_capture_names(
+                    &assignment.left,
+                    expression,
+                    path,
+                    captures,
+                );
+                let defaults = self
+                    .finite_bound_capture_names_from_expression(&assignment.right)
+                    .unwrap_or_default();
+                for identifier in assignment.left.get_binding_identifiers() {
+                    captures
+                        .entry(identifier.name.to_string())
+                        .or_default()
+                        .extend(defaults.iter().cloned());
+                }
+            }
+            BindingPattern::ObjectPattern(object) => {
+                for property in &object.properties {
+                    if property.computed {
+                        self.finite_bound_destructured_capture_names(
+                            &property.value,
+                            expression,
+                            path,
+                            captures,
+                        );
+                        continue;
+                    }
+                    let Some(name) = property.key.static_name() else {
+                        self.finite_bound_destructured_capture_names(
+                            &property.value,
+                            expression,
+                            path,
+                            captures,
+                        );
+                        continue;
+                    };
+                    let mut property_path = path.to_vec();
+                    property_path.push(name.to_string());
+                    self.finite_bound_destructured_capture_names(
+                        &property.value,
+                        expression,
+                        &property_path,
+                        captures,
+                    );
+                }
+                if let Some(rest) = &object.rest {
+                    for identifier in rest.argument.get_binding_identifiers() {
+                        captures
+                            .entry(identifier.name.to_string())
+                            .or_default()
+                            .extend(
+                                self.finite_bound_capture_names_from_expression(expression)
+                                    .unwrap_or_default(),
+                            );
+                    }
+                }
+            }
+            BindingPattern::ArrayPattern(array) => {
+                for (index, element) in array.elements.iter().enumerate() {
+                    let Some(element) = element else {
+                        continue;
+                    };
+                    let mut element_path = path.to_vec();
+                    element_path.push(index.to_string());
+                    self.finite_bound_destructured_capture_names(
+                        element,
+                        expression,
+                        &element_path,
+                        captures,
+                    );
+                }
+                if let Some(rest) = &array.rest {
+                    for identifier in rest.argument.get_binding_identifiers() {
+                        captures
+                            .entry(identifier.name.to_string())
+                            .or_default()
+                            .extend(
+                                self.finite_bound_capture_names_from_expression(expression)
+                                    .unwrap_or_default(),
+                            );
+                    }
+                }
+            }
+        }
+    }
+
+    fn finite_bound_assignment_capture_names_by_path(
+        &self,
+        target: &AssignmentTarget<'_>,
+        expression: &Expression<'_>,
+        path: &[String],
+        captures: &mut BTreeMap<String, BTreeSet<String>>,
+    ) {
+        match target {
+            AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                let resolved = self
+                    .finite_bound_capture_names_from_expression_path(expression, path)
+                    .unwrap_or_else(|| {
+                        self.finite_bound_capture_names_from_expression(expression)
+                            .unwrap_or_default()
+                    });
+                captures
+                    .entry(identifier.name.to_string())
+                    .or_default()
+                    .extend(resolved);
+            }
+            AssignmentTarget::ObjectAssignmentTarget(object) => {
+                for property in &object.properties {
+                    match property {
+                        AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(property) => {
+                            let mut property_path = path.to_vec();
+                            property_path.push(property.binding.name.to_string());
+                            let resolved = self
+                                .finite_bound_capture_names_from_expression_path(
+                                    expression,
+                                    &property_path,
+                                )
+                                .unwrap_or_else(|| {
+                                    self.finite_bound_capture_names_from_expression(expression)
+                                        .unwrap_or_default()
+                                });
+                            let target = captures
+                                .entry(property.binding.name.to_string())
+                                .or_default();
+                            target.extend(resolved);
+                            if let Some(init) = &property.init {
+                                target.extend(
+                                    self.finite_bound_capture_names_from_expression(init)
+                                        .unwrap_or_default(),
+                                );
+                            }
+                        }
+                        AssignmentTargetProperty::AssignmentTargetPropertyProperty(property) => {
+                            let Some(name) = (!property.computed)
+                                .then(|| property.name.static_name())
+                                .flatten()
+                            else {
+                                let mut names = Vec::new();
+                                assignment_target_maybe_default_identifier_names(
+                                    &property.binding,
+                                    &mut names,
+                                );
+                                for name in names {
+                                    captures.entry(name).or_default().extend(
+                                        self.finite_bound_capture_names_from_expression(expression)
+                                            .unwrap_or_default(),
+                                    );
+                                }
+                                continue;
+                            };
+                            let mut property_path = path.to_vec();
+                            property_path.push(name.to_string());
+                            self.finite_bound_assignment_maybe_default_capture_names(
+                                &property.binding,
+                                expression,
+                                &property_path,
+                                captures,
+                            );
+                        }
+                    }
+                }
+                if let Some(rest) = &object.rest {
+                    let mut names = Vec::new();
+                    assignment_target_identifier_names(&rest.target, &mut names);
+                    for name in names {
+                        captures.entry(name).or_default().extend(
+                            self.finite_bound_capture_names_from_expression(expression)
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
+            }
+            AssignmentTarget::ArrayAssignmentTarget(array) => {
+                for (index, element) in array.elements.iter().enumerate() {
+                    let Some(element) = element else {
+                        continue;
+                    };
+                    let mut element_path = path.to_vec();
+                    element_path.push(index.to_string());
+                    self.finite_bound_assignment_maybe_default_capture_names(
+                        element,
+                        expression,
+                        &element_path,
+                        captures,
+                    );
+                }
+                if let Some(rest) = &array.rest {
+                    let mut names = Vec::new();
+                    assignment_target_identifier_names(&rest.target, &mut names);
+                    for name in names {
+                        captures.entry(name).or_default().extend(
+                            self.finite_bound_capture_names_from_expression(expression)
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finite_bound_assignment_maybe_default_capture_names(
+        &self,
+        target: &AssignmentTargetMaybeDefault<'_>,
+        expression: &Expression<'_>,
+        path: &[String],
+        captures: &mut BTreeMap<String, BTreeSet<String>>,
+    ) {
+        match target {
+            AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(default) => {
+                self.finite_bound_assignment_capture_names_by_path(
+                    &default.binding,
+                    expression,
+                    path,
+                    captures,
+                );
+                let defaults = self
+                    .finite_bound_capture_names_from_expression(&default.init)
+                    .unwrap_or_default();
+                let mut names = Vec::new();
+                assignment_target_identifier_names(&default.binding, &mut names);
+                for name in names {
+                    captures
+                        .entry(name)
+                        .or_default()
+                        .extend(defaults.iter().cloned());
+                }
+            }
+            AssignmentTargetMaybeDefault::AssignmentTargetIdentifier(identifier) => {
+                let resolved = self
+                    .finite_bound_capture_names_from_expression_path(expression, path)
+                    .unwrap_or_else(|| {
+                        self.finite_bound_capture_names_from_expression(expression)
+                            .unwrap_or_default()
+                    });
+                captures
+                    .entry(identifier.name.to_string())
+                    .or_default()
+                    .extend(resolved);
+            }
+            AssignmentTargetMaybeDefault::ArrayAssignmentTarget(array) => {
+                for (index, element) in array.elements.iter().enumerate() {
+                    let Some(element) = element else {
+                        continue;
+                    };
+                    let mut element_path = path.to_vec();
+                    element_path.push(index.to_string());
+                    self.finite_bound_assignment_maybe_default_capture_names(
+                        element,
+                        expression,
+                        &element_path,
+                        captures,
+                    );
+                }
+                if let Some(rest) = &array.rest {
+                    self.finite_bound_assignment_capture_names_by_path(
+                        &rest.target,
+                        expression,
+                        path,
+                        captures,
+                    );
+                }
+            }
+            AssignmentTargetMaybeDefault::ObjectAssignmentTarget(object) => {
+                for property in &object.properties {
+                    match property {
+                        AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(property) => {
+                            let mut property_path = path.to_vec();
+                            property_path.push(property.binding.name.to_string());
+                            let resolved = self
+                                .finite_bound_capture_names_from_expression_path(
+                                    expression,
+                                    &property_path,
+                                )
+                                .unwrap_or_else(|| {
+                                    self.finite_bound_capture_names_from_expression(expression)
+                                        .unwrap_or_default()
+                                });
+                            let target = captures
+                                .entry(property.binding.name.to_string())
+                                .or_default();
+                            target.extend(resolved);
+                            if let Some(init) = &property.init {
+                                target.extend(
+                                    self.finite_bound_capture_names_from_expression(init)
+                                        .unwrap_or_default(),
+                                );
+                            }
+                        }
+                        AssignmentTargetProperty::AssignmentTargetPropertyProperty(property) => {
+                            let Some(name) = (!property.computed)
+                                .then(|| property.name.static_name())
+                                .flatten()
+                            else {
+                                self.finite_bound_assignment_maybe_default_capture_names(
+                                    &property.binding,
+                                    expression,
+                                    path,
+                                    captures,
+                                );
+                                continue;
+                            };
+                            let mut property_path = path.to_vec();
+                            property_path.push(name.to_string());
+                            self.finite_bound_assignment_maybe_default_capture_names(
+                                &property.binding,
+                                expression,
+                                &property_path,
+                                captures,
+                            );
+                        }
+                    }
+                }
+                if let Some(rest) = &object.rest {
+                    self.finite_bound_assignment_capture_names_by_path(
+                        &rest.target,
+                        expression,
+                        path,
+                        captures,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finite_bound_assignment_paths(
+        target: &AssignmentTarget<'_>,
+        path: &[String],
+        paths: &mut BTreeMap<String, Vec<String>>,
+    ) {
+        match target {
+            AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                paths.insert(identifier.name.to_string(), path.to_vec());
+            }
+            AssignmentTarget::ObjectAssignmentTarget(object) => {
+                for property in &object.properties {
+                    match property {
+                        AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(property) => {
+                            let mut property_path = path.to_vec();
+                            property_path.push(property.binding.name.to_string());
+                            paths.insert(property.binding.name.to_string(), property_path);
+                        }
+                        AssignmentTargetProperty::AssignmentTargetPropertyProperty(property)
+                            if !property.computed =>
+                        {
+                            let Some(name) = property.name.static_name() else {
+                                continue;
+                            };
+                            let mut property_path = path.to_vec();
+                            property_path.push(name.to_string());
+                            Self::finite_bound_assignment_maybe_default_paths(
+                                &property.binding,
+                                &property_path,
+                                paths,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            AssignmentTarget::ArrayAssignmentTarget(array) => {
+                for (index, element) in array.elements.iter().enumerate() {
+                    let Some(element) = element else {
+                        continue;
+                    };
+                    let mut element_path = path.to_vec();
+                    element_path.push(index.to_string());
+                    Self::finite_bound_assignment_maybe_default_paths(
+                        element,
+                        &element_path,
+                        paths,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finite_bound_assignment_maybe_default_paths(
+        target: &AssignmentTargetMaybeDefault<'_>,
+        path: &[String],
+        paths: &mut BTreeMap<String, Vec<String>>,
+    ) {
+        match target {
+            AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(default) => {
+                Self::finite_bound_assignment_paths(&default.binding, path, paths);
+            }
+            AssignmentTargetMaybeDefault::AssignmentTargetIdentifier(identifier) => {
+                paths.insert(identifier.name.to_string(), path.to_vec());
+            }
+            AssignmentTargetMaybeDefault::ObjectAssignmentTarget(object) => {
+                for property in &object.properties {
+                    if let AssignmentTargetProperty::AssignmentTargetPropertyProperty(property) =
+                        property
+                        && !property.computed
+                        && let Some(name) = property.name.static_name()
+                    {
+                        let mut property_path = path.to_vec();
+                        property_path.push(name.to_string());
+                        Self::finite_bound_assignment_maybe_default_paths(
+                            &property.binding,
+                            &property_path,
+                            paths,
+                        );
+                    }
+                }
+            }
+            AssignmentTargetMaybeDefault::ArrayAssignmentTarget(array) => {
+                for (index, element) in array.elements.iter().enumerate() {
+                    let Some(element) = element else {
+                        continue;
+                    };
+                    let mut element_path = path.to_vec();
+                    element_path.push(index.to_string());
+                    Self::finite_bound_assignment_maybe_default_paths(
+                        element,
+                        &element_path,
+                        paths,
+                    );
+                }
+            }
+            _ => {}
+        }
     }
 
     fn finite_bound_capture_names_for_identifier(&self, name: &str) -> BTreeSet<String> {
@@ -8570,6 +9275,7 @@ impl ReactWrapperReturnCollector {
             .finite_bound_capture_names_from_expression(expression)
             .unwrap_or_default();
         let mut exact_bindings = BTreeSet::new();
+        let mut candidate_bindings = BTreeSet::new();
         let mut member_path = Vec::new();
         if let Some(root) = expression_static_member_path(expression, &mut member_path) {
             let binding = self.finite_bound_capture_binding(root);
@@ -8603,6 +9309,14 @@ impl ReactWrapperReturnCollector {
                         }
                     }
                 }
+                if let Some(candidates) = self.finite_bound_capture_candidate_depths.get(&alias.0) {
+                    for name in &names {
+                        if let Some(scope_ids) = candidates.get(name) {
+                            candidate_bindings
+                                .extend(scope_ids.iter().map(|scope_id| (name.clone(), *scope_id)));
+                        }
+                    }
+                }
             }
         }
         let mut pending = exact_bindings.iter().cloned().collect::<Vec<_>>();
@@ -8621,8 +9335,14 @@ impl ReactWrapperReturnCollector {
                     }
                 }
             }
+            if let Some(candidates) = self.finite_bound_capture_candidate_depths.get(&binding.0) {
+                for (name, scope_ids) in candidates {
+                    candidate_bindings
+                        .extend(scope_ids.iter().map(|scope_id| (name.clone(), *scope_id)));
+                }
+            }
         }
-        self.record_escaped_finite_bound_captures(names, exact_bindings);
+        self.record_escaped_finite_bound_captures(names, exact_bindings, candidate_bindings);
     }
 
     fn record_escaped_finite_bound_identifier(&mut self, name: &str) {
@@ -8638,7 +9358,18 @@ impl ReactWrapperReturnCollector {
                     .map(|scope_id| (capture.clone(), *scope_id))
             })
             .collect();
-        self.record_escaped_finite_bound_captures(names, exact_bindings);
+        let candidate_bindings = self
+            .finite_bound_capture_candidate_depths
+            .get(name)
+            .into_iter()
+            .flat_map(|candidates| candidates.iter())
+            .flat_map(|(capture, scope_ids)| {
+                scope_ids
+                    .iter()
+                    .map(|scope_id| (capture.clone(), *scope_id))
+            })
+            .collect();
+        self.record_escaped_finite_bound_captures(names, exact_bindings, candidate_bindings);
     }
 
     fn record_escaped_finite_bound_member(&mut self, root: &str, path: &str) {
@@ -8656,7 +9387,7 @@ impl ReactWrapperReturnCollector {
                     .map(move |scope_id| (capture.clone(), scope_id))
             })
             .collect();
-        self.record_escaped_finite_bound_captures(names, exact_bindings);
+        self.record_escaped_finite_bound_captures(names, exact_bindings, BTreeSet::new());
     }
 
     fn finite_bound_capture_dependencies(
@@ -8890,6 +9621,23 @@ impl ReactWrapperReturnCollector {
                         self.seed_finite_bound_capture_object_dependencies(binding, nested, &path);
                     }
                 }
+                ObjectPropertyKind::ObjectProperty(property)
+                    if property.kind == PropertyKind::Get =>
+                {
+                    let path = if property.computed {
+                        prefix.to_string()
+                    } else if let Some(name) = property.key.static_name() {
+                        if prefix.is_empty() {
+                            name.to_string()
+                        } else {
+                            format!("{prefix}.{name}")
+                        }
+                    } else {
+                        prefix.to_string()
+                    };
+                    self.clear_finite_bound_capture_member_path(binding, &path);
+                    self.mark_finite_bound_capture_unknown_member_path(binding, &path);
+                }
                 ObjectPropertyKind::SpreadProperty(spread) => {
                     let Some(source) = spread.argument.get_identifier_reference() else {
                         self.clear_finite_bound_capture_member_path(binding, prefix);
@@ -8953,6 +9701,7 @@ impl ReactWrapperReturnCollector {
         &mut self,
         names: BTreeSet<String>,
         exact_bindings: BTreeSet<FiniteBoundCaptureBinding>,
+        candidate_bindings: BTreeSet<FiniteBoundCaptureBinding>,
     ) {
         let expanded = self.expanded_finite_bound_capture_names(&names);
         let provenance = self.finite_bound_capture_provenance(&expanded);
@@ -8965,10 +9714,21 @@ impl ReactWrapperReturnCollector {
                 .collect::<BTreeSet<_>>();
             if !exact.is_empty() {
                 self.escaped_finite_bound_capture_bindings.extend(exact);
-            } else if self.finite_bound_capture_binding_depths.contains_key(&name) {
+            }
+            let candidates = candidate_bindings
+                .iter()
+                .filter(|binding| binding.0 == name)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !candidates.is_empty() {
+                self.unresolved_escaped_finite_bound_capture_candidates
+                    .push(candidates);
+            } else if exact_bindings.iter().all(|binding| binding.0 != name)
+                && self.finite_bound_capture_binding_depths.contains_key(&name)
+            {
                 self.escaped_finite_bound_capture_bindings
                     .insert(self.finite_bound_capture_binding(&name));
-            } else {
+            } else if exact_bindings.iter().all(|binding| binding.0 != name) {
                 self.unresolved_escaped_finite_bound_capture_candidates
                     .push(
                         self.finite_bound_active_capture_scope_ids()
@@ -11066,7 +11826,11 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             for source in alias_source_bindings {
                 self.link_finite_bound_capture_binding_aliases(left.clone(), source);
             }
-            let arguments = if self.finite_bound_capture_binding_is_escaped(&name) {
+            let binding_is_escaped = self.finite_bound_capture_binding_is_escaped(&name);
+            let arguments = if binding_is_escaped {
+                self.invalidate_finite_bound_argument_provenance(
+                    self.finite_bound_argument_provenance(init),
+                );
                 None
             } else {
                 self.finite_bound_argument_entry(init)
@@ -11086,7 +11850,9 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             }
         } else {
             let mut provenance = self.finite_bound_argument_provenance(init);
-            let invalidated_source = if self.finite_bound_expression_is_known_array(init) {
+            let invalidated_source = if self.finite_bound_expression_is_known_array(init)
+                || self.finite_bound_expression_is_known_object(init)
+            {
                 BTreeSet::new()
             } else {
                 provenance.clone()
@@ -11094,16 +11860,30 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             self.invalidate_finite_bound_argument_provenance(invalidated_source.clone());
             provenance.extend(self.finite_bound_binding_default_provenance(&declarator.id));
             provenance.retain(|id| !invalidated_source.contains(id));
-            let mut captures = self
-                .finite_bound_capture_names_from_expression(init)
-                .unwrap_or_default();
-            captures.extend(Self::finite_bound_binding_capture_names(&declarator.id));
-            let captures = (!captures.is_empty()).then_some(captures);
+            let mut captures_by_name = BTreeMap::new();
+            self.finite_bound_destructured_capture_names(
+                &declarator.id,
+                init,
+                &[],
+                &mut captures_by_name,
+            );
+            let mut binding_names = BTreeMap::new();
+            let mut binding_paths = BTreeMap::new();
+            collect_parameter_bindings(
+                &declarator.id,
+                0,
+                &[],
+                &mut binding_names,
+                &mut binding_paths,
+            );
             let alias_source_bindings = Vec::<FiniteBoundCaptureBinding>::new();
             for identifier in declarator.id.get_binding_identifiers() {
+                let captures = captures_by_name
+                    .remove(identifier.name.as_str())
+                    .filter(|captures| !captures.is_empty());
                 self.set_finite_bound_capture_declaration_at_depth(
                     identifier.name.as_str(),
-                    captures.clone(),
+                    captures,
                     capture_binding_depth,
                 );
                 let left = self.finite_bound_capture_binding(identifier.name.as_str());
@@ -11111,12 +11891,18 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 for source in &alias_source_bindings {
                     self.link_finite_bound_capture_binding_aliases(left.clone(), source.clone());
                 }
+                let binding_provenance = binding_paths
+                    .get(identifier.name.as_str())
+                    .and_then(|path| {
+                        self.finite_bound_argument_provenance_from_expression_path(init, path)
+                    })
+                    .unwrap_or_else(|| provenance.clone());
                 self.set_finite_bound_argument_declaration_at_depth(
                     identifier.name.as_str(),
                     if self.finite_bound_capture_binding_is_escaped(identifier.name.as_str()) {
                         None
                     } else {
-                        Self::finite_bound_carrier_entry(&provenance)
+                        Self::finite_bound_carrier_entry(&binding_provenance)
                     },
                     capture_binding_depth,
                 );
@@ -11167,13 +11953,15 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         ) {
             let mut names = Vec::new();
             assignment_target_identifier_names(&expression.left, &mut names);
-            let mut captures = self
-                .finite_bound_capture_names_from_expression(&expression.right)
-                .unwrap_or_default();
-            captures.extend(Self::finite_bound_assignment_capture_names(
+            let mut captures_by_name = BTreeMap::new();
+            self.finite_bound_assignment_capture_names_by_path(
                 &expression.left,
-            ));
-            let captures = (!captures.is_empty()).then_some(captures);
+                &expression.right,
+                &[],
+                &mut captures_by_name,
+            );
+            let mut binding_paths = BTreeMap::new();
+            Self::finite_bound_assignment_paths(&expression.left, &[], &mut binding_paths);
             let alias_sources = BTreeSet::<String>::new();
             if expression.operator == AssignmentOperator::Assign
                 && self.conditional_control_flow_depth == 0
@@ -11187,21 +11975,38 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 && self.conditional_control_flow_depth == 0
             {
                 let mut provenance = self.finite_bound_argument_provenance(&expression.right);
-                let invalidated_source =
-                    if self.finite_bound_expression_is_known_array(&expression.right) {
-                        BTreeSet::new()
-                    } else {
-                        provenance.clone()
-                    };
+                let invalidated_source = if self
+                    .finite_bound_expression_is_known_array(&expression.right)
+                    || self.finite_bound_expression_is_known_object(&expression.right)
+                {
+                    BTreeSet::new()
+                } else {
+                    provenance.clone()
+                };
                 self.invalidate_finite_bound_argument_provenance(invalidated_source.clone());
                 provenance
                     .extend(self.finite_bound_assignment_default_provenance(&expression.left));
                 provenance.retain(|id| !invalidated_source.contains(id));
                 for name in &names {
-                    self.replace_finite_bound_capture_value_and_refresh(name, captures.clone());
+                    let captures = captures_by_name
+                        .get(name)
+                        .cloned()
+                        .filter(|captures| !captures.is_empty());
+                    self.replace_finite_bound_capture_value_and_refresh(name, captures);
+                    let binding_provenance = binding_paths
+                        .get(name)
+                        .and_then(|path| {
+                            self.finite_bound_argument_provenance_from_expression_path(
+                                &expression.right,
+                                path,
+                            )
+                        })
+                        .unwrap_or_else(|| provenance.clone());
                     if self.finite_bound_capture_binding_is_escaped(name) {
                         self.finite_bound_argument_arrays.remove(name);
-                    } else if let Some(entry) = Self::finite_bound_carrier_entry(&provenance) {
+                    } else if let Some(entry) =
+                        Self::finite_bound_carrier_entry(&binding_provenance)
+                    {
                         self.finite_bound_argument_arrays
                             .insert(name.clone(), entry);
                     } else {
@@ -11209,8 +12014,12 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                     }
                 }
             } else {
-                if let Some(captures) = captures {
-                    for name in &names {
+                for name in &names {
+                    if let Some(captures) = captures_by_name
+                        .get(name)
+                        .cloned()
+                        .filter(|captures| !captures.is_empty())
+                    {
                         self.merge_finite_bound_capture_value(name, captures.clone());
                     }
                 }
@@ -29345,6 +30154,40 @@ mod tests {
     }
 
     #[test]
+    fn escaped_mixed_capture_edges_keep_unresolved_candidates() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const target = [draw];
+                let escaped;
+                {
+                  const args = [draw];
+                  if (condition) escaped = () => { args[0] = runtimeFactory; };
+                }
+                {
+                  if (condition) escaped = () => { args[0] = runtimeFactory; };
+                  external.callback = escaped;
+                  const args = target;
+                }
+                return outer(inner.bind(null, ...target));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
     fn delayed_escape_preserves_dead_capture_binding_identity() {
         let scan = scan(
             r#"
@@ -29965,6 +30808,90 @@ mod tests {
             "dynamic usages: {:?}",
             scan.dynamic_usages
         );
+    }
+
+    #[test]
+    fn destructuring_keeps_callable_capture_paths_separate() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [declared] = await declaredForward();
+              declared[0][0](declaredKey);
+              const [assigned] = await assignedForward();
+              assigned[0][0](assignedKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function declaredForward() {
+                const args = [draw];
+                const source = {
+                  safe: ordinary,
+                  mutating: () => { args[0] = runtimeFactory; },
+                };
+                const { safe } = source;
+                external.callback = safe;
+                return outer(inner.bind(null, ...args));
+              }
+              async function assignedForward() {
+                const args = [draw];
+                const source = {
+                  safe: ordinary,
+                  mutating: () => { args[0] = runtimeFactory; },
+                };
+                let safe;
+                ({ safe } = source);
+                external.callback = safe;
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        assert!(
+            scan.dynamic_usages.is_empty(),
+            "dynamic usages: {:?}",
+            scan.dynamic_usages
+        );
+    }
+
+    #[test]
+    fn unresolved_computed_destructuring_preserves_callable_captures() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [declared] = await declaredForward();
+              declared[0][0](declaredKey);
+              const [assigned] = await assignedForward();
+              assigned[0][0](assignedKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function declaredForward() {
+                const args = [draw];
+                const source = { callback: () => { args[0] = runtimeFactory; } };
+                const { [runtimeProperty]: callback } = source;
+                external.callback = callback;
+                return outer(inner.bind(null, ...args));
+              }
+              async function assignedForward() {
+                const args = [draw];
+                const source = { nested: { callback: () => { args[0] = runtimeFactory; } } };
+                let callback;
+                ({ nested: { [runtimeProperty]: callback } } = source);
+                external.callback = callback;
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [4, 6] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
     }
 
     #[test]
@@ -30602,13 +31529,16 @@ mod tests {
               declared[0][0](declaredKey);
               const [assigned] = await assignmentForward();
               assigned[0][0](assignedKey);
+              const [direct] = await directForward();
+              direct[0][0](directKey);
+              const [rested] = await restForward();
+              rested[0][0](restKey);
               async function inner(factory) { return Promise.all([factory(), draw]); }
               async function outer(factory) { return Promise.all([factory(), draw]); }
               async function declarationForward() {
                 const args = [draw];
                 const holder = { get value() { args[0] = runtimeFactory; return draw; } };
                 const {value} = holder;
-                consume(value);
                 return outer(inner.bind(null, ...args));
               }
               async function assignmentForward() {
@@ -30616,7 +31546,17 @@ mod tests {
                 const holder = { get value() { args[0] = runtimeFactory; return draw; } };
                 let value;
                 ({value} = holder);
-                consume(value);
+                return outer(inner.bind(null, ...args));
+              }
+              async function directForward() {
+                const args = [draw];
+                const {value} = { get value() { args[0] = runtimeFactory; return draw; } };
+                return outer(inner.bind(null, ...args));
+              }
+              async function restForward() {
+                const args = [draw];
+                const holder = { get value() { args[0] = runtimeFactory; return draw; } };
+                const {...rest} = holder;
                 return outer(inner.bind(null, ...args));
               }
             }
@@ -30627,7 +31567,7 @@ mod tests {
             .iter()
             .map(|usage| usage.line)
             .collect::<BTreeSet<_>>();
-        for line in [4, 6] {
+        for line in [4, 6, 8, 10] {
             assert!(
                 lines.contains(&line),
                 "missing line {line}; dynamic lines: {lines:?}"
