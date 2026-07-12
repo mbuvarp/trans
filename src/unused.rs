@@ -7393,6 +7393,26 @@ impl<'a> Visit<'a> for FiniteBoundCaptureNameCollector {
     }
 }
 
+#[derive(Default)]
+struct FiniteBoundFunctionDeclarationCollector {
+    captures: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl<'a> Visit<'a> for FiniteBoundFunctionDeclarationCollector {
+    fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
+        if function.r#type == FunctionType::FunctionDeclaration
+            && let Some(identifier) = &function.id
+        {
+            let mut collector = FiniteBoundCaptureNameCollector::default();
+            collector.visit_function(function, ScopeFlags::empty());
+            self.captures
+                .insert(identifier.name.to_string(), collector.names);
+        }
+    }
+
+    fn visit_arrow_function_expression(&mut self, _arrow: &ArrowFunctionExpression<'a>) {}
+}
+
 impl<'a> Visit<'a> for InlineWrapperReturnVisitor<'_> {
     fn visit_return_statement(&mut self, statement: &ReturnStatement<'a>) {
         self.returns_wrapper |= statement
@@ -7408,6 +7428,14 @@ impl<'a> Visit<'a> for InlineWrapperReturnVisitor<'_> {
 }
 
 impl ReactWrapperReturnCollector {
+    fn finite_bound_function_declaration_captures(
+        body: &FunctionBody<'_>,
+    ) -> BTreeMap<String, BTreeSet<String>> {
+        let mut collector = FiniteBoundFunctionDeclarationCollector::default();
+        collector.visit_function_body(body);
+        collector.captures
+    }
+
     fn set_finite_bound_capture_declaration(
         &mut self,
         name: &str,
@@ -7611,6 +7639,71 @@ impl ReactWrapperReturnCollector {
         for alias in &aliases {
             self.finite_bound_capture_aliases
                 .insert(alias.clone(), aliases.clone());
+        }
+    }
+
+    fn finite_bound_capture_alias_sources(expression: &Expression<'_>) -> BTreeSet<String> {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => BTreeSet::from([identifier.name.to_string()]),
+            Expression::ConditionalExpression(conditional) => {
+                let mut sources = Self::finite_bound_capture_alias_sources(&conditional.consequent);
+                sources.extend(Self::finite_bound_capture_alias_sources(
+                    &conditional.alternate,
+                ));
+                sources
+            }
+            Expression::LogicalExpression(logical) => {
+                let mut sources = Self::finite_bound_capture_alias_sources(&logical.left);
+                sources.extend(Self::finite_bound_capture_alias_sources(&logical.right));
+                sources
+            }
+            Expression::AwaitExpression(await_expression) => {
+                Self::finite_bound_capture_alias_sources(&await_expression.argument)
+            }
+            Expression::SequenceExpression(sequence) => sequence
+                .expressions
+                .last()
+                .map(Self::finite_bound_capture_alias_sources)
+                .unwrap_or_default(),
+            Expression::AssignmentExpression(assignment) => {
+                Self::finite_bound_capture_alias_sources(&assignment.right)
+            }
+            Expression::StaticMemberExpression(member) => {
+                expression_member_root_name(&member.object)
+                    .map(|name| BTreeSet::from([name.to_string()]))
+                    .unwrap_or_default()
+            }
+            Expression::ComputedMemberExpression(member) => {
+                expression_member_root_name(&member.object)
+                    .map(|name| BTreeSet::from([name.to_string()]))
+                    .unwrap_or_default()
+            }
+            Expression::ArrayExpression(array) => array
+                .elements
+                .iter()
+                .flat_map(|element| match element {
+                    ArrayExpressionElement::SpreadElement(spread) => {
+                        Self::finite_bound_capture_alias_sources(&spread.argument)
+                    }
+                    _ => element
+                        .as_expression()
+                        .map(Self::finite_bound_capture_alias_sources)
+                        .unwrap_or_default(),
+                })
+                .collect(),
+            Expression::ObjectExpression(object) => object
+                .properties
+                .iter()
+                .flat_map(|property| match property {
+                    ObjectPropertyKind::ObjectProperty(property) => {
+                        Self::finite_bound_capture_alias_sources(&property.value)
+                    }
+                    ObjectPropertyKind::SpreadProperty(spread) => {
+                        Self::finite_bound_capture_alias_sources(&spread.argument)
+                    }
+                })
+                .collect(),
+            _ => BTreeSet::new(),
         }
     }
 
@@ -9030,6 +9123,56 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         walk::walk_catch_parameter(self, parameter);
     }
 
+    fn visit_for_of_statement(&mut self, statement: &ForOfStatement<'a>) {
+        let names = match &statement.left {
+            ForStatementLeft::VariableDeclaration(declaration) => declaration
+                .declarations
+                .iter()
+                .flat_map(|declarator| declarator.id.get_binding_identifiers())
+                .map(|identifier| identifier.name.to_string())
+                .collect::<Vec<_>>(),
+            _ => {
+                let mut names = Vec::new();
+                if let Some(target) = statement.left.as_assignment_target() {
+                    assignment_target_identifier_names(target, &mut names);
+                }
+                names
+            }
+        };
+        let captures = self
+            .finite_bound_capture_names_from_expression(&statement.right)
+            .unwrap_or_default();
+        let alias_sources = Self::finite_bound_capture_alias_sources(&statement.right);
+        let previous = names
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    self.finite_bound_capture_callables.get(name).cloned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for name in &names {
+            for source in &alias_sources {
+                self.link_finite_bound_capture_aliases(name, source);
+            }
+            if captures.is_empty() {
+                self.finite_bound_capture_callables.remove(name);
+            } else {
+                self.finite_bound_capture_callables
+                    .insert(name.clone(), captures.clone());
+            }
+        }
+        walk::walk_for_of_statement(self, statement);
+        for (name, captures) in previous {
+            if let Some(captures) = captures {
+                self.finite_bound_capture_callables.insert(name, captures);
+            } else {
+                self.finite_bound_capture_callables.remove(&name);
+            }
+        }
+    }
+
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         walk::walk_call_expression(self, call);
         let mut escaped_captures = self
@@ -9181,6 +9324,31 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         self.invalidate_finite_bound_argument_provenance(provenance);
     }
 
+    fn visit_jsx_opening_element(&mut self, opening: &JSXOpeningElement<'a>) {
+        walk::walk_jsx_opening_element(self, opening);
+        let mut captures = BTreeSet::new();
+        for attribute in &opening.attributes {
+            let expression = match attribute {
+                JSXAttributeItem::Attribute(attribute) => match &attribute.value {
+                    Some(JSXAttributeValue::ExpressionContainer(container))
+                        if !matches!(container.expression, JSXExpression::EmptyExpression(_)) =>
+                    {
+                        Some(container.expression.to_expression())
+                    }
+                    _ => None,
+                },
+                JSXAttributeItem::SpreadAttribute(spread) => Some(&spread.argument),
+            };
+            if let Some(expression) = expression {
+                captures.extend(
+                    self.finite_bound_capture_names_from_expression(expression)
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        self.record_escaped_finite_bound_captures(captures);
+    }
+
     fn visit_return_statement(&mut self, statement: &ReturnStatement<'a>) {
         walk::walk_return_statement(self, statement);
         if let Some(argument) = &statement.argument {
@@ -9234,8 +9402,8 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         }
         if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
             let name = identifier.name.to_string();
-            if let Some(source) = init.get_inner_expression().get_identifier_reference() {
-                self.link_finite_bound_capture_aliases(&name, source.name.as_str());
+            for source in Self::finite_bound_capture_alias_sources(init) {
+                self.link_finite_bound_capture_aliases(&name, &source);
             }
             let captures = self
                 .finite_bound_capture_names_from_expression(init)
@@ -9264,7 +9432,11 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 .unwrap_or_default();
             captures.extend(Self::finite_bound_binding_capture_names(&declarator.id));
             let captures = (!captures.is_empty()).then_some(captures);
+            let alias_sources = Self::finite_bound_capture_alias_sources(init);
             for identifier in declarator.id.get_binding_identifiers() {
+                for source in &alias_sources {
+                    self.link_finite_bound_capture_aliases(identifier.name.as_str(), source);
+                }
                 self.set_finite_bound_capture_declaration(
                     identifier.name.as_str(),
                     captures.clone(),
@@ -9290,12 +9462,8 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             && let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &expression.left
         {
             let name = identifier.name.to_string();
-            if let Some(source) = expression
-                .right
-                .get_inner_expression()
-                .get_identifier_reference()
-            {
-                self.link_finite_bound_capture_aliases(&name, source.name.as_str());
+            for source in Self::finite_bound_capture_alias_sources(&expression.right) {
+                self.link_finite_bound_capture_aliases(&name, &source);
             }
             let captures = self
                 .finite_bound_capture_names_from_expression(&expression.right)
@@ -9328,6 +9496,12 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 &expression.left,
             ));
             let captures = (!captures.is_empty()).then_some(captures);
+            let alias_sources = Self::finite_bound_capture_alias_sources(&expression.right);
+            for name in &names {
+                for source in &alias_sources {
+                    self.link_finite_bound_capture_aliases(name, source);
+                }
+            }
             if expression.operator == AssignmentOperator::Assign
                 && self.conditional_control_flow_depth == 0
             {
@@ -9397,6 +9571,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             && let Some(captures) =
                 self.finite_bound_capture_names_from_expression(&expression.right)
         {
+            self.record_escaped_finite_bound_captures(captures.clone());
             let aliases = self
                 .finite_bound_capture_aliases
                 .get(root)
@@ -12398,6 +12573,8 @@ impl SourceIndexCollector {
             namespaces.remove(&name);
             transparent_namespaces.remove(&name);
         }
+        let finite_bound_capture_callables =
+            ReactWrapperReturnCollector::finite_bound_function_declaration_captures(body);
         ReactWrapperReturnCollector {
             memo_identifiers,
             state_identifiers,
@@ -12430,7 +12607,7 @@ impl SourceIndexCollector {
             invalidated_finite_bound_argument_provenance: BTreeSet::new(),
             next_finite_bound_argument_provenance: 0,
             conditional_control_flow_depth: 0,
-            finite_bound_capture_callables: BTreeMap::new(),
+            finite_bound_capture_callables,
             finite_bound_capture_aliases: BTreeMap::new(),
             escaped_finite_bound_capture_names: BTreeSet::new(),
         }
@@ -26789,6 +26966,143 @@ mod tests {
                 const change = () => { args[0] = runtimeFactory; };
                 schedule(change);
                 const args = [draw];
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn hoisted_function_captures_are_available_before_declarations() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                schedule(change);
+                function change() { args[0] = runtimeFactory; }
+                const args = [draw];
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn member_and_jsx_callback_writes_retain_deferred_escapes() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [member] = await memberForward();
+              member[0][0](memberKey);
+              const [jsx] = await jsxForward();
+              jsx[0][0](jsxKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function memberForward() {
+                const change = () => { args[0] = runtimeFactory; };
+                external.callback = change;
+                const args = [draw];
+                return outer(inner.bind(null, ...args));
+              }
+              async function jsxForward() {
+                const change = () => { args[0] = runtimeFactory; };
+                const element = <Button onClick={change} />;
+                consume(element);
+                const args = [draw];
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [4, 6] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_direct_container_aliases_share_callable_member_captures() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [conditional] = await conditionalForward();
+              conditional[0][0](conditionalKey);
+              const [destructured] = await destructuredForward();
+              destructured[0][0](destructuredKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function conditionalForward() {
+                const holder = {};
+                const other = {};
+                const alias = enabled ? holder : other;
+                alias.change = () => { args[0] = runtimeFactory; };
+                const args = [draw];
+                holder.change();
+                return outer(inner.bind(null, ...args));
+              }
+              async function destructuredForward() {
+                const holder = {};
+                const wrapper = {holder};
+                const {holder: alias} = wrapper;
+                alias.change = () => { args[0] = runtimeFactory; };
+                const args = [draw];
+                holder.change();
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [4, 6] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn for_of_bindings_preserve_callable_capture_metadata() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const args = [draw];
+                const change = () => { args[0] = runtimeFactory; };
+                for (const callback of [change]) callback();
                 return outer(inner.bind(null, ...args));
               }
             }
