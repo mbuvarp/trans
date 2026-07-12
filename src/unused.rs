@@ -2788,9 +2788,20 @@ impl ProjectIndex {
                 if !indexes.is_empty() {
                     Some(indexes)
                 } else {
-                    file.default_local_export.as_ref().and_then(|local| {
-                        self.wrapper_array_indexes_for_local_at_depth(&path, local, depth + 1)
-                    })
+                    file.default_local_export
+                        .as_ref()
+                        .and_then(|local| {
+                            self.wrapper_array_indexes_for_local_at_depth(&path, local, depth + 1)
+                        })
+                        .or_else(|| {
+                            file.re_exports.get("default").and_then(|target| {
+                                self.wrapper_array_indexes_for_import_at_depth(
+                                    &path,
+                                    target,
+                                    depth + 1,
+                                )
+                            })
+                        })
                 }
             }
         }
@@ -7003,6 +7014,36 @@ struct ReactWrapperReturnCollector {
 }
 
 impl ReactWrapperReturnCollector {
+    fn argument_param_combinations(&self, call: &CallExpression<'_>) -> Vec<Vec<Option<usize>>> {
+        let mut combinations = Vec::new();
+        let argument_count = call.arguments.len();
+        for (argument_index, argument) in call.arguments.iter().enumerate() {
+            let params = argument
+                .as_expression()
+                .map(|expression| {
+                    self.forwards_from_expression(expression)
+                        .into_iter()
+                        .filter_map(|forward| match forward {
+                            TranslatorReturnForward::ParameterCall { param_index, .. } => {
+                                Some(param_index)
+                            }
+                            _ => None,
+                        })
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            for param in params {
+                let mut combination = vec![None; argument_count];
+                combination[argument_index] = Some(param);
+                combinations.push(combination);
+            }
+        }
+        if combinations.is_empty() {
+            combinations.push(vec![None; argument_count]);
+        }
+        combinations
+    }
+
     fn structured_member_path(&self, expression: &Expression<'_>) -> Option<(String, String)> {
         let mut path = Vec::new();
         let root = expression_static_member_path(expression, &mut path)?;
@@ -7332,6 +7373,16 @@ impl ReactWrapperReturnCollector {
         let mut forwards = BTreeSet::new();
         match expression.get_inner_expression() {
             Expression::Identifier(identifier) => {
+                if let Some(param_index) = self
+                    .parameter_callables
+                    .get(identifier.name.as_str())
+                    .copied()
+                {
+                    forwards.insert(TranslatorReturnForward::ParameterCall {
+                        param_index,
+                        binding: dynamic_translator_binding(),
+                    });
+                }
                 forwards.extend(
                     self.forward_values
                         .get(identifier.name.as_str())
@@ -7362,25 +7413,13 @@ impl ReactWrapperReturnCollector {
                             binding: dynamic_translator_binding(),
                         });
                     } else {
-                        forwards.insert(TranslatorReturnForward::ForwardCall {
-                            namespace: None,
-                            name: identifier.name.to_string(),
-                            argument_params: call
-                                .arguments
-                                .iter()
-                                .map(|argument| {
-                                    argument.as_expression().and_then(|expression| {
-                                        expression.get_identifier_reference().and_then(
-                                            |identifier| {
-                                                self.parameter_callables
-                                                    .get(identifier.name.as_str())
-                                                    .copied()
-                                            },
-                                        )
-                                    })
-                                })
-                                .collect(),
-                        });
+                        forwards.extend(self.argument_param_combinations(call).into_iter().map(
+                            |argument_params| TranslatorReturnForward::ForwardCall {
+                                namespace: None,
+                                name: identifier.name.to_string(),
+                                argument_params,
+                            },
+                        ));
                     }
                 } else if let Some(member) = call.callee.get_member_expr()
                     && let (Some(namespace), Some(name)) = (
@@ -7388,25 +7427,13 @@ impl ReactWrapperReturnCollector {
                         member.static_property_name(),
                     )
                 {
-                    forwards.insert(TranslatorReturnForward::ForwardCall {
-                        namespace: Some(namespace.name.to_string()),
-                        name: name.to_string(),
-                        argument_params: call
-                            .arguments
-                            .iter()
-                            .map(|argument| {
-                                argument.as_expression().and_then(|expression| {
-                                    expression
-                                        .get_identifier_reference()
-                                        .and_then(|identifier| {
-                                            self.parameter_callables
-                                                .get(identifier.name.as_str())
-                                                .copied()
-                                        })
-                                })
-                            })
-                            .collect(),
-                    });
+                    forwards.extend(self.argument_param_combinations(call).into_iter().map(
+                        |argument_params| TranslatorReturnForward::ForwardCall {
+                            namespace: Some(namespace.name.to_string()),
+                            name: name.to_string(),
+                            argument_params,
+                        },
+                    ));
                 }
             }
             Expression::AwaitExpression(await_expression) => {
@@ -10786,6 +10813,52 @@ impl SourceIndexCollector {
         }
     }
 
+    fn wrapper_callable_alias_summary(&self, expression: &Expression<'_>) -> WrapperReturnSummary {
+        let mut summary = WrapperReturnSummary {
+            forwards: translator_return_callable_forwards(expression),
+            ..WrapperReturnSummary::default()
+        };
+        let Expression::CallExpression(call) = expression.get_inner_expression() else {
+            return summary;
+        };
+        let Some(member) = call.callee.get_member_expr() else {
+            return summary;
+        };
+        if member.static_property_name() != Some("bind") {
+            return summary;
+        }
+        let Some(target) = member.object().get_identifier_reference() else {
+            return summary;
+        };
+        let Some(index_forwards) = self.wrapper_array_index_forwards.get(target.name.as_str())
+        else {
+            return summary;
+        };
+        for (index, candidates) in index_forwards {
+            for param_index in candidates.iter().filter_map(|candidate| match candidate {
+                TranslatorReturnForward::ParameterCall { param_index, .. } => Some(*param_index),
+                _ => None,
+            }) {
+                let Some(argument) = call
+                    .arguments
+                    .get(param_index + 1)
+                    .and_then(Argument::as_expression)
+                else {
+                    continue;
+                };
+                let forwards = translator_return_callable_forwards(argument);
+                if !forwards.is_empty() {
+                    summary
+                        .array_index_forwards
+                        .entry(*index)
+                        .or_default()
+                        .extend(forwards);
+                }
+            }
+        }
+        summary
+    }
+
     fn translator_return_collector(
         &self,
         params: &oxc_ast::ast::FormalParameters<'_>,
@@ -11487,6 +11560,22 @@ impl<'a> Visit<'a> for SourceIndexCollector {
         }
     }
 
+    fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
+        if self.scope_depth == 1
+            && expression.operator == AssignmentOperator::Assign
+            && let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &expression.left
+        {
+            let name = identifier.name.to_string();
+            self.wrapper_return_helpers.remove(&name);
+            self.wrapper_return_forwards.remove(&name);
+            self.wrapper_array_return_indexes.remove(&name);
+            self.wrapper_array_index_forwards.remove(&name);
+            let summary = self.wrapper_callable_alias_summary(&expression.right);
+            self.record_wrapper_return_summary(&name, summary);
+        }
+        walk::walk_assignment_expression(self, expression);
+    }
+
     fn visit_import_declaration(&mut self, declaration: &ImportDeclaration<'a>) {
         let source = declaration.source.value.as_str();
         if source != "next-intl" && source != "next-intl/server" {
@@ -11802,10 +11891,7 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                     Expression::FunctionExpression(function) => {
                         self.function_wrapper_return_summary(function)
                     }
-                    _ => WrapperReturnSummary {
-                        forwards: translator_return_callable_forwards(init),
-                        ..WrapperReturnSummary::default()
-                    },
+                    _ => self.wrapper_callable_alias_summary(init),
                 };
                 self.record_wrapper_return_summary(name, wrapper_return);
             }
@@ -22122,6 +22208,124 @@ mod tests {
             &main,
             r#"
             import loadValues from './helper';
+            const [values, cleanup] = await loadValues();
+            values[0](runtimeKey);
+            cleanup('layer');
+            "#,
+        )
+        .expect("write main");
+
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&5), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn bound_aggregate_aliases_resolve_fixed_wrapper_arguments() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) {
+              return Promise.all([factory(), draw]);
+            }
+            const bound = aggregate.bind(null, useBaseValues);
+            const [values, cleanup] = await bound();
+            values[0](runtimeKey);
+            cleanup('layer');
+            "#,
+        );
+
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&9), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&10), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn aggregate_parameter_origins_survive_aliases_and_alternatives() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) {
+              return Promise.all([factory(), draw]);
+            }
+            function forward(factory, fallback) {
+              const selected = enabled ? factory : fallback;
+              return aggregate(selected);
+            }
+            const [values, cleanup] = await forward(useBaseValues, draw);
+            values[0](runtimeKey);
+            cleanup('layer');
+            "#,
+        );
+
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&12), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&13), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn assigned_aggregate_aliases_update_the_project_graph() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) {
+              return Promise.all([factory(), draw]);
+            }
+            let alias;
+            alias = aggregate;
+            const [values, cleanup] = await alias(useBaseValues);
+            values[0](runtimeKey);
+            cleanup('layer');
+            "#,
+        );
+
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&10), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&11), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn default_re_exports_preserve_wrapper_array_indexes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper = dir.path().join("helper.ts");
+        let barrel = dir.path().join("barrel.ts");
+        let main = dir.path().join("main.ts");
+        fs::write(
+            &helper,
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            export default async function loadValues() {
+              return Promise.all([useBaseValues(), draw]);
+            }
+            "#,
+        )
+        .expect("write helper");
+        fs::write(&barrel, "export {default} from './helper';").expect("write barrel");
+        fs::write(
+            &main,
+            r#"
+            import loadValues from './barrel';
             const [values, cleanup] = await loadValues();
             values[0](runtimeKey);
             cleanup('layer');
