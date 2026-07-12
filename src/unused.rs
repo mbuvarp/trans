@@ -18,8 +18,8 @@ use oxc_ast::ast::{
     JSXAttributeValue, JSXChild, JSXElement, JSXElementName, JSXExpression,
     JSXMemberExpressionObject, JSXOpeningElement, ModuleExportName, ObjectAssignmentTarget,
     ObjectExpression, ObjectPropertyKind, PropertyKind, ReturnStatement, Statement,
-    StaticMemberExpression, TSInterfaceDeclaration, TSLiteral, TSSignature, TSType,
-    TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator, TSTypeQueryExprName,
+    StaticMemberExpression, SwitchStatement, TSInterfaceDeclaration, TSLiteral, TSSignature,
+    TSType, TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator, TSTypeQueryExprName,
     TemplateLiteral, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
@@ -473,6 +473,9 @@ struct WrapperCallableTarget {
     bound_argument_targets: BTreeMap<usize, BTreeSet<WrapperCallableTarget>>,
     bound_wrapper_arguments: BTreeSet<usize>,
     bound_argument_count: usize,
+    bound_unknown_from: Option<usize>,
+    bound_unknown_may_wrap: bool,
+    bound_unknown_targets: BTreeSet<WrapperCallableTarget>,
 }
 
 impl WrapperCallableTarget {
@@ -483,6 +486,9 @@ impl WrapperCallableTarget {
             bound_argument_targets: BTreeMap::new(),
             bound_wrapper_arguments: BTreeSet::new(),
             bound_argument_count: 0,
+            bound_unknown_from: None,
+            bound_unknown_may_wrap: false,
+            bound_unknown_targets: BTreeSet::new(),
         }
     }
 }
@@ -7385,20 +7391,23 @@ impl ReactWrapperReturnCollector {
                         .expect("bind member checked")
                         .object(),
                 );
-                let bound_argument_targets = call
-                    .arguments
+                let bound_arguments = call.arguments.iter().skip(1).collect::<Vec<_>>();
+                let unknown_position = bound_arguments
                     .iter()
-                    .skip(1)
+                    .position(|argument| matches!(argument, Argument::SpreadElement(_)));
+                let fixed_count = unknown_position.unwrap_or(bound_arguments.len());
+                let fixed_argument_targets = bound_arguments
+                    .iter()
+                    .take(fixed_count)
                     .enumerate()
                     .filter_map(|(index, argument)| {
                         let targets = self.wrapper_callable_targets(argument.as_expression()?);
                         (!targets.is_empty()).then_some((index, targets))
                     })
                     .collect::<BTreeMap<_, _>>();
-                let bound_wrapper_arguments = call
-                    .arguments
+                let fixed_wrapper_arguments = bound_arguments
                     .iter()
-                    .skip(1)
+                    .take(fixed_count)
                     .enumerate()
                     .filter_map(|(index, argument)| {
                         argument
@@ -7409,13 +7418,51 @@ impl ReactWrapperReturnCollector {
                             .then_some(index)
                     })
                     .collect::<BTreeSet<_>>();
-                let bound_argument_count = call.arguments.len().saturating_sub(1);
+                let unknown_targets = bound_arguments
+                    .iter()
+                    .skip(fixed_count)
+                    .filter_map(|argument| argument.as_expression())
+                    .flat_map(|argument| self.wrapper_callable_targets(argument))
+                    .collect::<BTreeSet<_>>();
+                let unknown_may_wrap = unknown_position.is_some()
+                    || bound_arguments.iter().skip(fixed_count).any(|argument| {
+                        argument.as_expression().is_some_and(|argument| {
+                            self.inline_expression_returns_wrapper(argument)
+                        })
+                    });
                 targets = targets
                     .into_iter()
                     .map(|mut target| {
-                        target.bound_argument_targets = bound_argument_targets.clone();
-                        target.bound_wrapper_arguments = bound_wrapper_arguments.clone();
-                        target.bound_argument_count = bound_argument_count;
+                        if target.bound_unknown_from.is_some() {
+                            target.bound_unknown_may_wrap |= unknown_may_wrap;
+                            target
+                                .bound_unknown_targets
+                                .extend(unknown_targets.iter().cloned());
+                            target.bound_unknown_targets.extend(
+                                fixed_argument_targets
+                                    .values()
+                                    .flat_map(|targets| targets.iter().cloned()),
+                            );
+                            target.bound_unknown_may_wrap |= !fixed_wrapper_arguments.is_empty();
+                            return target;
+                        }
+                        let offset = target.bound_argument_count;
+                        for (index, targets) in &fixed_argument_targets {
+                            target
+                                .bound_argument_targets
+                                .entry(offset + index)
+                                .or_default()
+                                .extend(targets.iter().cloned());
+                        }
+                        target
+                            .bound_wrapper_arguments
+                            .extend(fixed_wrapper_arguments.iter().map(|index| offset + index));
+                        target.bound_argument_count += fixed_count;
+                        if unknown_position.is_some() {
+                            target.bound_unknown_from = Some(target.bound_argument_count);
+                            target.bound_unknown_may_wrap = unknown_may_wrap;
+                            target.bound_unknown_targets = unknown_targets.clone();
+                        }
                         target
                     })
                     .collect();
@@ -7435,13 +7482,13 @@ impl ReactWrapperReturnCollector {
     }
 
     fn inline_expression_returns_wrapper(&self, expression: &Expression<'_>) -> bool {
-        let body = match expression.get_inner_expression() {
-            Expression::ArrowFunctionExpression(arrow) => &arrow.body,
+        let (body, expression_body) = match expression.get_inner_expression() {
+            Expression::ArrowFunctionExpression(arrow) => (&*arrow.body, arrow.expression),
             Expression::FunctionExpression(function) => {
                 let Some(body) = &function.body else {
                     return false;
                 };
-                body
+                (&**body, false)
             }
             Expression::ConditionalExpression(conditional) => {
                 return self.inline_expression_returns_wrapper(&conditional.consequent)
@@ -7453,7 +7500,8 @@ impl ReactWrapperReturnCollector {
             }
             _ => return false,
         };
-        if let Some(Statement::ExpressionStatement(statement)) = body.statements.first()
+        if expression_body
+            && let Some(Statement::ExpressionStatement(statement)) = body.statements.first()
             && body.statements.len() == 1
             && self.expression_returns_wrapper(&statement.expression)
         {
@@ -13205,7 +13253,7 @@ impl SourceUsageCollector {
             definition_shadowed_bindings,
             visited,
         )?;
-        if target.bound_argument_count == 0 {
+        if target.bound_argument_count == 0 && target.bound_unknown_from.is_none() {
             return Some(resolution);
         }
         let mut remaining = BTreeMap::<usize, BTreeSet<usize>>::new();
@@ -13226,6 +13274,18 @@ impl SourceUsageCollector {
                             })
                         });
                     }
+                } else if target.bound_unknown_from.is_some_and(|from| param >= from) {
+                    wrapper_argument |= target.bound_unknown_may_wrap;
+                    wrapper_argument |= target.bound_unknown_targets.iter().any(|target| {
+                        self.resolved_wrapper_callable_target_at_depth(
+                            target,
+                            definition_shadowed_bindings,
+                            visited,
+                        )
+                        .is_some_and(|resolution| {
+                            resolution.direct || !resolution.indexes.is_empty()
+                        })
+                    });
                 } else {
                     remaining
                         .entry(index)
@@ -19272,6 +19332,25 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         walk::walk_block_statement(self, block);
     }
 
+    fn visit_switch_statement(&mut self, statement: &SwitchStatement<'a>) {
+        let bindings = statement
+            .cases
+            .iter()
+            .flat_map(|case| block_scope_bindings(&case.consequent))
+            .collect::<BTreeSet<_>>();
+        let mut shadowed_bindings = self.shadowed_project_bindings.clone();
+        shadowed_bindings.extend(bindings.iter().cloned());
+        let mut resolutions = BTreeMap::new();
+        for case in &statement.cases {
+            resolutions.extend(
+                self.hoisted_local_wrapper_resolutions(&case.consequent, &shadowed_bindings),
+            );
+        }
+        self.pending_lexical_bindings = Some(bindings);
+        self.pending_local_wrapper_resolutions = Some(resolutions);
+        walk::walk_switch_statement(self, statement);
+    }
+
     fn visit_ts_type_alias_declaration(&mut self, declaration: &TSTypeAliasDeclaration<'a>) {
         self.record_ts_type_alias(declaration);
         walk::walk_ts_type_alias_declaration(self, declaration);
@@ -24273,6 +24352,98 @@ mod tests {
         .expect("write main");
         let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
         assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 10));
+    }
+
+    #[test]
+    fn nested_and_spread_bound_wrapper_arguments_remain_conservative() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function scope() {
+              const [nested] = await nestedForward();
+              nested[0][0](nestedKey);
+              const [spread] = await spreadForward();
+              spread[0][0](spreadKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function nestedForward() {
+                return outer(inner.bind(null, useBaseValues).bind(null));
+              }
+              async function spreadForward() {
+                return outer(inner.bind(null, ...runtimeArguments));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&8), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn block_inline_callbacks_do_not_imply_wrapper_returns() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            async function scope() {
+              const [arrow] = await arrowForward();
+              arrow[0](arrowKey);
+              const [functionValue] = await functionForward();
+              functionValue[0](functionKey);
+              async function aggregate(factory) { return Promise.all([factory(), draw]); }
+              async function arrowForward() {
+                return aggregate(() => { useMemo(() => runtimeValues(), []); });
+              }
+              async function functionForward() {
+                return aggregate(function () { useMemo(() => runtimeValues(), []); });
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(!lines.contains(&5), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&7), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn switch_lexical_wrapper_bindings_are_registered_before_forwarders() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper = dir.path().join("helper.ts");
+        let main = dir.path().join("main.ts");
+        fs::write(
+            &helper,
+            "export async function aggregate() { return [draw]; }",
+        )
+        .expect("write helper");
+        fs::write(
+            &main,
+            r#"
+            import {useMemo} from 'react';
+            import {aggregate} from './helper';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function scope() {
+              switch (mode) {
+                default:
+                  async function forward() { return aggregate(useBaseValues); }
+                  const aggregate = async factory => Promise.all([factory(), draw]);
+                  const [values] = await forward();
+                  values[0](runtimeKey);
+              }
+            }
+            "#,
+        )
+        .expect("write main");
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 11));
     }
 
     #[test]
