@@ -6584,6 +6584,9 @@ struct ReactWrapperReturnCollector {
     transparent_namespaces: BTreeSet<String>,
     wrapper_values: BTreeSet<String>,
     forward_values: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
+    structured_values: BTreeSet<String>,
+    wrapper_member_values: BTreeSet<(String, String)>,
+    forward_member_values: BTreeMap<(String, String), BTreeSet<TranslatorReturnForward>>,
     direct: bool,
     forwards: BTreeSet<TranslatorReturnForward>,
 }
@@ -6664,7 +6667,14 @@ impl ReactWrapperReturnCollector {
                 })
             }
             Expression::StaticMemberExpression(member) => {
-                self.expression_returns_wrapper(&member.object)
+                if let Some(object) = member.object.get_identifier_reference()
+                    && self.structured_values.contains(object.name.as_str())
+                {
+                    self.wrapper_member_values
+                        .contains(&(object.name.to_string(), member.property.name.to_string()))
+                } else {
+                    self.expression_returns_wrapper(&member.object)
+                }
             }
             Expression::ComputedMemberExpression(member) => {
                 self.expression_returns_wrapper(&member.object)
@@ -6764,7 +6774,19 @@ impl ReactWrapperReturnCollector {
                 }
             }
             Expression::StaticMemberExpression(member) => {
-                forwards.extend(self.forwards_from_expression(&member.object));
+                if let Some(object) = member.object.get_identifier_reference()
+                    && self.structured_values.contains(object.name.as_str())
+                {
+                    forwards.extend(
+                        self.forward_member_values
+                            .get(&(object.name.to_string(), member.property.name.to_string()))
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                } else {
+                    forwards.extend(self.forwards_from_expression(&member.object));
+                }
             }
             Expression::ComputedMemberExpression(member) => {
                 forwards.extend(self.forwards_from_expression(&member.object));
@@ -6823,6 +6845,31 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         };
         let wrapper = self.expression_returns_wrapper(init);
         let forwards = self.forwards_from_expression(init);
+        if let BindingPattern::BindingIdentifier(identifier) = &declarator.id
+            && let Expression::ObjectExpression(object) = init.get_inner_expression()
+        {
+            let name = identifier.name.to_string();
+            self.structured_values.insert(name.clone());
+            for property in &object.properties {
+                let ObjectPropertyKind::ObjectProperty(property) = property else {
+                    continue;
+                };
+                if property.computed {
+                    continue;
+                }
+                let Some(property_name) = property.key.static_name() else {
+                    continue;
+                };
+                let key = (name.clone(), property_name.to_string());
+                if self.expression_returns_wrapper(&property.value) {
+                    self.wrapper_member_values.insert(key.clone());
+                }
+                let member_forwards = self.forwards_from_expression(&property.value);
+                if !member_forwards.is_empty() {
+                    self.forward_member_values.insert(key, member_forwards);
+                }
+            }
+        }
         let state = matches!(init.get_inner_expression(), Expression::CallExpression(call) if self.call_is_wrapper(call, "useState"));
         if wrapper {
             self.wrapper_values.extend(
@@ -9698,6 +9745,9 @@ impl SourceIndexCollector {
             transparent_namespaces,
             wrapper_values: BTreeSet::new(),
             forward_values: BTreeMap::new(),
+            structured_values: BTreeSet::new(),
+            wrapper_member_values: BTreeSet::new(),
+            forward_member_values: BTreeMap::new(),
             direct: false,
             forwards: BTreeSet::new(),
         }
@@ -12104,6 +12154,10 @@ impl SourceUsageCollector {
             Expression::AwaitExpression(await_expression) => {
                 self.potential_wrapper_callable_paths_from_expression(&await_expression.argument)
             }
+            Expression::CallExpression(call) => self
+                .object_assign_wrapper_paths(call)
+                .map(|(paths, _)| paths)
+                .unwrap_or_default(),
             _ => PotentialWrapperPaths::default(),
         }
     }
@@ -12295,12 +12349,19 @@ impl SourceUsageCollector {
             }
             BindingPattern::AssignmentPattern(assignment) => {
                 self.bind_pattern_potential_wrapper_paths(&assignment.left, paths, prefix);
-                let mut default_paths =
-                    self.potential_wrapper_callable_paths_from_expression(&assignment.right);
-                if self.expression_is_potential_wrapper_callable(&assignment.right) {
-                    default_paths.included.insert(String::new());
+                let source = Self::potential_wrapper_paths_relative(paths, prefix);
+                if !source.excluded.contains("") || source.contains("") {
+                    let mut default_paths =
+                        self.potential_wrapper_callable_paths_from_expression(&assignment.right);
+                    if self.expression_is_potential_wrapper_callable(&assignment.right) {
+                        default_paths.included.insert(String::new());
+                    }
+                    self.bind_pattern_potential_wrapper_paths(
+                        &assignment.left,
+                        &default_paths,
+                        &[],
+                    );
                 }
-                self.bind_pattern_potential_wrapper_paths(&assignment.left, &default_paths, &[]);
             }
             BindingPattern::ObjectPattern(object) => {
                 let mut consumed = BTreeSet::new();
@@ -12493,16 +12554,19 @@ impl SourceUsageCollector {
                     paths,
                     prefix,
                 );
-                let mut default_paths =
-                    self.potential_wrapper_callable_paths_from_expression(&default.init);
-                if self.expression_is_potential_wrapper_callable(&default.init) {
-                    default_paths.included.insert(String::new());
+                let source = Self::potential_wrapper_paths_relative(paths, prefix);
+                if !source.excluded.contains("") || source.contains("") {
+                    let mut default_paths =
+                        self.potential_wrapper_callable_paths_from_expression(&default.init);
+                    if self.expression_is_potential_wrapper_callable(&default.init) {
+                        default_paths.included.insert(String::new());
+                    }
+                    self.bind_assignment_target_potential_wrapper_paths(
+                        &default.binding,
+                        &default_paths,
+                        &[],
+                    );
                 }
-                self.bind_assignment_target_potential_wrapper_paths(
-                    &default.binding,
-                    &default_paths,
-                    &[],
-                );
             }
             AssignmentTargetMaybeDefault::AssignmentTargetIdentifier(identifier) => {
                 self.bind_potential_wrapper_name(identifier.name.as_str(), paths, prefix);
@@ -16399,45 +16463,39 @@ impl SourceUsageCollector {
 }
 
 impl SourceUsageCollector {
-    fn apply_object_assign_wrapper_paths(&mut self, call: &CallExpression<'_>) {
+    fn is_object_assign_call(&self, call: &CallExpression<'_>) -> bool {
         let Some(member) = call.callee.get_member_expr() else {
-            return;
+            return false;
         };
-        if member.static_property_name() != Some("assign")
-            || !member
+        member.static_property_name() == Some("assign")
+            && member
                 .object()
                 .get_identifier_reference()
                 .is_some_and(|identifier| identifier.name == "Object")
-            || self
+            && !self
                 .file_index
                 .as_ref()
                 .is_some_and(|file| file.shadowed_builtins.contains("Object"))
-        {
-            return;
+    }
+
+    fn object_assign_wrapper_paths(
+        &self,
+        call: &CallExpression<'_>,
+    ) -> Option<(PotentialWrapperPaths, bool)> {
+        if !self.is_object_assign_call(call) {
+            return None;
         }
-        let Some(target) = call
-            .arguments
-            .first()
-            .and_then(Argument::as_expression)
-            .and_then(Expression::get_identifier_reference)
-            .map(|identifier| identifier.name.to_string())
-        else {
-            return;
-        };
-        let mut paths = self
-            .potential_wrapper_callable_paths
-            .get(&target)
-            .cloned()
-            .unwrap_or_default();
-        let mut wrapper_value = self.potential_wrapper_values.contains(&target);
-        for source in call
-            .arguments
-            .iter()
-            .skip(1)
-            .filter_map(Argument::as_expression)
-        {
+        let target = call.arguments.first()?.as_expression()?;
+        let mut paths = self.potential_wrapper_callable_paths_from_expression(target);
+        let mut wrapper_value = self.expression_is_potential_wrapper_value(target);
+        for argument in call.arguments.iter().skip(1) {
+            let (source, spread) = match argument {
+                Argument::SpreadElement(spread) => (&spread.argument, true),
+                _ => (argument.as_expression()?, false),
+            };
             let source_paths = self.potential_wrapper_callable_paths_from_expression(source);
-            if let Some(bindings) = self.translator_object_bindings_from_expression(source) {
+            let bindings = self.translator_object_bindings_from_expression(source);
+            if let Some(bindings) = &bindings {
                 let overwritten = bindings
                     .resolved_properties
                     .iter()
@@ -16452,17 +16510,45 @@ impl SourceUsageCollector {
             }
             if self.expression_is_potential_wrapper_value(source) {
                 wrapper_value = true;
-                paths.included.insert("*".to_string());
+                if spread || (bindings.is_none() && source_paths.is_empty()) {
+                    paths.included.insert("*".to_string());
+                }
             }
             paths.included.extend(source_paths.included);
             paths.excluded.extend(source_paths.excluded);
         }
-        if !paths.is_empty() {
-            self.potential_wrapper_callable_paths
-                .insert(target.clone(), paths);
+        Some((paths, wrapper_value))
+    }
+
+    fn apply_object_assign_wrapper_paths(&mut self, call: &CallExpression<'_>) {
+        let Some((assigned_paths, wrapper_value)) = self.object_assign_wrapper_paths(call) else {
+            return;
+        };
+        let Some(target) = call.arguments.first().and_then(Argument::as_expression) else {
+            return;
+        };
+        if let Some(identifier) = target.get_identifier_reference() {
+            if !assigned_paths.is_empty() {
+                self.potential_wrapper_callable_paths
+                    .insert(identifier.name.to_string(), assigned_paths);
+            }
+            if wrapper_value {
+                self.potential_wrapper_values
+                    .insert(identifier.name.to_string());
+            }
+            return;
         }
+        let mut path = Vec::new();
+        let Some(root) = expression_static_member_path(target, &mut path) else {
+            return;
+        };
+        let property = path.join(".");
+        self.potential_wrapper_callable_paths
+            .entry(root.to_string())
+            .or_default()
+            .assign_property(&property, false, &assigned_paths);
         if wrapper_value {
-            self.potential_wrapper_values.insert(target);
+            self.potential_wrapper_values.insert(root.to_string());
         }
     }
 }
@@ -16922,6 +17008,8 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             self.potential_wrapper_callable_paths
                 .insert(name.to_string(), inherited_wrapper_callable_paths.clone());
         }
+        self.potential_wrapper_values
+            .extend(destructured_wrapper_callables.iter().cloned());
         self.potential_wrapper_callables
             .extend(destructured_wrapper_callables);
         self.bind_pattern_potential_wrapper_paths(
@@ -20206,6 +20294,107 @@ mod tests {
             }
             const values = useShadowedValues(runtimePromise);
             values[0](runtimeKey);
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.is_empty(), "{:#?}", scan.dynamic_usages);
+    }
+
+    #[test]
+    fn aggregate_destructuring_preserves_nested_wrapper_values() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function useAllValues() { return Promise.all([useBaseValues()]); }
+            async function run() {
+              const [values] = await useAllValues();
+              values[0](runtimeKey);
+            }
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 7));
+    }
+
+    #[test]
+    fn object_assign_expressions_members_and_spreads_preserve_paths() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const values = useMemo(() => runtimeValues(), []);
+            const callable = values[0];
+            const result = Object.assign({}, {value: callable});
+            result.value(runtimeKey);
+            const holder = {target: {}};
+            Object.assign(holder.target, {value: callable});
+            holder.target.value(runtimeKey);
+            const sources = [{value: callable}];
+            const spreadResult = Object.assign({}, ...sources);
+            spreadResult.whichever(runtimeKey);
+            "#,
+        );
+
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&9), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&12), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn known_object_assign_sources_do_not_promote_siblings() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const values = useMemo(() => runtimeValues(), []);
+            const callable = values[0];
+            const target = {};
+            Object.assign(target, {value: callable, cleanup: draw});
+            target.cleanup('layer');
+            target.value(runtimeKey);
+            "#,
+        );
+
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(!lines.contains(&7), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&8), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn resolved_destructuring_sources_skip_wrapper_defaults() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const values = useMemo(() => runtimeValues(), []);
+            const callable = values[0];
+            const {value = callable} = {value: draw};
+            value('layer');
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.is_empty(), "{:#?}", scan.dynamic_usages);
+    }
+
+    #[test]
+    fn selected_member_wrapper_returns_ignore_siblings() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            function useCleanup() {
+              const state = {values: useBaseValues(), cleanup: draw};
+              return state.cleanup;
+            }
+            const cleanup = useCleanup();
+            cleanup('layer');
             "#,
         );
 
