@@ -379,6 +379,7 @@ struct SourceFileIndex {
     imports: BTreeMap<String, ImportTarget>,
     namespace_imports: BTreeMap<String, String>,
     re_exports: BTreeMap<String, ImportTarget>,
+    namespace_re_exports: BTreeMap<String, String>,
     star_re_exports: Vec<String>,
     dependency_sources: BTreeSet<String>,
     shadowed_builtins: BTreeSet<String>,
@@ -1183,7 +1184,7 @@ fn find_unused_with_options(
         {
             continue;
         }
-        if apply_dynamic_exclusions && is_dynamic_protected(id, &scan.dynamic_usages) {
+        if is_dynamic_protected(id, &scan.dynamic_usages, apply_dynamic_exclusions) {
             continue;
         }
         unused_ids.push(id.clone());
@@ -1251,16 +1252,17 @@ fn write_snapshot(root: &Path, config: &TransConfig, snapshot: &TranslationSnaps
     Ok(())
 }
 
-fn is_dynamic_protected(id: &str, dynamic_usages: &[DynamicUsage]) -> bool {
+fn is_dynamic_protected(id: &str, dynamic_usages: &[DynamicUsage], apply_unbounded: bool) -> bool {
     dynamic_usages.iter().any(|prefix| {
         if let Some(keys) = &prefix.possible_keys {
             return keys.iter().any(|key| translation_id_matches_key(id, key));
         }
-        prefix.namespace.is_empty()
-            || id == prefix.namespace
-            || id
-                .strip_prefix(&prefix.namespace)
-                .is_some_and(|remaining| remaining.starts_with('.'))
+        apply_unbounded
+            && (prefix.namespace.is_empty()
+                || id == prefix.namespace
+                || id
+                    .strip_prefix(&prefix.namespace)
+                    .is_some_and(|remaining| remaining.starts_with('.')))
     })
 }
 
@@ -1674,6 +1676,80 @@ impl ProjectIndex {
         target: &ImportTarget,
     ) -> Option<NextIntlFactory> {
         self.next_intl_factory_for_import_at_depth(from, target, 0)
+    }
+
+    fn next_intl_factory_for_imported_namespace_member(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+        member: &str,
+    ) -> Option<NextIntlFactory> {
+        self.next_intl_factory_for_imported_namespace_member_at_depth(from, target, member, 0)
+    }
+
+    fn next_intl_factory_for_namespace_source(
+        &self,
+        from: &Path,
+        source: &str,
+        member: &str,
+        depth: usize,
+    ) -> Option<NextIntlFactory> {
+        NextIntlFactory::direct(source, member).or_else(|| {
+            self.next_intl_factory_for_import_at_depth(
+                from,
+                &ImportTarget {
+                    source: source.to_string(),
+                    imported: ImportedName::Named(member.to_string()),
+                },
+                depth + 1,
+            )
+        })
+    }
+
+    fn next_intl_factory_for_imported_namespace_member_at_depth(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+        member: &str,
+        depth: usize,
+    ) -> Option<NextIntlFactory> {
+        if depth > 16 {
+            return None;
+        }
+        let path = self.resolve_module(from, &target.source)?;
+        let file = self.files.get(&path)?;
+        let exported = match &target.imported {
+            ImportedName::Named(name) => name.as_str(),
+            ImportedName::Default => "default",
+        };
+        file.namespace_re_exports
+            .get(exported)
+            .and_then(|source| {
+                self.next_intl_factory_for_namespace_source(&path, source, member, depth + 1)
+            })
+            .or_else(|| {
+                file.translator_return_export_locals
+                    .get(exported)
+                    .and_then(|local| file.namespace_imports.get(local))
+                    .and_then(|source| {
+                        self.next_intl_factory_for_namespace_source(
+                            &path,
+                            source,
+                            member,
+                            depth + 1,
+                        )
+                    })
+            })
+            .or_else(|| {
+                file.re_exports.get(exported).and_then(|target| {
+                    self.next_intl_factory_for_imported_namespace_member_at_depth(
+                        &path,
+                        target,
+                        member,
+                        depth + 1,
+                    )
+                })
+            })
     }
 
     fn next_intl_factory_for_import_at_depth(
@@ -14120,23 +14196,25 @@ fn static_factory_namespace_arg(call: &CallExpression<'_>) -> NamespaceArg {
     };
     match argument {
         Argument::StringLiteral(literal) => NamespaceArg::Scoped(literal.value.to_string()),
-        Argument::ObjectExpression(object) => object
-            .properties
-            .iter()
-            .find_map(|property| {
-                let ObjectPropertyKind::ObjectProperty(property) = property else {
-                    return None;
-                };
-                (property.key.static_name().as_deref() == Some("namespace")).then(
-                    || match &property.value {
-                        Expression::StringLiteral(literal) => {
-                            NamespaceArg::Scoped(literal.value.to_string())
-                        }
-                        _ => NamespaceArg::Dynamic,
-                    },
-                )
-            })
-            .unwrap_or(NamespaceArg::Unscoped),
+        Argument::ObjectExpression(object) => {
+            for property in object.properties.iter().rev() {
+                match property {
+                    ObjectPropertyKind::SpreadProperty(_) => return NamespaceArg::Dynamic,
+                    ObjectPropertyKind::ObjectProperty(property)
+                        if property.key.static_name().as_deref() == Some("namespace") =>
+                    {
+                        return match &property.value {
+                            Expression::StringLiteral(literal) => {
+                                NamespaceArg::Scoped(literal.value.to_string())
+                            }
+                            _ => NamespaceArg::Dynamic,
+                        };
+                    }
+                    ObjectPropertyKind::ObjectProperty(_) => {}
+                }
+            }
+            NamespaceArg::Unscoped
+        }
         _ => NamespaceArg::Dynamic,
     }
 }
@@ -15332,6 +15410,7 @@ struct SourceIndexCollector {
     imports: BTreeMap<String, ImportTarget>,
     namespace_imports: BTreeMap<String, String>,
     re_exports: BTreeMap<String, ImportTarget>,
+    namespace_re_exports: BTreeMap<String, String>,
     star_re_exports: Vec<String>,
     dependency_sources: BTreeSet<String>,
     shadowed_builtins: BTreeSet<String>,
@@ -16039,6 +16118,7 @@ impl SourceIndexCollector {
             imports: self.imports,
             namespace_imports: self.namespace_imports,
             re_exports: self.re_exports,
+            namespace_re_exports: self.namespace_re_exports,
             star_re_exports: self.star_re_exports,
             dependency_sources: self.dependency_sources,
             shadowed_builtins: self.shadowed_builtins,
@@ -17018,6 +17098,11 @@ impl<'a> Visit<'a> for SourceIndexCollector {
         self.dependency_sources.insert(source.clone());
         if declaration.exported.is_none() && !declaration.export_kind.is_type() {
             self.star_re_exports.push(source);
+        } else if !declaration.export_kind.is_type()
+            && let Some(exported) = declaration.exported.as_ref().and_then(module_export_name)
+        {
+            self.namespace_re_exports
+                .insert(exported.to_string(), source);
         }
         walk::walk_export_all_declaration(self, declaration);
     }
@@ -19941,18 +20026,18 @@ impl SourceUsageCollector {
             return None;
         }
         let project = self.project.as_ref()?;
-        let source = self
-            .file_index
-            .as_ref()?
-            .namespace_imports
-            .get(object.name.as_str())?;
-        project.next_intl_factory_for_import(
-            &self.path,
-            &ImportTarget {
-                source: source.clone(),
-                imported: ImportedName::Named(name.to_string()),
-            },
-        )
+        let file = self.file_index.as_ref()?;
+        if let Some(source) = file.namespace_imports.get(object.name.as_str()) {
+            return project.next_intl_factory_for_import(
+                &self.path,
+                &ImportTarget {
+                    source: source.clone(),
+                    imported: ImportedName::Named(name.to_string()),
+                },
+            );
+        }
+        let target = file.imports.get(object.name.as_str())?;
+        project.next_intl_factory_for_imported_namespace_member(&self.path, target, name.as_ref())
     }
 
     fn message_paths_from_expression(&self, expression: &Expression<'_>) -> Option<FiniteStrings> {
@@ -25758,6 +25843,82 @@ mod tests {
     }
 
     #[test]
+    fn helper_factory_summaries_reject_overridable_namespaces() {
+        let scan = scan(
+            r#"
+            import {getTranslations} from 'next-intl/server';
+            function getTranslator(opts) {
+              return getTranslations({namespace: 'app', ...opts});
+            }
+            const t = await getTranslator(runtimeOptions);
+            t('title');
+            "#,
+        );
+
+        assert!(!scan.used_ids.contains("app.title"));
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace.is_empty())
+        );
+    }
+
+    #[test]
+    fn bounded_dynamic_keys_remain_protected_when_unbounded_protection_is_forced_off() {
+        let dynamic_usages = vec![
+            DynamicUsage {
+                namespace: String::new(),
+                namespace_unknown: true,
+                path: PathBuf::from("unknown.ts"),
+                line: 1,
+                possible_keys: None,
+                key_start: None,
+                key_end: None,
+            },
+            DynamicUsage {
+                namespace: String::new(),
+                namespace_unknown: true,
+                path: PathBuf::from("bounded.ts"),
+                line: 1,
+                possible_keys: Some(BTreeSet::from(["title".to_string()])),
+                key_start: None,
+                key_end: None,
+            },
+        ];
+
+        assert!(is_dynamic_protected("app.title", &dynamic_usages, false,));
+        assert!(!is_dynamic_protected(
+            "app.description",
+            &dynamic_usages,
+            false,
+        ));
+    }
+
+    #[test]
+    fn resolves_exported_next_intl_namespaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let barrel = dir.path().join("intl.ts");
+        let main = dir.path().join("main.ts");
+        fs::write(&barrel, "export * as intl from 'next-intl';").expect("write namespace barrel");
+        fs::write(
+            &main,
+            r#"
+            import {intl} from './intl';
+            const t = intl.useTranslations('app');
+            t(runtimeKey);
+            "#,
+        )
+        .expect("write namespace consumer");
+
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "app")
+        );
+    }
+
+    #[test]
     fn later_namespace_spreads_make_factories_dynamic() {
         let scan = scan(
             r#"
@@ -25809,11 +25970,13 @@ mod tests {
 
         assert!(is_dynamic_protected(
             "Navigation.title",
-            &scan.dynamic_usages
+            &scan.dynamic_usages,
+            true,
         ));
         assert!(!is_dynamic_protected(
             "Footer.copyright.year",
-            &scan.dynamic_usages
+            &scan.dynamic_usages,
+            true,
         ));
     }
 
