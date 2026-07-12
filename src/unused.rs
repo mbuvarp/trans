@@ -2788,10 +2788,9 @@ impl ProjectIndex {
                 if !indexes.is_empty() {
                     Some(indexes)
                 } else {
-                    file.default_local_export
-                        .as_ref()
-                        .and_then(|local| file.wrapper_array_return_indexes.get(local))
-                        .cloned()
+                    file.default_local_export.as_ref().and_then(|local| {
+                        self.wrapper_array_indexes_for_local_at_depth(&path, local, depth + 1)
+                    })
                 }
             }
         }
@@ -2802,10 +2801,23 @@ impl ProjectIndex {
         path: &Path,
         name: &str,
     ) -> BTreeMap<usize, BTreeSet<usize>> {
+        self.wrapper_array_parameter_indexes_for_local_at_depth(path, name, 0)
+    }
+
+    fn wrapper_array_parameter_indexes_for_local_at_depth(
+        &self,
+        path: &Path,
+        name: &str,
+        depth: usize,
+    ) -> BTreeMap<usize, BTreeSet<usize>> {
+        if depth > 16 {
+            return BTreeMap::new();
+        }
         let Some(file) = self.files.get(path) else {
             return BTreeMap::new();
         };
-        file.wrapper_array_index_forwards
+        let mut indexes = file
+            .wrapper_array_index_forwards
             .get(name)
             .into_iter()
             .flat_map(|forwards| forwards.iter())
@@ -2821,7 +2833,99 @@ impl ProjectIndex {
                     .collect::<BTreeSet<_>>();
                 (!params.is_empty()).then_some((*index, params))
             })
-            .collect()
+            .collect::<BTreeMap<_, _>>();
+        let Some(forwards) = file.wrapper_return_forwards.get(name) else {
+            return indexes;
+        };
+        for forward in forwards {
+            let (resolved, argument_params) = match forward {
+                TranslatorReturnForward::Local(callee) => {
+                    let resolved = file.imports.get(callee).map_or_else(
+                        || {
+                            self.wrapper_array_parameter_indexes_for_local_at_depth(
+                                path,
+                                callee,
+                                depth + 1,
+                            )
+                        },
+                        |target| {
+                            self.wrapper_array_parameter_indexes_for_import_at_depth(
+                                path,
+                                target,
+                                depth + 1,
+                            )
+                        },
+                    );
+                    (resolved, None)
+                }
+                TranslatorReturnForward::NamespaceMember { namespace, name } => {
+                    let resolved = file
+                        .namespace_imports
+                        .get(namespace)
+                        .map(|source| {
+                            self.wrapper_array_parameter_indexes_for_import_at_depth(
+                                path,
+                                &ImportTarget {
+                                    source: source.clone(),
+                                    imported: ImportedName::Named(name.clone()),
+                                },
+                                depth + 1,
+                            )
+                        })
+                        .unwrap_or_default();
+                    (resolved, None)
+                }
+                TranslatorReturnForward::ForwardCall {
+                    namespace,
+                    name,
+                    argument_params,
+                } => {
+                    let resolved = if let Some(namespace) = namespace {
+                        file.namespace_imports
+                            .get(namespace)
+                            .map(|source| {
+                                self.wrapper_array_parameter_indexes_for_import_at_depth(
+                                    path,
+                                    &ImportTarget {
+                                        source: source.clone(),
+                                        imported: ImportedName::Named(name.clone()),
+                                    },
+                                    depth + 1,
+                                )
+                            })
+                            .unwrap_or_default()
+                    } else if let Some(target) = file.imports.get(name) {
+                        self.wrapper_array_parameter_indexes_for_import_at_depth(
+                            path,
+                            target,
+                            depth + 1,
+                        )
+                    } else {
+                        self.wrapper_array_parameter_indexes_for_local_at_depth(
+                            path,
+                            name,
+                            depth + 1,
+                        )
+                    };
+                    (resolved, Some(argument_params))
+                }
+                TranslatorReturnForward::ParameterCall { .. } => continue,
+            };
+            for (index, params) in resolved {
+                let params = if let Some(argument_params) = argument_params {
+                    params
+                        .into_iter()
+                        .filter_map(|param| argument_params.get(param).copied().flatten())
+                        .collect()
+                } else {
+                    params
+                };
+                if !params.is_empty() {
+                    indexes.entry(index).or_default().extend(params);
+                }
+            }
+        }
+        indexes
     }
 
     fn wrapper_array_parameter_indexes_for_import(
@@ -2850,7 +2954,11 @@ impl ProjectIndex {
         match &target.imported {
             ImportedName::Named(name) => {
                 if let Some(local) = file.translator_return_export_locals.get(name) {
-                    return self.wrapper_array_parameter_indexes_for_local(&path, local);
+                    return self.wrapper_array_parameter_indexes_for_local_at_depth(
+                        &path,
+                        local,
+                        depth + 1,
+                    );
                 }
                 if let Some(target) = file.re_exports.get(name) {
                     return self.wrapper_array_parameter_indexes_for_import_at_depth(
@@ -2876,7 +2984,11 @@ impl ProjectIndex {
             }
             ImportedName::Default => {
                 if let Some(local) = &file.default_local_export {
-                    return self.wrapper_array_parameter_indexes_for_local(&path, local);
+                    return self.wrapper_array_parameter_indexes_for_local_at_depth(
+                        &path,
+                        local,
+                        depth + 1,
+                    );
                 }
                 let indexes = file
                     .default_wrapper_array_index_forwards
@@ -3609,10 +3721,9 @@ impl PotentialWrapperPaths {
         let pattern = pattern.split('.').collect::<Vec<_>>();
         let target = target.split('.').collect::<Vec<_>>();
         pattern.len() == target.len()
-            && pattern
-                .iter()
-                .zip(target)
-                .all(|(pattern, target)| *pattern == "*" || *pattern == target)
+            && pattern.iter().zip(target).all(|(pattern, target)| {
+                (*pattern == "*" && !target.is_empty()) || *pattern == target
+            })
     }
 
     fn specificity(pattern: &str) -> usize {
@@ -7251,8 +7362,25 @@ impl ReactWrapperReturnCollector {
                             binding: dynamic_translator_binding(),
                         });
                     } else {
-                        forwards
-                            .insert(TranslatorReturnForward::Local(identifier.name.to_string()));
+                        forwards.insert(TranslatorReturnForward::ForwardCall {
+                            namespace: None,
+                            name: identifier.name.to_string(),
+                            argument_params: call
+                                .arguments
+                                .iter()
+                                .map(|argument| {
+                                    argument.as_expression().and_then(|expression| {
+                                        expression.get_identifier_reference().and_then(
+                                            |identifier| {
+                                                self.parameter_callables
+                                                    .get(identifier.name.as_str())
+                                                    .copied()
+                                            },
+                                        )
+                                    })
+                                })
+                                .collect(),
+                        });
                     }
                 } else if let Some(member) = call.callee.get_member_expr()
                     && let (Some(namespace), Some(name)) = (
@@ -7260,9 +7388,24 @@ impl ReactWrapperReturnCollector {
                         member.static_property_name(),
                     )
                 {
-                    forwards.insert(TranslatorReturnForward::NamespaceMember {
-                        namespace: namespace.name.to_string(),
+                    forwards.insert(TranslatorReturnForward::ForwardCall {
+                        namespace: Some(namespace.name.to_string()),
                         name: name.to_string(),
+                        argument_params: call
+                            .arguments
+                            .iter()
+                            .map(|argument| {
+                                argument.as_expression().and_then(|expression| {
+                                    expression
+                                        .get_identifier_reference()
+                                        .and_then(|identifier| {
+                                            self.parameter_callables
+                                                .get(identifier.name.as_str())
+                                                .copied()
+                                        })
+                                })
+                            })
+                            .collect(),
                     });
                 }
             }
@@ -11659,7 +11802,10 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                     Expression::FunctionExpression(function) => {
                         self.function_wrapper_return_summary(function)
                     }
-                    _ => WrapperReturnSummary::default(),
+                    _ => WrapperReturnSummary {
+                        forwards: translator_return_callable_forwards(init),
+                        ..WrapperReturnSummary::default()
+                    },
                 };
                 self.record_wrapper_return_summary(name, wrapper_return);
             }
@@ -21907,6 +22053,90 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(lines.contains(&6), "dynamic lines: {lines:?}");
         assert!(!lines.contains(&7), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn higher_order_aggregate_indexes_cross_forwarders_and_callable_aliases() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) {
+              return Promise.all([factory(), draw]);
+            }
+            function forward(unused, factory) { return aggregate(factory); }
+            const alias = forward;
+            const [values, cleanup] = await alias(null, useBaseValues);
+            values[0](runtimeKey);
+            cleanup('layer');
+            "#,
+        );
+
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&10), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&11), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn wrapper_callback_rest_bindings_preserve_callable_children() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const rows = useMemo(() => runtimeRows(), []);
+            rows.forEach(({ignored, ...rest}) => rest.format(runtimeKey));
+            rows.forEach(([ignored, ...rest]) => rest[0](runtimeKey));
+            "#,
+        );
+
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&5), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn default_identifier_exports_use_full_wrapper_index_resolution() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper = dir.path().join("helper.ts");
+        let main = dir.path().join("main.ts");
+        fs::write(
+            &helper,
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function loadValues() {
+              return Promise.all([useBaseValues(), draw]);
+            }
+            export default loadValues;
+            "#,
+        )
+        .expect("write helper");
+        fs::write(
+            &main,
+            r#"
+            import loadValues from './helper';
+            const [values, cleanup] = await loadValues();
+            values[0](runtimeKey);
+            cleanup('layer');
+            "#,
+        )
+        .expect("write main");
+
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&5), "dynamic lines: {lines:?}");
     }
 
     #[test]
