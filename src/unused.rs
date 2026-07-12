@@ -461,7 +461,8 @@ enum TranslatorReturnForward {
         namespace: Option<String>,
         name: String,
         argument_params: Vec<Option<usize>>,
-        argument_targets: BTreeMap<usize, WrapperCallableTarget>,
+        argument_targets: BTreeMap<usize, BTreeSet<WrapperCallableTarget>>,
+        wrapper_arguments: BTreeSet<usize>,
     },
 }
 
@@ -4022,6 +4023,7 @@ struct LocalWrapperResolution {
     indexes: BTreeSet<usize>,
     parameters: BTreeMap<usize, BTreeSet<usize>>,
     forwards: BTreeSet<TranslatorReturnForward>,
+    definition_shadowed_bindings: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -7161,6 +7163,35 @@ fn function_local_bindings(body: &FunctionBody<'_>) -> BTreeSet<String> {
     collector.names
 }
 
+fn function_scope_bindings(body: &FunctionBody<'_>) -> BTreeSet<String> {
+    let mut names = function_var_bindings(body);
+    for statement in &body.statements {
+        match statement {
+            Statement::VariableDeclaration(declaration) => {
+                names.extend(declaration.declarations.iter().flat_map(|declarator| {
+                    declarator
+                        .id
+                        .get_binding_identifiers()
+                        .into_iter()
+                        .map(|identifier| identifier.name.to_string())
+                }));
+            }
+            Statement::FunctionDeclaration(function) => {
+                if let Some(id) = &function.id {
+                    names.insert(id.name.to_string());
+                }
+            }
+            Statement::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    names.insert(id.name.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
 struct ReactWrapperReturnCollector {
     memo_identifiers: BTreeSet<String>,
     state_identifiers: BTreeSet<String>,
@@ -7188,7 +7219,11 @@ impl ReactWrapperReturnCollector {
     fn argument_param_combinations(
         &self,
         call: &CallExpression<'_>,
-    ) -> Vec<(Vec<Option<usize>>, BTreeMap<usize, WrapperCallableTarget>)> {
+    ) -> Vec<(
+        Vec<Option<usize>>,
+        BTreeMap<usize, BTreeSet<WrapperCallableTarget>>,
+        BTreeSet<usize>,
+    )> {
         let mut combinations = Vec::new();
         let argument_count = call.arguments.len();
         let argument_targets = call
@@ -7197,23 +7232,21 @@ impl ReactWrapperReturnCollector {
             .enumerate()
             .filter_map(|(index, argument)| {
                 let expression = argument.as_expression()?.get_inner_expression();
-                let target = if let Some(identifier) = expression.get_identifier_reference() {
-                    WrapperCallableTarget {
-                        namespace: None,
-                        name: identifier.name.to_string(),
-                    }
-                } else {
-                    let member = expression.get_member_expr()?;
-                    WrapperCallableTarget {
-                        namespace: Some(
-                            member.object().get_identifier_reference()?.name.to_string(),
-                        ),
-                        name: member.static_property_name()?.to_string(),
-                    }
-                };
-                Some((index, target))
+                let targets = self.wrapper_callable_targets(expression);
+                (!targets.is_empty()).then_some((index, targets))
             })
             .collect::<BTreeMap<_, _>>();
+        let wrapper_arguments = call
+            .arguments
+            .iter()
+            .enumerate()
+            .filter_map(|(index, argument)| {
+                argument
+                    .as_expression()
+                    .is_some_and(|argument| self.inline_expression_returns_wrapper(argument))
+                    .then_some(index)
+            })
+            .collect::<BTreeSet<_>>();
         for (argument_index, argument) in call.arguments.iter().enumerate() {
             let params = argument
                 .as_expression()
@@ -7232,13 +7265,102 @@ impl ReactWrapperReturnCollector {
             for param in params {
                 let mut combination = vec![None; argument_count];
                 combination[argument_index] = Some(param);
-                combinations.push((combination, argument_targets.clone()));
+                combinations.push((
+                    combination,
+                    argument_targets.clone(),
+                    wrapper_arguments.clone(),
+                ));
             }
         }
         if combinations.is_empty() {
-            combinations.push((vec![None; argument_count], argument_targets));
+            combinations.push((
+                vec![None; argument_count],
+                argument_targets,
+                wrapper_arguments,
+            ));
         }
         combinations
+    }
+
+    fn wrapper_callable_targets(
+        &self,
+        expression: &Expression<'_>,
+    ) -> BTreeSet<WrapperCallableTarget> {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => BTreeSet::from([WrapperCallableTarget {
+                namespace: None,
+                name: identifier.name.to_string(),
+            }]),
+            Expression::ConditionalExpression(conditional) => {
+                let mut targets = self.wrapper_callable_targets(&conditional.consequent);
+                targets.extend(self.wrapper_callable_targets(&conditional.alternate));
+                targets
+            }
+            Expression::LogicalExpression(logical) => {
+                let mut targets = self.wrapper_callable_targets(&logical.left);
+                targets.extend(self.wrapper_callable_targets(&logical.right));
+                targets
+            }
+            Expression::AwaitExpression(await_expression) => {
+                self.wrapper_callable_targets(&await_expression.argument)
+            }
+            Expression::CallExpression(call)
+                if call
+                    .callee
+                    .get_member_expr()
+                    .is_some_and(|member| member.static_property_name() == Some("bind")) =>
+            {
+                self.wrapper_callable_targets(
+                    call.callee
+                        .get_member_expr()
+                        .expect("bind member checked")
+                        .object(),
+                )
+            }
+            expression => expression
+                .get_member_expr()
+                .and_then(|member| {
+                    Some(WrapperCallableTarget {
+                        namespace: Some(
+                            member.object().get_identifier_reference()?.name.to_string(),
+                        ),
+                        name: member.static_property_name()?.to_string(),
+                    })
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn inline_expression_returns_wrapper(&self, expression: &Expression<'_>) -> bool {
+        let body = match expression.get_inner_expression() {
+            Expression::ArrowFunctionExpression(arrow) => &arrow.body,
+            Expression::FunctionExpression(function) => {
+                let Some(body) = &function.body else {
+                    return false;
+                };
+                body
+            }
+            Expression::ConditionalExpression(conditional) => {
+                return self.inline_expression_returns_wrapper(&conditional.consequent)
+                    || self.inline_expression_returns_wrapper(&conditional.alternate);
+            }
+            Expression::LogicalExpression(logical) => {
+                return self.inline_expression_returns_wrapper(&logical.left)
+                    || self.inline_expression_returns_wrapper(&logical.right);
+            }
+            _ => return false,
+        };
+        body.statements.iter().any(|statement| match statement {
+            Statement::ExpressionStatement(statement) => {
+                self.expression_returns_wrapper(&statement.expression)
+            }
+            Statement::ReturnStatement(statement) => statement
+                .argument
+                .as_ref()
+                .is_some_and(|argument| self.expression_returns_wrapper(argument)),
+            _ => false,
+        })
     }
 
     fn structured_member_path(&self, expression: &Expression<'_>) -> Option<(String, String)> {
@@ -7611,12 +7733,13 @@ impl ReactWrapperReturnCollector {
                         });
                     } else {
                         forwards.extend(self.argument_param_combinations(call).into_iter().map(
-                            |(argument_params, argument_targets)| {
+                            |(argument_params, argument_targets, wrapper_arguments)| {
                                 TranslatorReturnForward::ForwardCall {
                                     namespace: None,
                                     name: identifier.name.to_string(),
                                     argument_params,
                                     argument_targets,
+                                    wrapper_arguments,
                                 }
                             },
                         ));
@@ -7628,12 +7751,13 @@ impl ReactWrapperReturnCollector {
                     )
                 {
                     forwards.extend(self.argument_param_combinations(call).into_iter().map(
-                        |(argument_params, argument_targets)| {
+                        |(argument_params, argument_targets, wrapper_arguments)| {
                             TranslatorReturnForward::ForwardCall {
                                 namespace: Some(namespace.name.to_string()),
                                 name: name.to_string(),
                                 argument_params,
                                 argument_targets,
+                                wrapper_arguments,
                             }
                         },
                     ));
@@ -9870,6 +9994,7 @@ impl TranslatorReturnCollector {
                             name,
                             argument_params,
                             argument_targets: BTreeMap::new(),
+                            wrapper_arguments: BTreeSet::new(),
                         }])
                     })
                     .unwrap_or_default()
@@ -12731,6 +12856,10 @@ impl SourceUsageCollector {
         let collector = self.local_wrapper_index_collector();
         Self::local_wrapper_resolution_from_summary(
             collector.function_wrapper_return_summary(function),
+            self.local_wrapper_definition_shadows(
+                &function.params,
+                function.body.as_ref().map(|body| &**body),
+            ),
         )
     }
 
@@ -12739,7 +12868,10 @@ impl SourceUsageCollector {
         arrow: &ArrowFunctionExpression<'_>,
     ) -> LocalWrapperResolution {
         let collector = self.local_wrapper_index_collector();
-        Self::local_wrapper_resolution_from_summary(collector.arrow_wrapper_return_summary(arrow))
+        Self::local_wrapper_resolution_from_summary(
+            collector.arrow_wrapper_return_summary(arrow),
+            self.local_wrapper_definition_shadows(&arrow.params, Some(&arrow.body)),
+        )
     }
 
     fn local_wrapper_index_collector(&self) -> SourceIndexCollector {
@@ -12755,6 +12887,7 @@ impl SourceUsageCollector {
 
     fn local_wrapper_resolution_from_summary(
         summary: WrapperReturnSummary,
+        definition_shadowed_bindings: BTreeSet<String>,
     ) -> LocalWrapperResolution {
         LocalWrapperResolution {
             direct: summary.direct,
@@ -12776,12 +12909,33 @@ impl SourceUsageCollector {
                 })
                 .collect(),
             forwards: summary.forwards,
+            definition_shadowed_bindings,
         }
+    }
+
+    fn local_wrapper_definition_shadows(
+        &self,
+        params: &oxc_ast::ast::FormalParameters<'_>,
+        body: Option<&FunctionBody<'_>>,
+    ) -> BTreeSet<String> {
+        let mut shadows = self.shadowed_project_bindings.clone();
+        shadows.extend(
+            params
+                .items
+                .iter()
+                .flat_map(|param| param.pattern.get_binding_identifiers())
+                .map(|identifier| identifier.name.to_string()),
+        );
+        if let Some(body) = body {
+            shadows.extend(function_scope_bindings(body));
+        }
+        shadows
     }
 
     fn hoisted_local_wrapper_resolutions(
         &self,
         body: &FunctionBody<'_>,
+        enclosing_shadowed_bindings: &BTreeSet<String>,
     ) -> BTreeMap<String, LocalWrapperResolution> {
         body.statements
             .iter()
@@ -12790,7 +12944,26 @@ impl SourceUsageCollector {
                     return None;
                 };
                 let name = function.id.as_ref()?.name.to_string();
-                Some((name, self.local_wrapper_resolution_for_function(function)))
+                let collector = self.local_wrapper_index_collector();
+                let mut shadows = enclosing_shadowed_bindings.clone();
+                shadows.extend(
+                    function
+                        .params
+                        .items
+                        .iter()
+                        .flat_map(|param| param.pattern.get_binding_identifiers())
+                        .map(|identifier| identifier.name.to_string()),
+                );
+                if let Some(body) = &function.body {
+                    shadows.extend(function_scope_bindings(body));
+                }
+                Some((
+                    name,
+                    Self::local_wrapper_resolution_from_summary(
+                        collector.function_wrapper_return_summary(function),
+                        shadows,
+                    ),
+                ))
             })
             .collect()
     }
@@ -12815,12 +12988,17 @@ impl SourceUsageCollector {
                 name: target,
                 argument_params,
                 argument_targets,
+                wrapper_arguments,
             } = forward
             else {
                 continue;
             };
-            let target_resolution =
-                self.resolved_wrapper_target_at_depth(namespace.as_deref(), &target, visited);
+            let target_resolution = self.resolved_wrapper_target_at_depth(
+                namespace.as_deref(),
+                &target,
+                &resolution.definition_shadowed_bindings,
+                visited,
+            );
             let Some(target_resolution) = target_resolution else {
                 continue;
             };
@@ -12832,18 +13010,23 @@ impl SourceUsageCollector {
                     .into_iter()
                     .filter_map(|param_index| {
                         let mapped = argument_params.get(param_index).copied().flatten();
-                        if mapped.is_none()
-                            && let Some(target) = argument_targets.get(&param_index)
-                        {
-                            concrete_wrapper |= self
-                                .resolved_wrapper_target_at_depth(
-                                    target.namespace.as_deref(),
-                                    &target.name,
-                                    visited,
-                                )
-                                .is_some_and(|resolution| {
-                                    resolution.direct || !resolution.indexes.is_empty()
+                        if mapped.is_none() {
+                            concrete_wrapper |= wrapper_arguments.contains(&param_index);
+                            if let Some(targets) = argument_targets.get(&param_index) {
+                                concrete_wrapper |= targets.iter().any(|target| {
+                                    self.resolved_wrapper_target_at_depth(
+                                        target.namespace.as_deref(),
+                                        &target.name,
+                                        &resolution.definition_shadowed_bindings,
+                                        visited,
+                                    )
+                                    .is_some_and(
+                                        |resolution| {
+                                            resolution.direct || !resolution.indexes.is_empty()
+                                        },
+                                    )
                                 });
+                            }
                         }
                         mapped
                     })
@@ -12868,13 +13051,18 @@ impl SourceUsageCollector {
         &self,
         namespace: Option<&str>,
         name: &str,
+        definition_shadowed_bindings: &BTreeSet<String>,
         visited: &mut BTreeSet<String>,
     ) -> Option<LocalWrapperResolution> {
-        if namespace.is_none() && self.local_wrapper_resolutions.contains_key(name) {
+        let binding = namespace.unwrap_or(name);
+        let is_definition_shadow = definition_shadowed_bindings.contains(binding);
+        if namespace.is_none()
+            && is_definition_shadow
+            && self.local_wrapper_resolutions.contains_key(name)
+        {
             return self.resolved_local_wrapper_at_depth(name, visited);
         }
-        let binding = namespace.unwrap_or(name);
-        if self.shadowed_project_bindings.contains(binding) {
+        if is_definition_shadow {
             return None;
         }
         self.project_wrapper_resolution_for_name(namespace, name)
@@ -12921,6 +13109,7 @@ impl SourceUsageCollector {
                 indexes,
                 parameters,
                 forwards: BTreeSet::new(),
+                definition_shadowed_bindings: BTreeSet::new(),
             },
         )
     }
@@ -18946,10 +19135,14 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             .body
             .as_ref()
             .map(|body| function_var_bindings(body));
+        let enclosing_shadowed_bindings = self.local_wrapper_definition_shadows(
+            &function.params,
+            function.body.as_ref().map(|body| &**body),
+        );
         self.pending_local_wrapper_resolutions = function
             .body
             .as_ref()
-            .map(|body| self.hoisted_local_wrapper_resolutions(body));
+            .map(|body| self.hoisted_local_wrapper_resolutions(body, &enclosing_shadowed_bindings));
         walk::walk_function(self, function, flags);
         if let Some(environment) = outer_environment {
             self.restore_binding_environment(environment);
@@ -18958,8 +19151,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
 
     fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
         self.pending_var_bindings = Some(function_var_bindings(&arrow.body));
+        let enclosing_shadowed_bindings =
+            self.local_wrapper_definition_shadows(&arrow.params, Some(&arrow.body));
         self.pending_local_wrapper_resolutions =
-            Some(self.hoisted_local_wrapper_resolutions(&arrow.body));
+            Some(self.hoisted_local_wrapper_resolutions(&arrow.body, &enclosing_shadowed_bindings));
         walk::walk_arrow_function_expression(self, arrow);
     }
 
@@ -23700,6 +23895,74 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(!lines.contains(&8), "dynamic lines: {lines:?}");
         assert!(!lines.contains(&13), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn local_forwarders_preserve_compound_and_inline_wrapper_arguments() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function scope() {
+              const [conditional] = await conditionalForward();
+              conditional[0](conditionalKey);
+              const [logical] = await logicalForward();
+              logical[0](logicalKey);
+              const [bound] = await boundForward();
+              bound[0](boundKey);
+              const [inline] = await inlineForward();
+              inline[0](inlineKey);
+              async function aggregate(factory) { return Promise.all([factory(), draw]); }
+              async function conditionalForward() { return aggregate(enabled ? useBaseValues : draw); }
+              async function logicalForward() { return aggregate(enabled && useBaseValues); }
+              async function boundForward() { return aggregate(useBaseValues.bind(null)); }
+              async function inlineForward() { return aggregate(() => useMemo(() => runtimeValues(), [])); }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [6, 8, 10, 12] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_forwarders_resolve_targets_in_their_definition_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper = dir.path().join("helper.ts");
+        let main = dir.path().join("main.ts");
+        fs::write(
+            &helper,
+            "export async function aggregate(factory) { return Promise.all([factory(), draw]); }",
+        )
+        .expect("write helper");
+        fs::write(
+            &main,
+            r#"
+            import {useMemo} from 'react';
+            import {aggregate} from './helper';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function scope() {
+              async function forward() { return aggregate(useBaseValues); }
+              {
+                const aggregate = draw;
+                const useBaseValues = draw;
+                const [values] = await forward();
+                values[0](runtimeKey);
+              }
+            }
+            "#,
+        )
+        .expect("write main");
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 11));
     }
 
     #[test]
