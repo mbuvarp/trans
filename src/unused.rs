@@ -521,6 +521,8 @@ struct FiniteBoundArgumentEntry {
 struct FiniteBoundArgumentScope {
     previous: BTreeMap<String, Option<FiniteBoundArgumentEntry>>,
     previous_capture_callables: BTreeMap<String, Option<BTreeSet<String>>>,
+    previous_capture_provenance: BTreeMap<String, Option<BTreeSet<usize>>>,
+    previous_resolved_capture_names: BTreeMap<String, Option<BTreeSet<String>>>,
     disposal_provenance: BTreeSet<usize>,
 }
 
@@ -3098,7 +3100,8 @@ impl ProjectIndex {
                     namespace,
                     name,
                     argument_params,
-                    ..
+                    argument_targets,
+                    wrapper_arguments: _,
                 } => {
                     let resolved = if let Some(namespace) = namespace {
                         file.namespace_imports
@@ -3127,16 +3130,33 @@ impl ProjectIndex {
                             depth + 1,
                         )
                     };
-                    (resolved, Some(argument_params))
+                    (resolved, Some((argument_params, argument_targets)))
                 }
                 TranslatorReturnForward::ParameterCall { .. } => continue,
             };
             for (index, params) in resolved {
-                let params = if let Some(argument_params) = argument_params {
-                    params
-                        .into_iter()
-                        .filter_map(|param| argument_params.get(param).copied().flatten())
-                        .collect()
+                let params = if let Some((argument_params, argument_targets)) = argument_params {
+                    let mut mapped = BTreeSet::new();
+                    for param in params {
+                        if let Some(Some(mapped_param)) = argument_params.get(param) {
+                            mapped.insert(*mapped_param);
+                        } else if let Some(targets) = argument_targets.get(&param) {
+                            for target in targets {
+                                if let Some(target) = self
+                                    .wrapper_callable_target_resolution_at_depth(
+                                        path,
+                                        target,
+                                        depth + 1,
+                                    )
+                                {
+                                    mapped.extend(
+                                        target.captured_parameters.values().flatten().copied(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    mapped
                 } else {
                     params
                 };
@@ -3146,6 +3166,141 @@ impl ProjectIndex {
             }
         }
         indexes
+    }
+
+    fn wrapper_callable_target_resolution_at_depth(
+        &self,
+        path: &Path,
+        target: &WrapperCallableTarget,
+        depth: usize,
+    ) -> Option<LocalWrapperResolution> {
+        if depth > 16 {
+            return None;
+        }
+        let file = self.files.get(path)?;
+        let (direct, indexes, parameters) = if let Some(namespace) = &target.namespace {
+            let source = file.namespace_imports.get(namespace)?;
+            let import = ImportTarget {
+                source: source.clone(),
+                imported: ImportedName::Named(target.name.clone()),
+            };
+            (
+                self.wrapper_return_for_import_at_depth(path, &import, depth + 1),
+                self.wrapper_array_indexes_for_import_at_depth(path, &import, depth + 1)
+                    .unwrap_or_default(),
+                self.wrapper_array_parameter_indexes_for_import_at_depth(path, &import, depth + 1),
+            )
+        } else if let Some(import) = file.imports.get(&target.name) {
+            (
+                self.wrapper_return_for_import_at_depth(path, import, depth + 1),
+                self.wrapper_array_indexes_for_import_at_depth(path, import, depth + 1)
+                    .unwrap_or_default(),
+                self.wrapper_array_parameter_indexes_for_import_at_depth(path, import, depth + 1),
+            )
+        } else {
+            (
+                self.wrapper_return_for_local_at_depth(path, &target.name, depth + 1),
+                self.wrapper_array_indexes_for_local_at_depth(path, &target.name, depth + 1)
+                    .unwrap_or_default(),
+                self.wrapper_array_parameter_indexes_for_local_at_depth(
+                    path,
+                    &target.name,
+                    depth + 1,
+                ),
+            )
+        };
+        let mut resolution = LocalWrapperResolution {
+            direct,
+            indexes,
+            parameters,
+            captured_parameters: BTreeMap::new(),
+            forwards: BTreeSet::new(),
+            definition_shadowed_bindings: BTreeSet::new(),
+        };
+        if target.bound_argument_count == 0 && target.bound_unknown_from.is_none() {
+            return Some(resolution);
+        }
+        let mut remaining = BTreeMap::<usize, BTreeSet<usize>>::new();
+        let mut captured = BTreeMap::<usize, BTreeSet<usize>>::new();
+        for (index, params) in std::mem::take(&mut resolution.parameters) {
+            let mut wrapper_argument = false;
+            for param in params {
+                if param < target.bound_argument_count {
+                    wrapper_argument |= target.bound_wrapper_arguments.contains(&param);
+                    if let Some(params) = target.bound_argument_params.get(&param) {
+                        captured
+                            .entry(index)
+                            .or_default()
+                            .extend(params.iter().copied());
+                    }
+                    if let Some(targets) = target.bound_argument_targets.get(&param) {
+                        for nested in targets {
+                            if let Some(nested) = self.wrapper_callable_target_resolution_at_depth(
+                                path,
+                                nested,
+                                depth + 1,
+                            ) {
+                                wrapper_argument |= nested.direct || !nested.indexes.is_empty();
+                                captured
+                                    .entry(index)
+                                    .or_default()
+                                    .extend(nested.captured_parameters.values().flatten().copied());
+                            }
+                        }
+                    }
+                    if target.bound_unknown_from.is_some_and(|from| param >= from) {
+                        wrapper_argument |= target.bound_unknown_may_wrap;
+                        captured
+                            .entry(index)
+                            .or_default()
+                            .extend(target.bound_unknown_params.iter().copied());
+                        for nested in &target.bound_unknown_targets {
+                            if let Some(nested) = self.wrapper_callable_target_resolution_at_depth(
+                                path,
+                                nested,
+                                depth + 1,
+                            ) {
+                                wrapper_argument |= nested.direct || !nested.indexes.is_empty();
+                                captured
+                                    .entry(index)
+                                    .or_default()
+                                    .extend(nested.captured_parameters.values().flatten().copied());
+                            }
+                        }
+                    }
+                } else if target.bound_unknown_from.is_some_and(|from| param >= from) {
+                    wrapper_argument |= target.bound_unknown_may_wrap;
+                    captured
+                        .entry(index)
+                        .or_default()
+                        .extend(target.bound_unknown_params.iter().copied());
+                    for nested in &target.bound_unknown_targets {
+                        if let Some(nested) = self.wrapper_callable_target_resolution_at_depth(
+                            path,
+                            nested,
+                            depth + 1,
+                        ) {
+                            wrapper_argument |= nested.direct || !nested.indexes.is_empty();
+                            captured
+                                .entry(index)
+                                .or_default()
+                                .extend(nested.captured_parameters.values().flatten().copied());
+                        }
+                    }
+                } else {
+                    remaining
+                        .entry(index)
+                        .or_default()
+                        .insert(param - target.bound_argument_count);
+                }
+            }
+            if wrapper_argument {
+                resolution.indexes.insert(index);
+            }
+        }
+        resolution.parameters = remaining;
+        resolution.captured_parameters = captured;
+        Some(resolution)
     }
 
     fn wrapper_array_parameter_indexes_for_import(
@@ -7377,6 +7532,8 @@ struct ReactWrapperReturnCollector {
     next_finite_bound_argument_provenance: usize,
     conditional_control_flow_depth: usize,
     finite_bound_capture_callables: BTreeMap<String, BTreeSet<String>>,
+    finite_bound_capture_provenance: BTreeMap<String, BTreeSet<usize>>,
+    finite_bound_resolved_capture_names: BTreeMap<String, BTreeSet<String>>,
     finite_bound_capture_aliases: BTreeMap<String, BTreeSet<String>>,
     escaped_finite_bound_capture_names: BTreeSet<String>,
     suppressed_member_read_spans: Vec<(u32, u32)>,
@@ -7505,12 +7662,36 @@ impl ReactWrapperReturnCollector {
                 .previous_capture_callables
                 .entry(name.to_string())
                 .or_insert_with(|| self.finite_bound_capture_callables.get(name).cloned());
+            scope
+                .previous_capture_provenance
+                .entry(name.to_string())
+                .or_insert_with(|| self.finite_bound_capture_provenance.get(name).cloned());
+            scope
+                .previous_resolved_capture_names
+                .entry(name.to_string())
+                .or_insert_with(|| self.finite_bound_resolved_capture_names.get(name).cloned());
         }
         if let Some(captures) = captures {
+            let provenance = self.finite_bound_capture_provenance(&captures);
+            let resolved_names = captures
+                .iter()
+                .filter(|capture| {
+                    !self
+                        .finite_bound_capture_provenance(&BTreeSet::from([(*capture).clone()]))
+                        .is_empty()
+                })
+                .cloned()
+                .collect();
             self.finite_bound_capture_callables
                 .insert(name.to_string(), captures);
+            self.finite_bound_capture_provenance
+                .insert(name.to_string(), provenance);
+            self.finite_bound_resolved_capture_names
+                .insert(name.to_string(), resolved_names);
         } else {
             self.finite_bound_capture_callables.remove(name);
+            self.finite_bound_capture_provenance.remove(name);
+            self.finite_bound_resolved_capture_names.remove(name);
         }
     }
 
@@ -7851,8 +8032,31 @@ impl ReactWrapperReturnCollector {
                 .or_insert_with(|| self.finite_bound_argument_arrays.get(name).cloned());
         }
         if let Some(value) = value {
+            let provenance = value.provenance.clone();
             self.finite_bound_argument_arrays
                 .insert(name.to_string(), value);
+            let pending = self
+                .finite_bound_capture_callables
+                .iter()
+                .filter_map(|(callable, captures)| {
+                    (captures.contains(name)
+                        && self
+                            .finite_bound_resolved_capture_names
+                            .get(callable)
+                            .is_none_or(|resolved| !resolved.contains(name)))
+                    .then_some(callable.clone())
+                })
+                .collect::<Vec<_>>();
+            for callable in pending {
+                self.finite_bound_capture_provenance
+                    .entry(callable.clone())
+                    .or_default()
+                    .extend(provenance.iter().copied());
+                self.finite_bound_resolved_capture_names
+                    .entry(callable)
+                    .or_default()
+                    .insert(name.to_string());
+            }
         } else {
             self.finite_bound_argument_arrays.remove(name);
         }
@@ -8432,8 +8636,17 @@ impl ReactWrapperReturnCollector {
             .get(name)
             .map(|entry| entry.provenance.clone())
             .unwrap_or_default();
-        if let Some(names) = self.finite_bound_capture_callables.get(name) {
+        if let Some(captured) = self.finite_bound_capture_provenance.get(name) {
+            provenance.extend(captured.iter().copied());
+        } else if let Some(names) = self.finite_bound_capture_callables.get(name) {
             provenance.extend(self.finite_bound_capture_provenance(names));
+        }
+        if let Some(aliases) = self.finite_bound_capture_aliases.get(name) {
+            for alias in aliases {
+                if let Some(captured) = self.finite_bound_capture_provenance.get(alias) {
+                    provenance.extend(captured.iter().copied());
+                }
+            }
         }
         provenance
     }
@@ -9220,6 +9433,21 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                     self.finite_bound_capture_callables.remove(&name);
                 }
             }
+            for (name, previous) in scope.previous_capture_provenance {
+                if let Some(previous) = previous {
+                    self.finite_bound_capture_provenance.insert(name, previous);
+                } else {
+                    self.finite_bound_capture_provenance.remove(&name);
+                }
+            }
+            for (name, previous) in scope.previous_resolved_capture_names {
+                if let Some(previous) = previous {
+                    self.finite_bound_resolved_capture_names
+                        .insert(name, previous);
+                } else {
+                    self.finite_bound_resolved_capture_names.remove(&name);
+                }
+            }
         }
     }
 
@@ -9523,6 +9751,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
     fn visit_jsx_opening_element(&mut self, opening: &JSXOpeningElement<'a>) {
         walk::walk_jsx_opening_element(self, opening);
         let mut captures = BTreeSet::new();
+        let mut provenance = BTreeSet::new();
         for attribute in &opening.attributes {
             let expression = match attribute {
                 JSXAttributeItem::Attribute(attribute) => match &attribute.value {
@@ -9536,12 +9765,14 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 JSXAttributeItem::SpreadAttribute(spread) => Some(&spread.argument),
             };
             if let Some(expression) = expression {
+                provenance.extend(self.finite_bound_argument_provenance(expression));
                 captures.extend(
                     self.finite_bound_capture_names_from_expression(expression)
                         .unwrap_or_default(),
                 );
             }
         }
+        self.invalidate_finite_bound_argument_provenance(provenance);
         self.record_escaped_finite_bound_captures(captures);
     }
 
@@ -9562,6 +9793,21 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             },
             _ => BTreeSet::new(),
         };
+        let mut provenance = match &element.opening_element.name {
+            JSXElementName::Identifier(identifier) => {
+                self.finite_bound_identifier_provenance(identifier.name.as_str())
+            }
+            JSXElementName::IdentifierReference(identifier) => {
+                self.finite_bound_identifier_provenance(identifier.name.as_str())
+            }
+            JSXElementName::MemberExpression(member) => match &member.object {
+                JSXMemberExpressionObject::IdentifierReference(identifier) => {
+                    self.finite_bound_identifier_provenance(identifier.name.as_str())
+                }
+                _ => BTreeSet::new(),
+            },
+            _ => BTreeSet::new(),
+        };
         for child in &element.children {
             let expression = match child {
                 JSXChild::ExpressionContainer(container)
@@ -9573,12 +9819,14 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 _ => None,
             };
             if let Some(expression) = expression {
+                provenance.extend(self.finite_bound_argument_provenance(expression));
                 captures.extend(
                     self.finite_bound_capture_names_from_expression(expression)
                         .unwrap_or_default(),
                 );
             }
         }
+        self.invalidate_finite_bound_argument_provenance(provenance);
         self.record_escaped_finite_bound_captures(captures);
     }
 
@@ -9833,6 +10081,8 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             && let Some(captures) =
                 self.finite_bound_capture_names_from_expression(&expression.right)
         {
+            let provenance = self.finite_bound_argument_provenance(&expression.right);
+            self.invalidate_finite_bound_argument_provenance(provenance);
             self.record_escaped_finite_bound_captures(captures.clone());
             let aliases = self
                 .finite_bound_capture_aliases
@@ -12941,6 +13191,10 @@ impl SourceIndexCollector {
                 .or_default()
                 .extend(captures);
         }
+        let finite_bound_capture_provenance = finite_bound_capture_callables
+            .keys()
+            .map(|name| (name.clone(), BTreeSet::new()))
+            .collect();
         let mut collector = ReactWrapperReturnCollector {
             memo_identifiers,
             state_identifiers,
@@ -12974,6 +13228,8 @@ impl SourceIndexCollector {
             next_finite_bound_argument_provenance: 0,
             conditional_control_flow_depth: 0,
             finite_bound_capture_callables,
+            finite_bound_capture_provenance,
+            finite_bound_resolved_capture_names: BTreeMap::new(),
             finite_bound_capture_aliases: BTreeMap::new(),
             escaped_finite_bound_capture_names: BTreeSet::new(),
             suppressed_member_read_spans: Vec::new(),
@@ -16210,7 +16466,7 @@ impl SourceUsageCollector {
                                         .get(param_index)
                                         .and_then(ArrayExpressionElement::as_expression)
                                         .is_some_and(|argument| {
-                                            self.expression_is_wrapper_returning_callable(argument)
+                                            self.expression_may_contain_wrapper_callable(argument)
                                         })
                                 })
                             }
@@ -16313,7 +16569,7 @@ impl SourceUsageCollector {
                             .get(param_index + 1)
                             .and_then(Argument::as_expression)
                             .is_some_and(|argument| {
-                                self.expression_is_wrapper_returning_callable(argument)
+                                self.expression_may_contain_wrapper_callable(argument)
                             })
                 });
                 if wrapper_argument {
@@ -16407,20 +16663,24 @@ impl SourceUsageCollector {
             }
             if index == position {
                 return argument.as_expression().is_some_and(|argument| {
-                    self.expression_is_wrapper_returning_callable(argument)
-                        || matches!(
-                            argument.get_inner_expression(),
-                            Expression::ArrayExpression(array)
-                                if array.elements.iter().any(|element| {
-                                    element.as_expression().is_some_and(|element| {
-                                        self.expression_is_wrapper_returning_callable(element)
-                                    })
-                                })
-                        )
+                    self.expression_may_contain_wrapper_callable(argument)
                 });
             }
         }
         false
+    }
+
+    fn expression_may_contain_wrapper_callable(&self, expression: &Expression<'_>) -> bool {
+        self.expression_is_wrapper_returning_callable(expression)
+            || matches!(
+                expression.get_inner_expression(),
+                Expression::ArrayExpression(array)
+                    if array.elements.iter().any(|element| {
+                        element.as_expression().is_some_and(|element| {
+                            self.expression_may_contain_wrapper_callable(element)
+                        })
+                    })
+            )
     }
 
     fn expression_is_wrapper_returning_callable(&self, expression: &Expression<'_>) -> bool {
@@ -25816,6 +26076,81 @@ mod tests {
     }
 
     #[test]
+    fn direct_apply_and_bind_detect_wrapper_callables_nested_in_array_overrides() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function scope() {
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward(args = [draw]) { return outer(inner.bind(null, ...args)); }
+              const [direct] = await forward([useBaseValues]);
+              direct[0][0](directKey);
+              const [applied] = await forward.apply(null, [[useBaseValues]]);
+              applied[0][0](applyKey);
+              const [bound] = await forward.bind(null, [useBaseValues])();
+              bound[0][0](bindKey);
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [9, 11, 13] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn imported_default_array_overrides_preserve_captured_wrapper_parameters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper = dir.path().join("helper.ts");
+        let main = dir.path().join("main.ts");
+        fs::write(
+            &helper,
+            r#"
+            async function inner(factory) { return Promise.all([factory(), draw]); }
+            async function outer(factory) { return Promise.all([factory(), draw]); }
+            export async function forward(args = [draw]) {
+              return outer(inner.bind(null, ...args));
+            }
+            "#,
+        )
+        .expect("write helper");
+        fs::write(
+            &main,
+            r#"
+            import {useMemo} from 'react';
+            import {forward} from './helper';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            const [result] = await forward([useBaseValues]);
+            result[0][0](runtimeKey);
+            "#,
+        )
+        .expect("write main");
+
+        let project = ProjectIndex::build(dir.path(), &[main.clone(), helper.clone()])
+            .expect("build project");
+        assert_eq!(
+            project.wrapper_array_parameter_indexes_for_local(&helper, "forward"),
+            BTreeMap::from([(0, BTreeSet::from([0]))])
+        );
+        let scan = collect_usage_from_files(dir.path(), &[main, helper]).expect("scan project");
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&6), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
     fn inline_bind_invocations_preserve_wrapper_parameter_indexes() {
         let scan = scan(
             r#"
@@ -27081,6 +27416,36 @@ mod tests {
                 { const change = ordinary; consume(change); }
                 const args = [draw];
                 change();
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn escaped_callable_invalidates_definition_capture_across_shadowing() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const args = [draw];
+                const change = () => { args[0] = runtimeFactory; };
+                {
+                  const args = [draw];
+                  external.callback = change;
+                  consume(args);
+                }
                 return outer(inner.bind(null, ...args));
               }
             }
