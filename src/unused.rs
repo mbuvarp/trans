@@ -10223,7 +10223,7 @@ impl TranslatorReturnCollector {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct WrapperReturnSummary {
     direct: bool,
     forwards: BTreeSet<TranslatorReturnForward>,
@@ -10562,6 +10562,8 @@ struct SourceIndexCollector {
     default_wrapper_array_index_forwards: BTreeMap<usize, BTreeSet<TranslatorReturnForward>>,
     binding_scopes: Vec<IndexBindingEnvironment>,
     scope_depth: usize,
+    module_bindings: BTreeSet<String>,
+    module_wrapper_assignments: BTreeMap<String, WrapperReturnSummary>,
 }
 
 #[derive(Clone)]
@@ -10583,6 +10585,9 @@ struct IndexBindingEnvironment {
     translator_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     wrapper_return_helpers: BTreeSet<String>,
     wrapper_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
+    wrapper_array_return_indexes: BTreeMap<String, BTreeSet<usize>>,
+    wrapper_array_index_forwards:
+        BTreeMap<String, BTreeMap<usize, BTreeSet<TranslatorReturnForward>>>,
     enum_member_domains: TypeDomains,
 }
 
@@ -10813,6 +10818,27 @@ impl SourceIndexCollector {
         }
     }
 
+    fn merge_wrapper_return_summary(&mut self, name: &str, summary: WrapperReturnSummary) {
+        if summary.direct {
+            self.wrapper_return_helpers.insert(name.to_string());
+        }
+        self.wrapper_return_forwards
+            .entry(name.to_string())
+            .or_default()
+            .extend(summary.forwards);
+        self.wrapper_array_return_indexes
+            .entry(name.to_string())
+            .or_default()
+            .extend(summary.array_indexes);
+        let target = self
+            .wrapper_array_index_forwards
+            .entry(name.to_string())
+            .or_default();
+        for (index, forwards) in summary.array_index_forwards {
+            target.entry(index).or_default().extend(forwards);
+        }
+    }
+
     fn wrapper_callable_alias_summary(&self, expression: &Expression<'_>) -> WrapperReturnSummary {
         let mut summary = WrapperReturnSummary {
             forwards: translator_return_callable_forwards(expression),
@@ -10830,11 +10856,27 @@ impl SourceIndexCollector {
         let Some(target) = member.object().get_identifier_reference() else {
             return summary;
         };
-        let Some(index_forwards) = self.wrapper_array_index_forwards.get(target.name.as_str())
-        else {
+        let index_forwards = self.local_wrapper_parameter_candidates(target.name.as_str(), 0);
+        if index_forwards.is_empty() {
+            if self.imports.contains_key(target.name.as_str())
+                && call.arguments.iter().skip(1).any(|argument| {
+                    argument.as_expression().is_some_and(|expression| {
+                        let forwards = translator_return_callable_forwards(expression);
+                        forwards.iter().any(|forward| match forward {
+                            TranslatorReturnForward::Local(name) => {
+                                self.wrapper_return_helpers.contains(name)
+                                    || self.wrapper_return_forwards.contains_key(name)
+                            }
+                            _ => false,
+                        })
+                    })
+                })
+            {
+                summary.direct = true;
+            }
             return summary;
-        };
-        for (index, candidates) in index_forwards {
+        }
+        for (index, candidates) in &index_forwards {
             for param_index in candidates.iter().filter_map(|candidate| match candidate {
                 TranslatorReturnForward::ParameterCall { param_index, .. } => Some(*param_index),
                 _ => None,
@@ -10857,6 +10899,38 @@ impl SourceIndexCollector {
             }
         }
         summary
+    }
+
+    fn local_wrapper_parameter_candidates(
+        &self,
+        name: &str,
+        depth: usize,
+    ) -> BTreeMap<usize, BTreeSet<TranslatorReturnForward>> {
+        if depth > 16 {
+            return BTreeMap::new();
+        }
+        let mut candidates = self
+            .wrapper_array_index_forwards
+            .get(name)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(forwards) = self.wrapper_return_forwards.get(name) {
+            for target in forwards.iter().filter_map(|forward| match forward {
+                TranslatorReturnForward::Local(name)
+                | TranslatorReturnForward::ForwardCall {
+                    namespace: None,
+                    name,
+                    ..
+                } => Some(name.as_str()),
+                _ => None,
+            }) {
+                for (index, forwards) in self.local_wrapper_parameter_candidates(target, depth + 1)
+                {
+                    candidates.entry(index).or_default().extend(forwards);
+                }
+            }
+        }
+        candidates
     }
 
     fn translator_return_collector(
@@ -10952,7 +11026,10 @@ impl SourceIndexCollector {
         self.translator_return_summary_from_body(&arrow.body, &arrow.params)
     }
 
-    fn finish(self) -> SourceFileIndex {
+    fn finish(mut self) -> SourceFileIndex {
+        for (name, summary) in std::mem::take(&mut self.module_wrapper_assignments) {
+            self.merge_wrapper_return_summary(&name, summary);
+        }
         let jsx_export_locals = self.export_locals.clone();
         let translator_return_export_locals = self.export_locals.clone();
         let mut named_exports = BTreeMap::new();
@@ -11125,6 +11202,8 @@ impl SourceIndexCollector {
             translator_return_forwards: self.translator_return_forwards.clone(),
             wrapper_return_helpers: self.wrapper_return_helpers.clone(),
             wrapper_return_forwards: self.wrapper_return_forwards.clone(),
+            wrapper_array_return_indexes: self.wrapper_array_return_indexes.clone(),
+            wrapper_array_index_forwards: self.wrapper_array_index_forwards.clone(),
             enum_member_domains: self.enum_member_domains.clone(),
         }
     }
@@ -11147,6 +11226,8 @@ impl SourceIndexCollector {
         self.translator_return_forwards = environment.translator_return_forwards;
         self.wrapper_return_helpers = environment.wrapper_return_helpers;
         self.wrapper_return_forwards = environment.wrapper_return_forwards;
+        self.wrapper_array_return_indexes = environment.wrapper_array_return_indexes;
+        self.wrapper_array_index_forwards = environment.wrapper_array_index_forwards;
         self.enum_member_domains = environment.enum_member_domains;
     }
 
@@ -11561,17 +11642,23 @@ impl<'a> Visit<'a> for SourceIndexCollector {
     }
 
     fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
-        if self.scope_depth == 1
-            && expression.operator == AssignmentOperator::Assign
+        if expression.operator == AssignmentOperator::Assign
             && let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &expression.left
+            && self.module_bindings.contains(identifier.name.as_str())
         {
             let name = identifier.name.to_string();
-            self.wrapper_return_helpers.remove(&name);
-            self.wrapper_return_forwards.remove(&name);
-            self.wrapper_array_return_indexes.remove(&name);
-            self.wrapper_array_index_forwards.remove(&name);
             let summary = self.wrapper_callable_alias_summary(&expression.right);
-            self.record_wrapper_return_summary(&name, summary);
+            let target = self.module_wrapper_assignments.entry(name).or_default();
+            target.direct |= summary.direct;
+            target.forwards.extend(summary.forwards);
+            target.array_indexes.extend(summary.array_indexes);
+            for (index, forwards) in summary.array_index_forwards {
+                target
+                    .array_index_forwards
+                    .entry(index)
+                    .or_default()
+                    .extend(forwards);
+            }
         }
         walk::walk_assignment_expression(self, expression);
     }
@@ -11701,6 +11788,15 @@ impl<'a> Visit<'a> for SourceIndexCollector {
     }
 
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if self.scope_depth == 1 {
+            self.module_bindings.extend(
+                declarator
+                    .id
+                    .get_binding_identifiers()
+                    .into_iter()
+                    .map(|identifier| identifier.name.to_string()),
+            );
+        }
         for (source, imported, local) in commonjs_declarator_imports(declarator) {
             if source != "next-intl" && source != "next-intl/server" {
                 continue;
@@ -22341,6 +22437,54 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(lines.contains(&4), "dynamic lines: {lines:?}");
         assert!(!lines.contains(&5), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn module_alias_assignments_merge_across_order_and_control_flow() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            let alias;
+            if (enabled) alias = aggregate;
+            const [first] = await alias(useBaseValues);
+            first[0](firstKey);
+            alias = draw;
+            const [second] = await alias(useBaseValues);
+            second[0](secondKey);
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&8), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&11), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn bound_aliases_follow_local_forwarding_helpers() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            function forward(factory) { return aggregate(factory); }
+            const bound = forward.bind(null, useBaseValues);
+            const [values, cleanup] = await bound();
+            values[0](runtimeKey);
+            cleanup('layer');
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&8), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&9), "dynamic lines: {lines:?}");
     }
 
     #[test]
