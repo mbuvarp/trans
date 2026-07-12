@@ -386,6 +386,7 @@ struct SourceFileIndex {
     translator_array_return_params: BTreeMap<String, ParamIndexes>,
     translator_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     wrapper_return_helpers: BTreeSet<String>,
+    wrapper_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     translator_return_export_locals: BTreeMap<String, String>,
     named_exports: BTreeMap<String, HelperSummary>,
     named_jsx_exports: BTreeMap<String, JsxComponentSummary>,
@@ -408,6 +409,7 @@ struct SourceFileIndex {
     default_translator_array_return_export: Option<TranslatorBinding>,
     default_translator_array_return_params: ParamIndexes,
     default_wrapper_return_export: bool,
+    default_wrapper_return_forwards: BTreeSet<TranslatorReturnForward>,
     default_translator_return_forwards: BTreeSet<TranslatorReturnForward>,
 }
 
@@ -2615,9 +2617,68 @@ impl ProjectIndex {
     }
 
     fn wrapper_return_for_local(&self, path: &Path, name: &str) -> bool {
-        self.files
-            .get(path)
-            .is_some_and(|file| file.wrapper_return_helpers.contains(name))
+        self.wrapper_return_for_local_at_depth(path, name, 0)
+    }
+
+    fn wrapper_return_for_local_at_depth(&self, path: &Path, name: &str, depth: usize) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        let Some(file) = self.files.get(path) else {
+            return false;
+        };
+        if file.wrapper_return_helpers.contains(name) {
+            return true;
+        }
+        file.wrapper_return_forwards
+            .get(name)
+            .is_some_and(|forwards| {
+                forwards.iter().any(|forward| match forward {
+                    TranslatorReturnForward::Local(callee) => {
+                        self.wrapper_return_for_local_at_depth(path, callee, depth + 1)
+                            || file.imports.get(callee).is_some_and(|target| {
+                                self.wrapper_return_for_import_at_depth(path, target, depth + 1)
+                            })
+                    }
+                    TranslatorReturnForward::NamespaceMember { namespace, name } => {
+                        file.namespace_imports.get(namespace).is_some_and(|source| {
+                            self.wrapper_return_for_import_at_depth(
+                                path,
+                                &ImportTarget {
+                                    source: source.clone(),
+                                    imported: ImportedName::Named(name.clone()),
+                                },
+                                depth + 1,
+                            )
+                        })
+                    }
+                    TranslatorReturnForward::ParameterCall { .. } => false,
+                    TranslatorReturnForward::ForwardCall {
+                        namespace: None,
+                        name,
+                        ..
+                    } => {
+                        self.wrapper_return_for_local_at_depth(path, name, depth + 1)
+                            || file.imports.get(name).is_some_and(|target| {
+                                self.wrapper_return_for_import_at_depth(path, target, depth + 1)
+                            })
+                    }
+                    TranslatorReturnForward::ForwardCall {
+                        namespace: Some(namespace),
+                        name,
+                        ..
+                    } => file.namespace_imports.get(namespace).is_some_and(|source| {
+                        self.wrapper_return_for_import_at_depth(
+                            path,
+                            &ImportTarget {
+                                source: source.clone(),
+                                imported: ImportedName::Named(name.clone()),
+                            },
+                            depth + 1,
+                        )
+                    }),
+                })
+            })
     }
 
     fn wrapper_return_for_import(&self, from: &Path, target: &ImportTarget) -> bool {
@@ -2642,6 +2703,12 @@ impl ProjectIndex {
         match &target.imported {
             ImportedName::Named(name) => {
                 file.named_wrapper_return_exports.contains(name)
+                    || file
+                        .translator_return_export_locals
+                        .get(name)
+                        .is_some_and(|local| {
+                            self.wrapper_return_for_local_at_depth(&path, local, depth + 1)
+                        })
                     || file.re_exports.get(name).is_some_and(|target| {
                         self.wrapper_return_for_import_at_depth(&path, target, depth + 1)
                     })
@@ -2658,6 +2725,65 @@ impl ProjectIndex {
             }
             ImportedName::Default => {
                 file.default_wrapper_return_export
+                    || file.default_local_export.as_ref().is_some_and(|local| {
+                        self.wrapper_return_for_local_at_depth(&path, local, depth + 1)
+                    })
+                    || file
+                        .default_wrapper_return_forwards
+                        .iter()
+                        .any(|forward| match forward {
+                            TranslatorReturnForward::Local(callee) => {
+                                self.wrapper_return_for_local_at_depth(&path, callee, depth + 1)
+                                    || file.imports.get(callee).is_some_and(|target| {
+                                        self.wrapper_return_for_import_at_depth(
+                                            &path,
+                                            target,
+                                            depth + 1,
+                                        )
+                                    })
+                            }
+                            TranslatorReturnForward::NamespaceMember { namespace, name } => {
+                                file.namespace_imports.get(namespace).is_some_and(|source| {
+                                    self.wrapper_return_for_import_at_depth(
+                                        &path,
+                                        &ImportTarget {
+                                            source: source.clone(),
+                                            imported: ImportedName::Named(name.clone()),
+                                        },
+                                        depth + 1,
+                                    )
+                                })
+                            }
+                            TranslatorReturnForward::ParameterCall { .. } => false,
+                            TranslatorReturnForward::ForwardCall {
+                                namespace: None,
+                                name,
+                                ..
+                            } => {
+                                self.wrapper_return_for_local_at_depth(&path, name, depth + 1)
+                                    || file.imports.get(name).is_some_and(|target| {
+                                        self.wrapper_return_for_import_at_depth(
+                                            &path,
+                                            target,
+                                            depth + 1,
+                                        )
+                                    })
+                            }
+                            TranslatorReturnForward::ForwardCall {
+                                namespace: Some(namespace),
+                                name,
+                                ..
+                            } => file.namespace_imports.get(namespace).is_some_and(|source| {
+                                self.wrapper_return_for_import_at_depth(
+                                    &path,
+                                    &ImportTarget {
+                                        source: source.clone(),
+                                        imported: ImportedName::Named(name.clone()),
+                                    },
+                                    depth + 1,
+                                )
+                            }),
+                        })
                     || file.re_exports.get("default").is_some_and(|target| {
                         self.wrapper_return_for_import_at_depth(&path, target, depth + 1)
                     })
@@ -6362,28 +6488,56 @@ fn function_local_bindings(body: &FunctionBody<'_>) -> BTreeSet<String> {
 }
 
 struct ReactWrapperReturnCollector {
-    identifiers: BTreeSet<String>,
+    memo_identifiers: BTreeSet<String>,
+    state_identifiers: BTreeSet<String>,
     namespaces: BTreeSet<String>,
-    found: bool,
+    wrapper_values: BTreeSet<String>,
+    direct: bool,
+    forwards: BTreeSet<TranslatorReturnForward>,
 }
 
 impl ReactWrapperReturnCollector {
+    fn call_is_wrapper(&self, call: &CallExpression<'_>, name: &str) -> bool {
+        if let Some(identifier) = call.callee.get_identifier_reference() {
+            let names = if name == "useMemo" {
+                &self.memo_identifiers
+            } else {
+                &self.state_identifiers
+            };
+            return names.contains(identifier.name.as_str());
+        }
+        call.callee.get_member_expr().is_some_and(|member| {
+            member.static_property_name() == Some(name)
+                && member
+                    .object()
+                    .get_identifier_reference()
+                    .is_some_and(|identifier| self.namespaces.contains(identifier.name.as_str()))
+        })
+    }
+
     fn expression_returns_wrapper(&self, expression: &Expression<'_>) -> bool {
         match expression.get_inner_expression() {
-            Expression::CallExpression(call) => {
-                if let Some(identifier) = call.callee.get_identifier_reference() {
-                    self.identifiers.contains(identifier.name.as_str())
-                } else {
-                    call.callee.get_member_expr().is_some_and(|member| {
-                        member.static_property_name() == Some("useMemo")
-                            && member.object().get_identifier_reference().is_some_and(
-                                |identifier| self.namespaces.contains(identifier.name.as_str()),
-                            )
-                    })
-                }
+            Expression::Identifier(identifier) => {
+                self.wrapper_values.contains(identifier.name.as_str())
             }
+            Expression::CallExpression(call) => self.call_is_wrapper(call, "useMemo"),
             Expression::AwaitExpression(await_expression) => {
                 self.expression_returns_wrapper(&await_expression.argument)
+            }
+            Expression::ArrayExpression(array) => array.elements.iter().any(|element| {
+                element
+                    .as_expression()
+                    .is_some_and(|expression| self.expression_returns_wrapper(expression))
+            }),
+            Expression::ObjectExpression(object) => {
+                object.properties.iter().any(|property| match property {
+                    ObjectPropertyKind::ObjectProperty(property) => {
+                        self.expression_returns_wrapper(&property.value)
+                    }
+                    ObjectPropertyKind::SpreadProperty(spread) => {
+                        self.expression_returns_wrapper(&spread.argument)
+                    }
+                })
             }
             Expression::ConditionalExpression(conditional) => {
                 self.expression_returns_wrapper(&conditional.consequent)
@@ -6396,16 +6550,86 @@ impl ReactWrapperReturnCollector {
             _ => false,
         }
     }
+
+    fn collect_forwards(&mut self, expression: &Expression<'_>) {
+        match expression.get_inner_expression() {
+            Expression::CallExpression(call)
+                if !self.call_is_wrapper(call, "useMemo")
+                    && !self.call_is_wrapper(call, "useState") =>
+            {
+                if let Some(identifier) = call.callee.get_identifier_reference() {
+                    self.forwards
+                        .insert(TranslatorReturnForward::Local(identifier.name.to_string()));
+                } else if let Some(member) = call.callee.get_member_expr()
+                    && let (Some(namespace), Some(name)) = (
+                        member.object().get_identifier_reference(),
+                        member.static_property_name(),
+                    )
+                {
+                    self.forwards
+                        .insert(TranslatorReturnForward::NamespaceMember {
+                            namespace: namespace.name.to_string(),
+                            name: name.to_string(),
+                        });
+                }
+            }
+            Expression::AwaitExpression(await_expression) => {
+                self.collect_forwards(&await_expression.argument)
+            }
+            Expression::ConditionalExpression(conditional) => {
+                self.collect_forwards(&conditional.consequent);
+                self.collect_forwards(&conditional.alternate);
+            }
+            Expression::LogicalExpression(logical) => {
+                self.collect_forwards(&logical.left);
+                self.collect_forwards(&logical.right);
+            }
+            _ => {}
+        }
+    }
 }
 
 impl<'a> Visit<'a> for ReactWrapperReturnCollector {
     fn visit_return_statement(&mut self, statement: &ReturnStatement<'a>) {
-        if statement
-            .argument
-            .as_ref()
-            .is_some_and(|argument| self.expression_returns_wrapper(argument))
+        if let Some(argument) = &statement.argument {
+            self.direct |= self.expression_returns_wrapper(argument);
+            self.collect_forwards(argument);
+        }
+    }
+
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        let Some(init) = &declarator.init else {
+            return;
+        };
+        let wrapper = self.expression_returns_wrapper(init);
+        let state = matches!(init.get_inner_expression(), Expression::CallExpression(call) if self.call_is_wrapper(call, "useState"));
+        if wrapper {
+            self.wrapper_values.extend(
+                declarator
+                    .id
+                    .get_binding_identifiers()
+                    .into_iter()
+                    .map(|identifier| identifier.name.to_string()),
+            );
+        } else if state
+            && let BindingPattern::ArrayPattern(pattern) = &declarator.id
+            && let Some(Some(element)) = pattern.elements.first()
         {
-            self.found = true;
+            self.wrapper_values.extend(
+                element
+                    .get_binding_identifiers()
+                    .into_iter()
+                    .map(|identifier| identifier.name.to_string()),
+            );
+        }
+    }
+
+    fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
+        if expression.operator == AssignmentOperator::Assign
+            && self.expression_returns_wrapper(&expression.right)
+            && let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &expression.left
+        {
+            self.wrapper_values.insert(identifier.name.to_string());
         }
     }
 
@@ -8791,6 +9015,12 @@ impl TranslatorReturnCollector {
 }
 
 #[derive(Default)]
+struct WrapperReturnSummary {
+    direct: bool,
+    forwards: BTreeSet<TranslatorReturnForward>,
+}
+
+#[derive(Default)]
 struct TranslatorReturnSummary {
     binding: Option<TranslatorBinding>,
     array_binding: Option<TranslatorBinding>,
@@ -9095,6 +9325,7 @@ struct SourceIndexCollector {
     translator_array_return_params: BTreeMap<String, ParamIndexes>,
     translator_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     wrapper_return_helpers: BTreeSet<String>,
+    wrapper_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     enum_member_domains: TypeDomains,
     translation_factories: BTreeSet<String>,
     next_intl_namespaces: BTreeSet<String>,
@@ -9112,6 +9343,7 @@ struct SourceIndexCollector {
     default_translator_array_return_params: ParamIndexes,
     default_translator_return_forwards: BTreeSet<TranslatorReturnForward>,
     default_wrapper_return_summary: bool,
+    default_wrapper_return_forwards: BTreeSet<TranslatorReturnForward>,
     binding_scopes: Vec<IndexBindingEnvironment>,
     scope_depth: usize,
 }
@@ -9134,6 +9366,7 @@ struct IndexBindingEnvironment {
     translator_array_return_params: BTreeMap<String, ParamIndexes>,
     translator_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     wrapper_return_helpers: BTreeSet<String>,
+    wrapper_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     enum_member_domains: TypeDomains,
 }
 
@@ -9193,45 +9426,70 @@ impl SourceIndexCollector {
         params: &oxc_ast::ast::FormalParameters<'_>,
         body: &FunctionBody<'_>,
     ) -> ReactWrapperReturnCollector {
-        let mut identifiers = self.react_use_memo_identifiers();
+        let mut memo_identifiers = self.react_use_memo_identifiers();
+        let mut state_identifiers = self
+            .imports
+            .iter()
+            .filter(|(_, target)| {
+                target.source == "react"
+                    && matches!(&target.imported, ImportedName::Named(name) if name == "useState")
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<BTreeSet<_>>();
         let mut namespaces = self.react_namespaces();
         for identifier in params
             .items
             .iter()
             .flat_map(|param| param.pattern.get_binding_identifiers())
         {
-            identifiers.remove(identifier.name.as_str());
+            memo_identifiers.remove(identifier.name.as_str());
+            state_identifiers.remove(identifier.name.as_str());
             namespaces.remove(identifier.name.as_str());
         }
         for name in function_local_bindings(body) {
-            identifiers.remove(&name);
+            memo_identifiers.remove(&name);
+            state_identifiers.remove(&name);
             namespaces.remove(&name);
         }
         ReactWrapperReturnCollector {
-            identifiers,
+            memo_identifiers,
+            state_identifiers,
             namespaces,
-            found: false,
+            wrapper_values: BTreeSet::new(),
+            direct: false,
+            forwards: BTreeSet::new(),
         }
     }
 
-    fn function_returns_wrapper(&self, function: &Function<'_>) -> bool {
+    fn function_wrapper_return_summary(&self, function: &Function<'_>) -> WrapperReturnSummary {
         let Some(body) = &function.body else {
-            return false;
+            return WrapperReturnSummary::default();
         };
         let mut collector = self.wrapper_return_collector(&function.params, body);
         collector.visit_function_body(body);
-        collector.found
+        WrapperReturnSummary {
+            direct: collector.direct,
+            forwards: collector.forwards,
+        }
     }
 
-    fn arrow_returns_wrapper(&self, arrow: &ArrowFunctionExpression<'_>) -> bool {
+    fn arrow_wrapper_return_summary(
+        &self,
+        arrow: &ArrowFunctionExpression<'_>,
+    ) -> WrapperReturnSummary {
         let mut collector = self.wrapper_return_collector(&arrow.params, &arrow.body);
         if arrow.expression
             && let Some(Statement::ExpressionStatement(statement)) = arrow.body.statements.first()
         {
-            return collector.expression_returns_wrapper(&statement.expression);
+            collector.direct = collector.expression_returns_wrapper(&statement.expression);
+            collector.collect_forwards(&statement.expression);
+        } else {
+            collector.visit_function_body(&arrow.body);
         }
-        collector.visit_function_body(&arrow.body);
-        collector.found
+        WrapperReturnSummary {
+            direct: collector.direct,
+            forwards: collector.forwards,
+        }
     }
 
     fn contextual_finite_record_iterable_from_expression(
@@ -9285,6 +9543,16 @@ impl SourceIndexCollector {
         }
         if !summary.forwards.is_empty() {
             self.translator_return_forwards
+                .insert(name.to_string(), summary.forwards);
+        }
+    }
+
+    fn record_wrapper_return_summary(&mut self, name: &str, summary: WrapperReturnSummary) {
+        if summary.direct {
+            self.wrapper_return_helpers.insert(name.to_string());
+        }
+        if !summary.forwards.is_empty() {
+            self.wrapper_return_forwards
                 .insert(name.to_string(), summary.forwards);
         }
     }
@@ -9504,6 +9772,7 @@ impl SourceIndexCollector {
             translator_array_return_params: self.translator_array_return_params,
             translator_return_forwards: self.translator_return_forwards,
             wrapper_return_helpers: self.wrapper_return_helpers,
+            wrapper_return_forwards: self.wrapper_return_forwards,
             translator_return_export_locals,
             named_exports,
             named_jsx_exports,
@@ -9526,6 +9795,7 @@ impl SourceIndexCollector {
             default_translator_array_return_export,
             default_translator_array_return_params,
             default_wrapper_return_export,
+            default_wrapper_return_forwards: self.default_wrapper_return_forwards,
             default_translator_return_forwards: self.default_translator_return_forwards,
         }
     }
@@ -9548,6 +9818,7 @@ impl SourceIndexCollector {
             translator_array_return_params: self.translator_array_return_params.clone(),
             translator_return_forwards: self.translator_return_forwards.clone(),
             wrapper_return_helpers: self.wrapper_return_helpers.clone(),
+            wrapper_return_forwards: self.wrapper_return_forwards.clone(),
             enum_member_domains: self.enum_member_domains.clone(),
         }
     }
@@ -9569,6 +9840,7 @@ impl SourceIndexCollector {
         self.translator_array_return_params = environment.translator_array_return_params;
         self.translator_return_forwards = environment.translator_return_forwards;
         self.wrapper_return_helpers = environment.wrapper_return_helpers;
+        self.wrapper_return_forwards = environment.wrapper_return_forwards;
         self.enum_member_domains = environment.enum_member_domains;
     }
 
@@ -9756,7 +10028,9 @@ impl SourceIndexCollector {
     fn record_default_export(&mut self, declaration: &ExportDefaultDeclaration<'_>) {
         match &declaration.declaration {
             ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
-                self.default_wrapper_return_summary = self.function_returns_wrapper(function);
+                let wrapper_return = self.function_wrapper_return_summary(function);
+                self.default_wrapper_return_summary = wrapper_return.direct;
+                self.default_wrapper_return_forwards = wrapper_return.forwards.clone();
                 self.default_jsx_summary = function
                     .params
                     .items
@@ -9820,9 +10094,7 @@ impl SourceIndexCollector {
                     translator_return.array_param_indexes.clone();
                 self.default_translator_return_forwards = translator_return.forwards.clone();
                 if let Some(id) = &function.id {
-                    if self.default_wrapper_return_summary {
-                        self.wrapper_return_helpers.insert(id.name.to_string());
-                    }
+                    self.record_wrapper_return_summary(id.name.as_str(), wrapper_return);
                     self.record_helper(
                         id.name.as_str(),
                         self.default_summary.clone().unwrap_or_default(),
@@ -9840,7 +10112,9 @@ impl SourceIndexCollector {
                 self.default_local = Some(identifier.name.to_string());
             }
             ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
-                self.default_wrapper_return_summary = self.arrow_returns_wrapper(arrow);
+                let wrapper_return = self.arrow_wrapper_return_summary(arrow);
+                self.default_wrapper_return_summary = wrapper_return.direct;
+                self.default_wrapper_return_forwards = wrapper_return.forwards;
                 self.default_jsx_summary = arrow.params.items.first().and_then(|parameter| {
                     jsx_component_summary_from_body(
                         &parameter.pattern,
@@ -9879,7 +10153,9 @@ impl SourceIndexCollector {
                 self.default_translator_return_forwards = translator_return.forwards;
             }
             ExportDefaultDeclarationKind::FunctionExpression(function) => {
-                self.default_wrapper_return_summary = self.function_returns_wrapper(function);
+                let wrapper_return = self.function_wrapper_return_summary(function);
+                self.default_wrapper_return_summary = wrapper_return.direct;
+                self.default_wrapper_return_forwards = wrapper_return.forwards;
                 self.default_jsx_summary = function
                     .params
                     .items
@@ -10089,9 +10365,8 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                 let summary = self.translator_return_summary_from_body(body, &function.params);
                 self.record_translator_return_summary(id.name.as_str(), summary);
             }
-            if self.function_returns_wrapper(function) {
-                self.wrapper_return_helpers.insert(id.name.to_string());
-            }
+            let wrapper_return = self.function_wrapper_return_summary(function);
+            self.record_wrapper_return_summary(id.name.as_str(), wrapper_return);
         }
         walk::walk_function(self, function, flags);
     }
@@ -10280,16 +10555,16 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                 if let Some(summary) = translator_return {
                     self.record_translator_return_summary(name, summary);
                 }
-                let returns_wrapper = match init.get_inner_expression() {
-                    Expression::ArrowFunctionExpression(arrow) => self.arrow_returns_wrapper(arrow),
-                    Expression::FunctionExpression(function) => {
-                        self.function_returns_wrapper(function)
+                let wrapper_return = match init.get_inner_expression() {
+                    Expression::ArrowFunctionExpression(arrow) => {
+                        self.arrow_wrapper_return_summary(arrow)
                     }
-                    _ => false,
+                    Expression::FunctionExpression(function) => {
+                        self.function_wrapper_return_summary(function)
+                    }
+                    _ => WrapperReturnSummary::default(),
                 };
-                if returns_wrapper {
-                    self.wrapper_return_helpers.insert(name.to_string());
-                }
+                self.record_wrapper_return_summary(name, wrapper_return);
             }
         }
         walk::walk_variable_declarator(self, declarator);
@@ -11460,9 +11735,10 @@ impl SourceUsageCollector {
             Expression::ComputedMemberExpression(member) => {
                 self.expression_is_potential_wrapper_value(&member.object)
             }
-            Expression::StaticMemberExpression(member) => self
-                .potential_wrapper_callable_paths_from_expression(&member.object)
-                .contains(member.property.name.as_str()),
+            Expression::StaticMemberExpression(member) => {
+                let paths = self.potential_wrapper_callable_paths_from_expression(&member.object);
+                Self::potential_wrapper_paths_contain(&paths, member.property.name.as_str())
+            }
             Expression::CallExpression(call) => {
                 call.callee.get_member_expr().is_some_and(|member| {
                     matches!(member.static_property_name(), Some("get" | "at"))
@@ -11535,13 +11811,14 @@ impl SourceUsageCollector {
                 }
                 paths
             }
-            Expression::StaticMemberExpression(member) => {
-                let prefix = format!("{}.", member.property.name);
-                self.potential_wrapper_callable_paths_from_expression(&member.object)
-                    .into_iter()
-                    .filter_map(|path| path.strip_prefix(&prefix).map(ToOwned::to_owned))
-                    .collect()
-            }
+            Expression::StaticMemberExpression(member) => self
+                .potential_wrapper_callable_paths_from_expression(&member.object)
+                .into_iter()
+                .filter_map(|path| {
+                    let (head, tail) = path.split_once('.')?;
+                    (head == member.property.name.as_str() || head == "*").then(|| tail.to_string())
+                })
+                .collect(),
             Expression::AwaitExpression(await_expression) => {
                 self.potential_wrapper_callable_paths_from_expression(&await_expression.argument)
             }
@@ -11557,8 +11834,104 @@ impl SourceUsageCollector {
         if path.is_empty() {
             return self.expression_is_potential_wrapper_callable(expression);
         }
-        self.potential_wrapper_callable_paths_from_expression(expression)
-            .contains(&path.join("."))
+        Self::potential_wrapper_paths_contain(
+            &self.potential_wrapper_callable_paths_from_expression(expression),
+            &path.join("."),
+        )
+    }
+
+    fn potential_wrapper_paths_contain(paths: &BTreeSet<String>, target: &str) -> bool {
+        paths.contains(target)
+            || paths.iter().any(|path| {
+                let pattern = path.split('.').collect::<Vec<_>>();
+                let target = target.split('.').collect::<Vec<_>>();
+                pattern.len() == target.len()
+                    && pattern
+                        .iter()
+                        .zip(target)
+                        .all(|(pattern, target)| *pattern == "*" || *pattern == target)
+            })
+    }
+
+    fn bind_pattern_potential_wrapper_paths(
+        &mut self,
+        pattern: &BindingPattern<'_>,
+        paths: &BTreeSet<String>,
+        prefix: &[String],
+    ) {
+        match pattern {
+            BindingPattern::BindingIdentifier(identifier) => {
+                let prefix = prefix.join(".");
+                if paths.contains(&prefix) {
+                    self.potential_wrapper_callables
+                        .insert(identifier.name.to_string());
+                }
+                let nested_prefix = (!prefix.is_empty()).then(|| format!("{prefix}."));
+                let nested = paths
+                    .iter()
+                    .filter_map(|path| match &nested_prefix {
+                        Some(prefix) => path.strip_prefix(prefix).map(ToOwned::to_owned),
+                        None => Some(path.clone()),
+                    })
+                    .filter(|path| !path.is_empty())
+                    .collect::<BTreeSet<_>>();
+                if !nested.is_empty() {
+                    self.potential_wrapper_callable_paths
+                        .insert(identifier.name.to_string(), nested);
+                }
+            }
+            BindingPattern::AssignmentPattern(assignment) => {
+                self.bind_pattern_potential_wrapper_paths(&assignment.left, paths, prefix);
+            }
+            BindingPattern::ObjectPattern(object) => {
+                let mut consumed = BTreeSet::new();
+                for property in &object.properties {
+                    if property.computed {
+                        continue;
+                    }
+                    let Some(name) = property.key.static_name() else {
+                        continue;
+                    };
+                    consumed.insert(name.to_string());
+                    let mut property_prefix = prefix.to_vec();
+                    property_prefix.push(name.to_string());
+                    self.bind_pattern_potential_wrapper_paths(
+                        &property.value,
+                        paths,
+                        &property_prefix,
+                    );
+                }
+                if let Some(rest) = &object.rest {
+                    let root = prefix.join(".");
+                    let root_prefix = (!root.is_empty()).then(|| format!("{root}."));
+                    let remaining = paths
+                        .iter()
+                        .filter_map(|path| {
+                            let relative = match &root_prefix {
+                                Some(prefix) => path.strip_prefix(prefix)?,
+                                None => path.as_str(),
+                            };
+                            let first = relative.split('.').next().unwrap_or_default();
+                            (!consumed.contains(first)).then(|| relative.to_string())
+                        })
+                        .collect::<BTreeSet<_>>();
+                    self.bind_pattern_potential_wrapper_paths(&rest.argument, &remaining, &[]);
+                }
+            }
+            BindingPattern::ArrayPattern(array) => {
+                for (index, element) in array.elements.iter().enumerate() {
+                    let Some(element) = element else {
+                        continue;
+                    };
+                    let mut element_prefix = prefix.to_vec();
+                    element_prefix.push(index.to_string());
+                    self.bind_pattern_potential_wrapper_paths(element, paths, &element_prefix);
+                }
+                if let Some(rest) = &array.rest {
+                    self.bind_pattern_potential_wrapper_paths(&rest.argument, paths, prefix);
+                }
+            }
+        }
     }
 
     fn is_potential_wrapper_translator_call(&self, expression: &Expression<'_>) -> bool {
@@ -11566,9 +11939,10 @@ impl SourceUsageCollector {
             Expression::Identifier(identifier) => self
                 .potential_wrapper_callables
                 .contains(identifier.name.as_str()),
-            Expression::StaticMemberExpression(member) => self
-                .potential_wrapper_callable_paths_from_expression(&member.object)
-                .contains(member.property.name.as_str()),
+            Expression::StaticMemberExpression(member) => {
+                let paths = self.potential_wrapper_callable_paths_from_expression(&member.object);
+                Self::potential_wrapper_paths_contain(&paths, member.property.name.as_str())
+            }
             Expression::ComputedMemberExpression(member) => {
                 self.expression_is_potential_wrapper_value(&member.object)
             }
@@ -13985,6 +14359,15 @@ impl SourceUsageCollector {
                     ) {
                         return true;
                     }
+                    if self
+                        .translator_object_bindings_from_expression(&spread.argument)
+                        .is_some_and(|bindings| {
+                            bindings.resolved_properties.contains(prop_name)
+                                && !bindings.path_is_unknown(prop_name)
+                        })
+                    {
+                        return false;
+                    }
                 }
             }
         }
@@ -15606,7 +15989,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         let potential_callable_path_binding = binding_identifier_name(&declarator.id)
             .filter(|_| !inherited_wrapper_callable_paths.is_empty());
         let destructured_wrapper_callables =
-            (!matches!(declarator.id, BindingPattern::BindingIdentifier(_))
+            (matches!(declarator.id, BindingPattern::ArrayPattern(_))
                 && (direct_memo_wrapper || inherited_wrapper_value))
                 .then(|| {
                     declarator
@@ -15884,10 +16267,15 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         }
         if let Some(name) = potential_callable_path_binding {
             self.potential_wrapper_callable_paths
-                .insert(name.to_string(), inherited_wrapper_callable_paths);
+                .insert(name.to_string(), inherited_wrapper_callable_paths.clone());
         }
         self.potential_wrapper_callables
             .extend(destructured_wrapper_callables);
+        self.bind_pattern_potential_wrapper_paths(
+            &declarator.id,
+            &inherited_wrapper_callable_paths,
+            &[],
+        );
         if let (Some(name), Some(binding)) =
             (binding_identifier_name(&declarator.id), callback_return)
         {
@@ -16537,6 +16925,12 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         }
         let assigned_binding = self.translator_binding_from_expression(&expression.right);
         let assigned_object = self.translator_object_bindings_from_expression(&expression.right);
+        let assigned_potential_callable =
+            self.expression_is_potential_wrapper_callable(&expression.right);
+        let assigned_potential_paths =
+            self.potential_wrapper_callable_paths_from_expression(&expression.right);
+        let propagate_potential_assignment =
+            expression.operator == AssignmentOperator::Assign || expression.operator.is_logical();
         if expression.operator == AssignmentOperator::Assign
             && let Some(name) = assignment_target_member_object_name(&expression.left)
             && self.translator_map_entries.contains_key(name)
@@ -16565,6 +16959,24 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         }
         if let Some((name, path)) = assignment_target_static_member_path(&expression.left) {
             let property = path.join(".");
+            let paths = self
+                .potential_wrapper_callable_paths
+                .entry(name.to_string())
+                .or_default();
+            if !expression.operator.is_logical() {
+                let prefix = format!("{property}.");
+                paths.retain(|path| path != &property && !path.starts_with(&prefix));
+            }
+            if propagate_potential_assignment && assigned_potential_callable {
+                paths.insert(property.clone());
+            }
+            if propagate_potential_assignment {
+                paths.extend(
+                    assigned_potential_paths
+                        .iter()
+                        .map(|path| format!("{property}.{path}")),
+                );
+            }
             let bindings = self
                 .translator_object_bindings
                 .entry(name.to_string())
@@ -16594,8 +17006,27 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 for property in properties {
                     let mut property_path = path.clone();
                     property_path.push(property);
+                    let property = property_path.join(".");
+                    let paths = self
+                        .potential_wrapper_callable_paths
+                        .entry(name.to_string())
+                        .or_default();
+                    if !expression.operator.is_logical() && exact_target {
+                        let prefix = format!("{property}.");
+                        paths.retain(|path| path != &property && !path.starts_with(&prefix));
+                    }
+                    if propagate_potential_assignment && assigned_potential_callable {
+                        paths.insert(property.clone());
+                    }
+                    if propagate_potential_assignment {
+                        paths.extend(
+                            assigned_potential_paths
+                                .iter()
+                                .map(|path| format!("{property}.{path}")),
+                        );
+                    }
                     bindings.assign_path(
-                        &property_path.join("."),
+                        &property,
                         expression.operator,
                         exact_target,
                         assigned_binding.as_ref(),
@@ -16603,6 +17034,22 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     );
                 }
             } else {
+                if propagate_potential_assignment
+                    && (assigned_potential_callable || !assigned_potential_paths.is_empty())
+                {
+                    let paths = self
+                        .potential_wrapper_callable_paths
+                        .entry(name.to_string())
+                        .or_default();
+                    if assigned_potential_callable {
+                        paths.insert("*".to_string());
+                    }
+                    paths.extend(
+                        assigned_potential_paths
+                            .iter()
+                            .map(|path| format!("*.{path}")),
+                    );
+                }
                 if let Some(bindings) = self.translator_object_bindings.get_mut(name) {
                     bindings.mark_unknown(&path.join("."));
                 }
@@ -18560,9 +19007,11 @@ mod tests {
             &helper,
             r#"
             import {useMemo} from 'react';
-            export function useRuntimeValues(locale) {
-              return useMemo(() => runtimeValues(locale), [locale]);
+            function useBaseValues(locale) {
+              const values = useMemo(() => runtimeValues(locale), [locale]);
+              return values;
             }
+            export function useRuntimeValues(locale) { return useBaseValues(locale); }
             "#,
         )
         .expect("write helper");
@@ -18594,6 +19043,91 @@ mod tests {
                 .map(|usage| usage.line)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn wrapper_return_summaries_follow_locals_state_and_forwarding_hooks() {
+        let scan = scan(
+            r#"
+            import {useMemo, useState} from 'react';
+            function useBaseValues() {
+              const values = useMemo(() => runtimeValues(), []);
+              return values;
+            }
+            function useForwardedValues() { return useBaseValues(); }
+            const forwarded = useForwardedValues();
+            forwarded[0](runtimeKey);
+            function useStateValues() {
+              const [values] = useState(() => runtimeValues());
+              return values;
+            }
+            const stated = useStateValues();
+            stated[0](runtimeKey);
+            "#,
+        );
+
+        let lines: Vec<_> = scan.dynamic_usages.iter().map(|usage| usage.line).collect();
+        assert!(lines.contains(&9), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&15), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn destructured_wrapper_paths_do_not_promote_siblings() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const values = useMemo(() => runtimeValues(), []);
+            const callable = values[0];
+            const holder = {callable, cleanup: draw};
+            const {callable: selected, cleanup} = holder;
+            cleanup('layer');
+            selected(runtimeKey);
+            "#,
+        );
+
+        let lines: Vec<_> = scan.dynamic_usages.iter().map(|usage| usage.line).collect();
+        assert!(!lines.contains(&7), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&8), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn member_assignments_update_exact_and_unknown_callable_paths() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const values = useMemo(() => runtimeValues(), []);
+            const callable = values[0];
+            const bag = {};
+            bag.value = callable;
+            bag.cleanup = draw;
+            bag.cleanup('layer');
+            bag.value(runtimeKey);
+            const unknown = {};
+            unknown[runtimeProperty] = callable;
+            unknown.whichever(runtimeKey);
+            "#,
+        );
+
+        let lines: Vec<_> = scan.dynamic_usages.iter().map(|usage| usage.line).collect();
+        assert!(!lines.contains(&8), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&9), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&12), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn later_known_jsx_spreads_override_wrapper_props() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const values = useMemo(() => runtimeValues(), []);
+            const callable = values[0];
+            function Child({value}) { value(runtimeKey); return null; }
+            const ordinary = {value: draw};
+            const child = <Child value={callable} {...ordinary} />;
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.is_empty());
     }
 
     #[test]
