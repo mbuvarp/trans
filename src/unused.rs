@@ -7972,6 +7972,7 @@ impl ReactWrapperReturnCollector {
             self.finite_bound_capture_dependency_depths.remove(name);
             self.finite_bound_capture_value_depths.remove(name);
         }
+        self.refresh_finite_bound_capture_members_for_callable(name);
         self.invalidate_escaped_finite_bound_capture(name);
     }
 
@@ -8009,6 +8010,7 @@ impl ReactWrapperReturnCollector {
             .entry(name.to_string())
             .or_default()
             .extend(value_scope_ids);
+        self.refresh_finite_bound_capture_members_for_callable(name);
         self.invalidate_escaped_finite_bound_capture(name);
         self.refresh_finite_bound_capture_dependents(name, false);
     }
@@ -8130,6 +8132,7 @@ impl ReactWrapperReturnCollector {
                         .insert(dependent.clone(), merged_provenance);
                     self.finite_bound_resolved_capture_names
                         .insert(dependent.clone(), merged_resolved);
+                    self.refresh_finite_bound_capture_members_for_callable(&dependent);
                     self.invalidate_escaped_finite_bound_capture(&dependent);
                     pending.push((dependent, false));
                 }
@@ -8704,13 +8707,28 @@ impl ReactWrapperReturnCollector {
         for key in keys {
             if let Some(dependencies) = self.finite_bound_capture_member_dependencies.get_mut(&key)
             {
-                dependencies.insert(name.to_string(), BTreeSet::from([scope_id]));
+                dependencies
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(scope_id);
             }
             self.finite_bound_capture_member_provenance
                 .entry(key)
                 .or_default()
                 .extend(provenance.iter().copied());
         }
+    }
+
+    fn refresh_finite_bound_capture_members_for_callable(&mut self, name: &str) {
+        let Some(scope_id) = self.finite_bound_capture_binding_depths.get(name).copied() else {
+            return;
+        };
+        let provenance = self
+            .finite_bound_capture_provenance
+            .get(name)
+            .cloned()
+            .unwrap_or_default();
+        self.refresh_finite_bound_capture_member_binding(name, scope_id, &provenance);
     }
 
     fn seed_finite_bound_capture_object_dependencies(
@@ -8757,17 +8775,22 @@ impl ReactWrapperReturnCollector {
                         continue;
                     };
                     let source_binding = self.finite_bound_capture_binding(source.name.as_str());
-                    let copied = self
+                    let aliases = self
+                        .finite_bound_capture_aliases
+                        .get(&source_binding)
+                        .cloned()
+                        .unwrap_or_else(|| BTreeSet::from([source_binding.clone()]));
+                    let paths = self
                         .finite_bound_capture_member_dependencies
-                        .iter()
-                        .filter(|((candidate, _), _)| candidate == &source_binding)
-                        .map(|((_, path), dependencies)| {
-                            let provenance = self
-                                .finite_bound_capture_member_provenance
-                                .get(&(source_binding.clone(), path.clone()))
-                                .cloned()
-                                .unwrap_or_default();
-                            (path.clone(), dependencies.clone(), provenance)
+                        .keys()
+                        .filter(|(candidate, _)| aliases.contains(candidate))
+                        .map(|(_, path)| path.clone())
+                        .collect::<BTreeSet<_>>();
+                    let copied = paths
+                        .into_iter()
+                        .filter_map(|path| {
+                            self.finite_bound_capture_member_state(&source_binding, &path)
+                                .map(|(dependencies, provenance)| (path, dependencies, provenance))
                         })
                         .collect::<Vec<_>>();
                     for (path, dependencies, provenance) in copied {
@@ -29448,6 +29471,64 @@ mod tests {
                 const holder = { mutating: () => { args[0] = runtimeFactory; }, safe: ordinary };
                 const alias = holder;
                 external.callback = alias.safe;
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        assert!(
+            scan.dynamic_usages.is_empty(),
+            "dynamic usages: {:?}",
+            scan.dynamic_usages
+        );
+    }
+
+    #[test]
+    fn member_property_summaries_refresh_after_callable_reassignment() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const args = [draw];
+                let callback = ordinary;
+                const holder = { invoke: () => callback() };
+                callback = () => { args[0] = runtimeFactory; };
+                external.callback = holder.invoke;
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn object_spreads_copy_member_summaries_through_aliases() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const holder = {
+                  mutating: () => { args[0] = runtimeFactory; },
+                  safe: ordinary,
+                };
+                const alias = holder;
+                const copy = {...alias};
+                const args = [draw];
+                external.callback = copy.safe;
                 return outer(inner.bind(null, ...args));
               }
             }
