@@ -387,6 +387,7 @@ struct SourceFileIndex {
     translator_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     wrapper_return_helpers: BTreeSet<String>,
     wrapper_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
+    wrapper_array_return_indexes: BTreeMap<String, BTreeSet<usize>>,
     translator_return_export_locals: BTreeMap<String, String>,
     named_exports: BTreeMap<String, HelperSummary>,
     named_jsx_exports: BTreeMap<String, JsxComponentSummary>,
@@ -410,6 +411,7 @@ struct SourceFileIndex {
     default_translator_array_return_params: ParamIndexes,
     default_wrapper_return_export: bool,
     default_wrapper_return_forwards: BTreeSet<TranslatorReturnForward>,
+    default_wrapper_array_return_indexes: BTreeSet<usize>,
     default_translator_return_forwards: BTreeSet<TranslatorReturnForward>,
 }
 
@@ -2618,6 +2620,40 @@ impl ProjectIndex {
 
     fn wrapper_return_for_local(&self, path: &Path, name: &str) -> bool {
         self.wrapper_return_for_local_at_depth(path, name, 0)
+    }
+
+    fn wrapper_array_indexes_for_local(&self, path: &Path, name: &str) -> Option<BTreeSet<usize>> {
+        self.files
+            .get(path)?
+            .wrapper_array_return_indexes
+            .get(name)
+            .cloned()
+    }
+
+    fn wrapper_array_indexes_for_import(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+    ) -> Option<BTreeSet<usize>> {
+        let path = self.resolve_module(from, &target.source)?;
+        let file = self.files.get(&path)?;
+        match &target.imported {
+            ImportedName::Named(name) => file
+                .translator_return_export_locals
+                .get(name)
+                .and_then(|local| file.wrapper_array_return_indexes.get(local))
+                .cloned(),
+            ImportedName::Default => {
+                if !file.default_wrapper_array_return_indexes.is_empty() {
+                    Some(file.default_wrapper_array_return_indexes.clone())
+                } else {
+                    file.default_local_export
+                        .as_ref()
+                        .and_then(|local| file.wrapper_array_return_indexes.get(local))
+                        .cloned()
+                }
+            }
+        }
     }
 
     fn wrapper_return_for_local_at_depth(&self, path: &Path, name: &str, depth: usize) -> bool {
@@ -6590,6 +6626,7 @@ struct ReactWrapperReturnCollector {
     structured_unknown_values: BTreeSet<String>,
     direct: bool,
     forwards: BTreeSet<TranslatorReturnForward>,
+    array_indexes: BTreeSet<usize>,
 }
 
 impl ReactWrapperReturnCollector {
@@ -6644,6 +6681,17 @@ impl ReactWrapperReturnCollector {
                         } else {
                             format!("{prefix}.{name}")
                         };
+                        let path_prefix = format!("{path}.");
+                        self.wrapper_member_values
+                            .retain(|(candidate_root, candidate)| {
+                                candidate_root != root
+                                    || (candidate != &path && !candidate.starts_with(&path_prefix))
+                            });
+                        self.forward_member_values
+                            .retain(|(candidate_root, candidate), _| {
+                                candidate_root != root
+                                    || (candidate != &path && !candidate.starts_with(&path_prefix))
+                            });
                         if matches!(
                             property.value.get_inner_expression(),
                             Expression::ObjectExpression(_)
@@ -6660,8 +6708,12 @@ impl ReactWrapperReturnCollector {
                             self.forward_member_values.insert(key, forwards);
                         }
                     }
-                    ObjectPropertyKind::ObjectProperty(_) => {
-                        self.structured_unknown_values.insert(root.to_string());
+                    ObjectPropertyKind::ObjectProperty(property) => {
+                        if self.expression_returns_wrapper(&property.value)
+                            || !self.forwards_from_expression(&property.value).is_empty()
+                        {
+                            self.structured_unknown_values.insert(root.to_string());
+                        }
                     }
                     ObjectPropertyKind::SpreadProperty(spread) => {
                         let Some(source) = spread.argument.get_identifier_reference() else {
@@ -6681,10 +6733,34 @@ impl ReactWrapperReturnCollector {
                             .filter(|((candidate, _), _)| candidate == source)
                             .map(|((_, path), forwards)| (path.clone(), forwards.clone()))
                             .collect::<Vec<_>>();
-                        for path in wrappers {
+                        for source_path in wrappers {
+                            let path = if prefix.is_empty() {
+                                source_path
+                            } else {
+                                format!("{prefix}.{source_path}")
+                            };
+                            let path_prefix = format!("{path}.");
+                            self.wrapper_member_values
+                                .retain(|(candidate_root, candidate)| {
+                                    candidate_root != root
+                                        || (candidate != &path
+                                            && !candidate.starts_with(&path_prefix))
+                                });
                             self.wrapper_member_values.insert((root.to_string(), path));
                         }
-                        for (path, values) in forwards {
+                        for (source_path, values) in forwards {
+                            let path = if prefix.is_empty() {
+                                source_path
+                            } else {
+                                format!("{prefix}.{source_path}")
+                            };
+                            let path_prefix = format!("{path}.");
+                            self.forward_member_values
+                                .retain(|(candidate_root, candidate), _| {
+                                    candidate_root != root
+                                        || (candidate != &path
+                                            && !candidate.starts_with(&path_prefix))
+                                });
                             self.forward_member_values
                                 .insert((root.to_string(), path), values);
                         }
@@ -7024,6 +7100,34 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         if let Some(argument) = &statement.argument {
             self.direct |= self.expression_returns_wrapper(argument);
             self.collect_forwards(argument);
+            if let Expression::CallExpression(call) = argument.get_inner_expression()
+                && call.callee.get_member_expr().is_some_and(|member| {
+                    member.static_property_name() == Some("all")
+                        && member
+                            .object()
+                            .get_identifier_reference()
+                            .is_some_and(|identifier| identifier.name == "Promise")
+                })
+                && let Some(Expression::ArrayExpression(array)) = call
+                    .arguments
+                    .first()
+                    .and_then(Argument::as_expression)
+                    .map(Expression::get_inner_expression)
+            {
+                let indexes = array
+                    .elements
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, element)| {
+                        element.as_expression().and_then(|expression| {
+                            (self.expression_returns_wrapper(expression)
+                                || !self.forwards_from_expression(expression).is_empty())
+                            .then_some(index)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                self.array_indexes.extend(indexes);
+            }
         }
     }
 
@@ -7112,6 +7216,49 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 if !forwards.is_empty() {
                     self.forward_member_values.insert((root, path), forwards);
                 }
+            }
+        } else if expression.operator == AssignmentOperator::Assign
+            && let Some((root, prefix)) = assignment_target_unknown_container_path(&expression.left)
+        {
+            let root = root.to_string();
+            let forwards = self.forwards_from_expression(&expression.right);
+            let wrapper = self.expression_returns_wrapper(&expression.right);
+            let properties = match &expression.left {
+                AssignmentTarget::ComputedMemberExpression(member) => {
+                    match member.expression.get_inner_expression() {
+                        Expression::StringLiteral(literal) => Some(vec![literal.value.to_string()]),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(properties) = properties {
+                for property in properties {
+                    let mut path = prefix.clone();
+                    path.push(property);
+                    let path = path.join(".");
+                    let path_prefix = format!("{path}.");
+                    self.wrapper_member_values
+                        .retain(|(candidate_root, candidate)| {
+                            candidate_root != &root
+                                || (candidate != &path && !candidate.starts_with(&path_prefix))
+                        });
+                    self.forward_member_values
+                        .retain(|(candidate_root, candidate), _| {
+                            candidate_root != &root
+                                || (candidate != &path && !candidate.starts_with(&path_prefix))
+                        });
+                    if wrapper {
+                        self.wrapper_member_values
+                            .insert((root.clone(), path.clone()));
+                    }
+                    if !forwards.is_empty() {
+                        self.forward_member_values
+                            .insert((root.clone(), path), forwards.clone());
+                    }
+                }
+            } else if wrapper || !forwards.is_empty() {
+                self.structured_unknown_values.insert(root);
             }
         }
     }
@@ -9501,6 +9648,7 @@ impl TranslatorReturnCollector {
 struct WrapperReturnSummary {
     direct: bool,
     forwards: BTreeSet<TranslatorReturnForward>,
+    array_indexes: BTreeSet<usize>,
 }
 
 #[derive(Default)]
@@ -9809,6 +9957,7 @@ struct SourceIndexCollector {
     translator_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     wrapper_return_helpers: BTreeSet<String>,
     wrapper_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
+    wrapper_array_return_indexes: BTreeMap<String, BTreeSet<usize>>,
     enum_member_domains: TypeDomains,
     translation_factories: BTreeSet<String>,
     next_intl_namespaces: BTreeSet<String>,
@@ -9827,6 +9976,7 @@ struct SourceIndexCollector {
     default_translator_return_forwards: BTreeSet<TranslatorReturnForward>,
     default_wrapper_return_summary: bool,
     default_wrapper_return_forwards: BTreeSet<TranslatorReturnForward>,
+    default_wrapper_array_return_indexes: BTreeSet<usize>,
     binding_scopes: Vec<IndexBindingEnvironment>,
     scope_depth: usize,
 }
@@ -9954,6 +10104,7 @@ impl SourceIndexCollector {
             structured_unknown_values: BTreeSet::new(),
             direct: false,
             forwards: BTreeSet::new(),
+            array_indexes: BTreeSet::new(),
         }
     }
 
@@ -9966,6 +10117,7 @@ impl SourceIndexCollector {
         WrapperReturnSummary {
             direct: collector.direct,
             forwards: collector.forwards,
+            array_indexes: collector.array_indexes,
         }
     }
 
@@ -9985,6 +10137,7 @@ impl SourceIndexCollector {
         WrapperReturnSummary {
             direct: collector.direct,
             forwards: collector.forwards,
+            array_indexes: collector.array_indexes,
         }
     }
 
@@ -10050,6 +10203,10 @@ impl SourceIndexCollector {
         if !summary.forwards.is_empty() {
             self.wrapper_return_forwards
                 .insert(name.to_string(), summary.forwards);
+        }
+        if !summary.array_indexes.is_empty() {
+            self.wrapper_array_return_indexes
+                .insert(name.to_string(), summary.array_indexes);
         }
     }
 
@@ -10269,6 +10426,7 @@ impl SourceIndexCollector {
             translator_return_forwards: self.translator_return_forwards,
             wrapper_return_helpers: self.wrapper_return_helpers,
             wrapper_return_forwards: self.wrapper_return_forwards,
+            wrapper_array_return_indexes: self.wrapper_array_return_indexes,
             translator_return_export_locals,
             named_exports,
             named_jsx_exports,
@@ -10292,6 +10450,7 @@ impl SourceIndexCollector {
             default_translator_array_return_params,
             default_wrapper_return_export,
             default_wrapper_return_forwards: self.default_wrapper_return_forwards,
+            default_wrapper_array_return_indexes: self.default_wrapper_array_return_indexes,
             default_translator_return_forwards: self.default_translator_return_forwards,
         }
     }
@@ -10527,6 +10686,7 @@ impl SourceIndexCollector {
                 let wrapper_return = self.function_wrapper_return_summary(function);
                 self.default_wrapper_return_summary = wrapper_return.direct;
                 self.default_wrapper_return_forwards = wrapper_return.forwards.clone();
+                self.default_wrapper_array_return_indexes = wrapper_return.array_indexes.clone();
                 self.default_jsx_summary = function
                     .params
                     .items
@@ -10611,6 +10771,7 @@ impl SourceIndexCollector {
                 let wrapper_return = self.arrow_wrapper_return_summary(arrow);
                 self.default_wrapper_return_summary = wrapper_return.direct;
                 self.default_wrapper_return_forwards = wrapper_return.forwards;
+                self.default_wrapper_array_return_indexes = wrapper_return.array_indexes;
                 self.default_jsx_summary = arrow.params.items.first().and_then(|parameter| {
                     jsx_component_summary_from_body(
                         &parameter.pattern,
@@ -10652,6 +10813,7 @@ impl SourceIndexCollector {
                 let wrapper_return = self.function_wrapper_return_summary(function);
                 self.default_wrapper_return_summary = wrapper_return.direct;
                 self.default_wrapper_return_forwards = wrapper_return.forwards;
+                self.default_wrapper_array_return_indexes = wrapper_return.array_indexes;
                 self.default_jsx_summary = function
                     .params
                     .items
@@ -11094,6 +11256,36 @@ impl<'a> Visit<'a> for SourceIndexCollector {
 }
 
 impl SourceUsageCollector {
+    fn visit_wrapper_for_each_callback(&mut self, call: &CallExpression<'_>) -> bool {
+        let Some(member) = call.callee.get_member_expr() else {
+            return false;
+        };
+        if member.static_property_name() != Some("forEach")
+            || !self.expression_is_potential_wrapper_value(member.object())
+        {
+            return false;
+        }
+        let Some(Argument::ArrowFunctionExpression(arrow)) = call.arguments.first() else {
+            return false;
+        };
+        let Some(name) = arrow
+            .params
+            .items
+            .first()
+            .and_then(|param| binding_identifier_name(&param.pattern))
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        let environment = self.binding_environment();
+        self.mask_binding_name(&name);
+        self.potential_wrapper_values.insert(name.clone());
+        self.potential_wrapper_callables.insert(name);
+        self.visit_function_body(&arrow.body);
+        self.restore_binding_environment(environment);
+        true
+    }
+
     fn call_is_react_callback_wrapper(&self, call: &CallExpression<'_>, name: &str) -> bool {
         let Some(file) = &self.file_index else {
             return false;
@@ -12153,6 +12345,8 @@ impl SourceUsageCollector {
                             "slice"
                                 | "filter"
                                 | "concat"
+                                | "values"
+                                | "entries"
                                 | "toReversed"
                                 | "toSorted"
                                 | "toSpliced"
@@ -12211,6 +12405,21 @@ impl SourceUsageCollector {
         let Expression::CallExpression(call) = expression else {
             return None;
         };
+        if let Some(identifier) = call.callee.get_identifier_reference()
+            && let (Some(project), Some(file)) = (&self.project, &self.file_index)
+        {
+            let name = identifier.name.as_str();
+            if let Some(indexes) = project.wrapper_array_indexes_for_local(&self.path, name) {
+                return Some(indexes);
+            }
+            if let Some(indexes) = file
+                .imports
+                .get(name)
+                .and_then(|target| project.wrapper_array_indexes_for_import(&self.path, target))
+            {
+                return Some(indexes);
+            }
+        }
         let member = call.callee.get_member_expr()?;
         if member.static_property_name() != Some("all")
             || !member
@@ -17398,6 +17607,9 @@ impl<'a> Visit<'a> for SourceUsageCollector {
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         self.apply_object_assign_wrapper_paths(call);
+        if self.visit_wrapper_for_each_callback(call) {
+            return;
+        }
         if let Some(member) = call.callee.get_member_expr()
             && member.static_property_name() == Some("set")
             && let Some(identifier) = member.object().get_identifier_reference()
@@ -20787,6 +20999,27 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(lines.contains(&5), "dynamic lines: {lines:?}");
         assert!(!lines.contains(&6), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn mixed_promise_all_indexes_cross_helper_summaries() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function loadValues() { return Promise.all([useBaseValues(), draw]); }
+            const [values, cleanup] = await loadValues();
+            values[0](runtimeKey);
+            cleanup('layer');
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&7), "dynamic lines: {lines:?}");
     }
 
     #[test]
