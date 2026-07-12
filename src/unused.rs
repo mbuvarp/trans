@@ -525,6 +525,8 @@ struct FiniteBoundArgumentScope {
     previous: BTreeMap<String, Option<FiniteBoundArgumentEntry>>,
     previous_capture_callables: BTreeMap<String, Option<BTreeSet<String>>>,
     previous_capture_provenance: BTreeMap<String, Option<BTreeSet<usize>>>,
+    previous_capture_edge_provenance:
+        BTreeMap<String, Option<BTreeMap<FiniteBoundCaptureBinding, BTreeSet<usize>>>>,
     previous_resolved_capture_names: BTreeMap<String, Option<BTreeSet<FiniteBoundCaptureBinding>>>,
     previous_capture_binding_depths: BTreeMap<String, Option<usize>>,
     previous_capture_dependency_depths: BTreeMap<String, Option<BTreeMap<String, BTreeSet<usize>>>>,
@@ -7633,6 +7635,8 @@ struct ReactWrapperReturnCollector {
     conditional_control_flow_depth: usize,
     finite_bound_capture_callables: BTreeMap<String, BTreeSet<String>>,
     finite_bound_capture_provenance: BTreeMap<String, BTreeSet<usize>>,
+    finite_bound_capture_edge_provenance:
+        BTreeMap<String, BTreeMap<FiniteBoundCaptureBinding, BTreeSet<usize>>>,
     finite_bound_resolved_capture_names: BTreeMap<String, BTreeSet<FiniteBoundCaptureBinding>>,
     finite_bound_capture_binding_depths: BTreeMap<String, usize>,
     finite_bound_capture_dependency_depths: BTreeMap<String, BTreeMap<String, BTreeSet<usize>>>,
@@ -7640,6 +7644,7 @@ struct ReactWrapperReturnCollector {
     finite_bound_capture_aliases:
         BTreeMap<FiniteBoundCaptureBinding, BTreeSet<FiniteBoundCaptureBinding>>,
     escaped_finite_bound_capture_bindings: BTreeSet<FiniteBoundCaptureBinding>,
+    unresolved_escaped_finite_bound_capture_candidates: Vec<BTreeSet<FiniteBoundCaptureBinding>>,
     suppressed_member_read_spans: Vec<(u32, u32)>,
 }
 
@@ -7801,8 +7806,24 @@ impl ReactWrapperReturnCollector {
     }
 
     fn finite_bound_capture_binding_is_escaped(&self, name: &str) -> bool {
+        let binding = self.finite_bound_capture_binding(name);
         self.escaped_finite_bound_capture_bindings
-            .contains(&self.finite_bound_capture_binding(name))
+            .contains(&binding)
+            || self
+                .unresolved_escaped_finite_bound_capture_candidates
+                .iter()
+                .any(|candidates| candidates.contains(&binding))
+    }
+
+    fn resolve_escaped_finite_bound_capture_binding(
+        &mut self,
+        binding: &FiniteBoundCaptureBinding,
+    ) {
+        for candidates in &mut self.unresolved_escaped_finite_bound_capture_candidates {
+            if candidates.contains(binding) {
+                candidates.retain(|candidate| candidate == binding);
+            }
+        }
     }
 
     fn invalidate_escaped_finite_bound_capture(&mut self, name: &str) {
@@ -7838,6 +7859,10 @@ impl ReactWrapperReturnCollector {
                 .entry(name.to_string())
                 .or_insert_with(|| self.finite_bound_capture_provenance.get(name).cloned());
             scope
+                .previous_capture_edge_provenance
+                .entry(name.to_string())
+                .or_insert_with(|| self.finite_bound_capture_edge_provenance.get(name).cloned());
+            scope
                 .previous_resolved_capture_names
                 .entry(name.to_string())
                 .or_insert_with(|| self.finite_bound_resolved_capture_names.get(name).cloned());
@@ -7861,6 +7886,7 @@ impl ReactWrapperReturnCollector {
         let binding_scope_id = self.finite_bound_capture_scope_id_at_depth(binding_depth);
         self.finite_bound_capture_binding_depths
             .insert(name.to_string(), binding_scope_id);
+        self.resolve_escaped_finite_bound_capture_binding(&(name.to_string(), binding_scope_id));
         self.replace_finite_bound_capture_value(name, captures);
         if defines_callable && !replaces_existing_callable {
             self.refresh_finite_bound_capture_dependents(name, true);
@@ -7874,6 +7900,7 @@ impl ReactWrapperReturnCollector {
         BTreeSet<usize>,
         BTreeSet<FiniteBoundCaptureBinding>,
         BTreeMap<String, BTreeSet<usize>>,
+        BTreeMap<FiniteBoundCaptureBinding, BTreeSet<usize>>,
     ) {
         let provenance = self.finite_bound_capture_provenance(captures);
         let resolved_names = captures
@@ -7894,7 +7921,21 @@ impl ReactWrapperReturnCollector {
                     .map(|depth| (capture.clone(), BTreeSet::from([depth])))
             })
             .collect();
-        (provenance, resolved_names, dependency_depths)
+        let edge_provenance = captures
+            .iter()
+            .filter_map(|capture| {
+                let binding = self.finite_bound_capture_binding(capture);
+                let provenance =
+                    self.finite_bound_capture_provenance(&BTreeSet::from([capture.clone()]));
+                (!provenance.is_empty()).then_some((binding, provenance))
+            })
+            .collect();
+        (
+            provenance,
+            resolved_names,
+            dependency_depths,
+            edge_provenance,
+        )
     }
 
     fn replace_finite_bound_capture_value(
@@ -7903,12 +7944,14 @@ impl ReactWrapperReturnCollector {
         captures: Option<BTreeSet<String>>,
     ) {
         if let Some(captures) = captures {
-            let (provenance, resolved_names, dependency_depths) =
+            let (provenance, resolved_names, dependency_depths, edge_provenance) =
                 self.finite_bound_capture_value_state(&captures);
             self.finite_bound_capture_callables
                 .insert(name.to_string(), captures);
             self.finite_bound_capture_provenance
                 .insert(name.to_string(), provenance);
+            self.finite_bound_capture_edge_provenance
+                .insert(name.to_string(), edge_provenance);
             self.finite_bound_resolved_capture_names
                 .insert(name.to_string(), resolved_names);
             self.finite_bound_capture_dependency_depths
@@ -7920,6 +7963,7 @@ impl ReactWrapperReturnCollector {
         } else {
             self.finite_bound_capture_callables.remove(name);
             self.finite_bound_capture_provenance.remove(name);
+            self.finite_bound_capture_edge_provenance.remove(name);
             self.finite_bound_resolved_capture_names.remove(name);
             self.finite_bound_capture_dependency_depths.remove(name);
             self.finite_bound_capture_value_depths.remove(name);
@@ -7928,7 +7972,7 @@ impl ReactWrapperReturnCollector {
     }
 
     fn merge_finite_bound_capture_value(&mut self, name: &str, captures: BTreeSet<String>) {
-        let (provenance, resolved_names, dependency_depths) =
+        let (provenance, resolved_names, dependency_depths, edge_provenance) =
             self.finite_bound_capture_value_state(&captures);
         self.finite_bound_capture_callables
             .entry(name.to_string())
@@ -7938,6 +7982,10 @@ impl ReactWrapperReturnCollector {
             .entry(name.to_string())
             .or_default()
             .extend(provenance);
+        self.finite_bound_capture_edge_provenance
+            .entry(name.to_string())
+            .or_default()
+            .extend(edge_provenance);
         self.finite_bound_resolved_capture_names
             .entry(name.to_string())
             .or_default()
@@ -8026,20 +8074,31 @@ impl ReactWrapperReturnCollector {
                     .entry(changed.clone())
                     .or_default()
                     .insert(changed_depth);
-                let (provenance, resolved_names, _) =
+                let (_, resolved_names, _, edge_provenance) =
                     self.finite_bound_capture_value_state(&captures);
-                let mut merged_provenance = self
-                    .finite_bound_capture_provenance
-                    .get(&dependent)
-                    .cloned()
-                    .unwrap_or_default();
-                merged_provenance.extend(provenance);
+                let binding = (changed.clone(), changed_depth);
+                let edges = self
+                    .finite_bound_capture_edge_provenance
+                    .entry(dependent.clone())
+                    .or_default();
+                if let Some(provenance) = edge_provenance.get(&binding) {
+                    edges.insert(binding.clone(), provenance.clone());
+                } else {
+                    edges.remove(&binding);
+                }
+                let merged_provenance = edges
+                    .values()
+                    .flat_map(|provenance| provenance.iter().copied())
+                    .collect::<BTreeSet<_>>();
                 let mut merged_resolved = self
                     .finite_bound_resolved_capture_names
                     .get(&dependent)
                     .cloned()
                     .unwrap_or_default();
-                merged_resolved.extend(resolved_names);
+                merged_resolved.remove(&binding);
+                if resolved_names.contains(&binding) {
+                    merged_resolved.insert(binding);
+                }
                 let changed = self
                     .finite_bound_capture_provenance
                     .get(&dependent)
@@ -8049,6 +8108,17 @@ impl ReactWrapperReturnCollector {
                         .get(&dependent)
                         .is_none_or(|current| current != &merged_resolved);
                 if changed {
+                    let previous_provenance = self
+                        .finite_bound_capture_provenance
+                        .get(&dependent)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(entry) = self.finite_bound_argument_arrays.get_mut(&dependent) {
+                        entry
+                            .provenance
+                            .retain(|id| !previous_provenance.contains(id));
+                        entry.provenance.extend(merged_provenance.iter().copied());
+                    }
                     self.finite_bound_capture_provenance
                         .insert(dependent.clone(), merged_provenance);
                     self.finite_bound_resolved_capture_names
@@ -8401,33 +8471,64 @@ impl ReactWrapperReturnCollector {
         expanded
     }
 
-    fn record_escaped_finite_bound_captures(&mut self, names: BTreeSet<String>) {
+    fn record_escaped_finite_bound_expression(&mut self, expression: &Expression<'_>) {
+        let names = self
+            .finite_bound_capture_names_from_expression(expression)
+            .unwrap_or_default();
+        let mut exact_bindings = BTreeSet::new();
+        for source in Self::finite_bound_capture_alias_sources(expression) {
+            let source_binding = self.finite_bound_capture_binding(&source);
+            let aliases = self
+                .finite_bound_capture_aliases
+                .get(&source_binding)
+                .cloned()
+                .unwrap_or_else(|| BTreeSet::from([source_binding]));
+            for alias in aliases {
+                if !self.finite_bound_capture_binding_is_current(&alias) {
+                    continue;
+                }
+                if let Some(dependencies) =
+                    self.finite_bound_capture_dependency_depths.get(&alias.0)
+                {
+                    for name in &names {
+                        if let Some(scope_ids) = dependencies.get(name) {
+                            exact_bindings
+                                .extend(scope_ids.iter().map(|scope_id| (name.clone(), *scope_id)));
+                        }
+                    }
+                }
+            }
+        }
+        self.record_escaped_finite_bound_captures(names, exact_bindings);
+    }
+
+    fn record_escaped_finite_bound_captures(
+        &mut self,
+        names: BTreeSet<String>,
+        exact_bindings: BTreeSet<FiniteBoundCaptureBinding>,
+    ) {
         let expanded = self.expanded_finite_bound_capture_names(&names);
         let provenance = self.finite_bound_capture_provenance(&expanded);
         self.invalidate_finite_bound_argument_provenance(provenance);
         for name in expanded {
-            let dependency_scope_ids = self
-                .finite_bound_capture_dependency_depths
-                .values()
-                .filter_map(|dependencies| dependencies.get(&name))
-                .flatten()
-                .copied()
+            let exact = exact_bindings
+                .iter()
+                .filter(|binding| binding.0 == name)
+                .cloned()
                 .collect::<BTreeSet<_>>();
-            if !dependency_scope_ids.is_empty() {
-                self.escaped_finite_bound_capture_bindings.extend(
-                    dependency_scope_ids
-                        .into_iter()
-                        .map(|scope_id| (name.clone(), scope_id)),
-                );
+            if !exact.is_empty() {
+                self.escaped_finite_bound_capture_bindings.extend(exact);
             } else if self.finite_bound_capture_binding_depths.contains_key(&name) {
                 self.escaped_finite_bound_capture_bindings
                     .insert(self.finite_bound_capture_binding(&name));
             } else {
-                self.escaped_finite_bound_capture_bindings.extend(
-                    self.finite_bound_active_capture_scope_ids()
-                        .into_iter()
-                        .map(|scope_id| (name.clone(), scope_id)),
-                );
+                self.unresolved_escaped_finite_bound_capture_candidates
+                    .push(
+                        self.finite_bound_active_capture_scope_ids()
+                            .into_iter()
+                            .map(|scope_id| (name.clone(), scope_id))
+                            .collect(),
+                    );
             }
         }
     }
@@ -8481,6 +8582,11 @@ impl ReactWrapperReturnCollector {
                 })
                 .collect::<Vec<_>>();
             for callable in pending {
+                let binding = (name.to_string(), binding_scope_id);
+                self.finite_bound_capture_edge_provenance
+                    .entry(callable.clone())
+                    .or_default()
+                    .insert(binding, provenance.clone());
                 self.finite_bound_capture_provenance
                     .entry(callable.clone())
                     .or_default()
@@ -9884,6 +9990,14 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                     self.finite_bound_capture_provenance.remove(&name);
                 }
             }
+            for (name, previous) in scope.previous_capture_edge_provenance {
+                if let Some(previous) = previous {
+                    self.finite_bound_capture_edge_provenance
+                        .insert(name, previous);
+                } else {
+                    self.finite_bound_capture_edge_provenance.remove(&name);
+                }
+            }
             for (name, previous) in scope.previous_resolved_capture_names {
                 if let Some(previous) = previous {
                     self.finite_bound_resolved_capture_names
@@ -9932,7 +10046,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         let captures = self
             .finite_bound_capture_names_from_expression(&statement.object)
             .unwrap_or_default();
-        self.record_escaped_finite_bound_captures(captures);
+        self.record_escaped_finite_bound_captures(captures, BTreeSet::new());
         let provenance = self.finite_bound_argument_provenance(&statement.object);
         self.invalidate_finite_bound_argument_provenance(provenance);
         self.enter_scope(ScopeFlags::With, &statement.scope_id);
@@ -9976,7 +10090,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         }
         if disposes_iteration_values {
             iteration_provenance.extend(self.finite_bound_capture_provenance(&captures));
-            self.record_escaped_finite_bound_captures(captures.clone());
+            self.record_escaped_finite_bound_captures(captures.clone(), BTreeSet::new());
         }
         self.invalidate_finite_bound_argument_provenance(iteration_provenance);
         let alias_sources = Self::finite_bound_capture_alias_sources(&statement.right);
@@ -9998,6 +10112,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                     name.clone(),
                     self.finite_bound_capture_callables.get(name).cloned(),
                     self.finite_bound_capture_provenance.get(name).cloned(),
+                    self.finite_bound_capture_edge_provenance.get(name).cloned(),
                     self.finite_bound_resolved_capture_names.get(name).cloned(),
                     self.finite_bound_capture_binding_depths.get(name).copied(),
                     self.finite_bound_capture_dependency_depths
@@ -10043,6 +10158,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 name,
                 captures,
                 provenance,
+                edge_provenance,
                 resolved_names,
                 binding_depth,
                 dependency_depths,
@@ -10060,6 +10176,12 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                         .insert(name.clone(), provenance);
                 } else {
                     self.finite_bound_capture_provenance.remove(&name);
+                }
+                if let Some(edge_provenance) = edge_provenance {
+                    self.finite_bound_capture_edge_provenance
+                        .insert(name.clone(), edge_provenance);
+                } else {
+                    self.finite_bound_capture_edge_provenance.remove(&name);
                 }
                 if let Some(resolved_names) = resolved_names {
                     self.finite_bound_resolved_capture_names
@@ -10114,7 +10236,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 );
             }
         }
-        self.record_escaped_finite_bound_captures(escaped_captures);
+        self.record_escaped_finite_bound_captures(escaped_captures, BTreeSet::new());
         let mut invalidated_provenance = BTreeSet::new();
         if call.callee.get_member_expr().is_none() {
             invalidated_provenance.extend(self.finite_bound_argument_provenance(&call.callee));
@@ -10212,7 +10334,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 );
             }
         }
-        self.record_escaped_finite_bound_captures(escaped_captures);
+        self.record_escaped_finite_bound_captures(escaped_captures, BTreeSet::new());
         let mut provenance = self.finite_bound_argument_provenance(&expression.callee);
         provenance.extend(
             expression
@@ -10254,7 +10376,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         let captures = self
             .finite_bound_capture_names_from_expression(&statement.argument)
             .unwrap_or_default();
-        self.record_escaped_finite_bound_captures(captures);
+        self.record_escaped_finite_bound_captures(captures, BTreeSet::new());
         let provenance = self.finite_bound_argument_provenance(&statement.argument);
         self.invalidate_finite_bound_argument_provenance(provenance);
     }
@@ -10267,7 +10389,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         let captures = self
             .finite_bound_capture_names_from_expression(argument)
             .unwrap_or_default();
-        self.record_escaped_finite_bound_captures(captures);
+        self.record_escaped_finite_bound_captures(captures, BTreeSet::new());
         let provenance = self.finite_bound_argument_provenance(argument);
         self.invalidate_finite_bound_argument_provenance(provenance);
     }
@@ -10283,7 +10405,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                     .unwrap_or_default(),
             );
         }
-        self.record_escaped_finite_bound_captures(escaped_captures);
+        self.record_escaped_finite_bound_captures(escaped_captures, BTreeSet::new());
         let mut provenance = self.finite_bound_argument_provenance(&expression.tag);
         for substitution in &expression.quasi.expressions {
             provenance.extend(self.finite_bound_argument_provenance(substitution));
@@ -10316,7 +10438,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             }
         }
         self.invalidate_finite_bound_argument_provenance(provenance);
-        self.record_escaped_finite_bound_captures(captures);
+        self.record_escaped_finite_bound_captures(captures, BTreeSet::new());
     }
 
     fn visit_jsx_element(&mut self, element: &JSXElement<'a>) {
@@ -10370,7 +10492,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             }
         }
         self.invalidate_finite_bound_argument_provenance(provenance);
-        self.record_escaped_finite_bound_captures(captures);
+        self.record_escaped_finite_bound_captures(captures, BTreeSet::new());
     }
 
     fn visit_return_statement(&mut self, statement: &ReturnStatement<'a>) {
@@ -10422,7 +10544,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             let captures = self
                 .finite_bound_capture_names_from_expression(init)
                 .unwrap_or_default();
-            self.record_escaped_finite_bound_captures(captures);
+            self.record_escaped_finite_bound_captures(captures, BTreeSet::new());
             let provenance = self.finite_bound_argument_provenance(init);
             if let Some(scope) = self.finite_bound_argument_scopes.last_mut() {
                 scope.disposal_provenance.extend(provenance.iter().copied());
@@ -10685,7 +10807,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         {
             let provenance = self.finite_bound_argument_provenance(&expression.right);
             self.invalidate_finite_bound_argument_provenance(provenance);
-            self.record_escaped_finite_bound_captures(captures.clone());
+            self.record_escaped_finite_bound_expression(&expression.right);
             let root_binding = self.finite_bound_capture_binding(root);
             let aliases = self
                 .finite_bound_capture_aliases
@@ -10711,6 +10833,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             } else {
                 self.finite_bound_argument_arrays.remove(&name);
             }
+            self.refresh_finite_bound_capture_dependents(&name, false);
             let (array_indexes, array_index_forwards) =
                 self.array_summary_from_expression(&expression.right);
             if self.expression_returns_wrapper(&expression.right) {
@@ -10907,7 +11030,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         let captures = self
             .finite_bound_capture_names_from_expression(&decorator.expression)
             .unwrap_or_default();
-        self.record_escaped_finite_bound_captures(captures);
+        self.record_escaped_finite_bound_captures(captures, BTreeSet::new());
         let provenance = self.finite_bound_argument_provenance(&decorator.expression);
         self.invalidate_finite_bound_argument_provenance(provenance);
     }
@@ -13838,12 +13961,14 @@ impl SourceIndexCollector {
             conditional_control_flow_depth: 0,
             finite_bound_capture_callables,
             finite_bound_capture_provenance,
+            finite_bound_capture_edge_provenance: BTreeMap::new(),
             finite_bound_resolved_capture_names: BTreeMap::new(),
             finite_bound_capture_binding_depths: BTreeMap::new(),
             finite_bound_capture_dependency_depths: BTreeMap::new(),
             finite_bound_capture_value_depths: BTreeMap::new(),
             finite_bound_capture_aliases: BTreeMap::new(),
             escaped_finite_bound_capture_bindings: BTreeSet::new(),
+            unresolved_escaped_finite_bound_capture_candidates: Vec::new(),
             suppressed_member_read_spans: Vec::new(),
         };
         collector.seed_finite_bound_parameter_defaults(params);
@@ -28748,6 +28873,95 @@ mod tests {
                 let callback = mutator;
                 callback = ordinary;
                 external.callback = callback;
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        assert!(
+            scan.dynamic_usages.is_empty(),
+            "dynamic usages: {:?}",
+            scan.dynamic_usages
+        );
+    }
+
+    #[test]
+    fn escaped_unresolved_capture_ignores_unrelated_same_named_edges() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const target = [draw];
+                let unrelated;
+                const escaped = () => callback();
+                {
+                  const wrong = [draw];
+                  const callback = () => { wrong[0] = runtimeFactory; };
+                  unrelated = () => callback();
+                }
+                external.callback = escaped;
+                const callback = () => { target[0] = runtimeFactory; };
+                consume(unrelated);
+                return outer(inner.bind(null, ...target));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn dependent_refresh_replaces_obsolete_edge_provenance() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const args = [draw];
+                let callback = () => { args[0] = runtimeFactory; };
+                const escaped = () => callback();
+                callback = ordinary;
+                external.callback = escaped;
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        assert!(
+            scan.dynamic_usages.is_empty(),
+            "dynamic usages: {:?}",
+            scan.dynamic_usages
+        );
+    }
+
+    #[test]
+    fn resolved_inner_escape_candidate_does_not_taint_outer_binding() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                {
+                  const escaped = () => { args[0] = runtimeFactory; };
+                  external.callback = escaped;
+                  const args = [draw];
+                }
+                const args = [draw];
                 return outer(inner.bind(null, ...args));
               }
             }
