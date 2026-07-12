@@ -16,6 +16,8 @@ pub enum TransError {
     MissingLanguageFile(PathBuf),
     #[error("verification failed: {0}")]
     VerificationFailed(String),
+    #[error("{0}")]
+    CommandRefused(String),
     #[error("next-intl non-string values: {0}")]
     NextIntlNonStringValues(String),
     #[error(transparent)]

@@ -72,6 +72,17 @@ fn setup_next_intl_project(root: &std::path::Path) -> TransConfig {
     config
 }
 
+fn setup_next_intl_project_with_keys(root: &std::path::Path, keys: &[(&str, &str)]) -> TransConfig {
+    let mut config = base_config();
+    config.mode = trans::config::ConfigMode::NextIntl;
+    config.save_to_root(root).expect("save config");
+
+    save_language_translations(root, &config, "en", &translations(keys)).expect("save en");
+    save_language_translations(root, &config, "nb", &translations(keys)).expect("save nb");
+
+    config
+}
+
 fn setup_project_with_ai(root: &std::path::Path) -> TransConfig {
     let mut config = base_config();
     config.ai = Some(AiConfig {
@@ -543,6 +554,15 @@ fn find_searches_next_intl_nested_values() {
 }
 
 #[test]
+fn unused_help_documents_no_ts_checker_flag() {
+    trans_cmd()
+        .args(["unused", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-ts-checker"));
+}
+
+#[test]
 fn add_update_show_delete_flow() {
     let dir = tempdir().expect("tempdir");
     let config = setup_project(dir.path());
@@ -816,6 +836,1559 @@ fn next_intl_non_string_values_fail_in_non_interactive_commands() {
         .stderr(predicate::str::contains("next-intl non-string values"));
 
     let _ = config;
+}
+
+#[test]
+fn unused_lists_unused_next_intl_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("app.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("unused")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Unused keys: 1 / 2 (50%)"))
+        .stdout(predicate::str::contains("app.unused").not())
+        .stdout(predicate::str::contains("app.title").not());
+}
+
+#[test]
+fn unused_keys_flag_keeps_dynamic_namespaces_out_of_the_candidate_set() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("app.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\nt(key);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys", "--no-ts-checker"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+}
+
+#[test]
+fn unused_traces_translator_props_into_imported_jsx_components() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.noDescription", "No description"),
+            ("projects.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("card.tsx"),
+        r#"
+        export function Card({tProjects}: {
+          tProjects: (key: 'noDescription') => string
+        }) {
+          return <p>{tProjects('noDescription')}</p>;
+        }
+        "#,
+    )
+    .expect("write component");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        r#"
+        import {useTranslations} from 'next-intl';
+        import {Card} from './card';
+        const tProjects = useTranslations('projects');
+        export default function Page() {
+          return <Card tProjects={tProjects} />;
+        }
+        "#,
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("projects.unused\n");
+}
+
+#[test]
+fn unused_traces_member_translator_props_into_namespace_jsx_components() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.noDescription", "No description"),
+            ("projects.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("card.tsx"),
+        "export function Card({format}) { return <p>{format('noDescription')}</p>; }\n",
+    )
+    .expect("write component");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport * as Components from './card';\nconst tProjects = useTranslations('projects');\nconst translators = {projects: tProjects};\nexport default function Page() { return <Components.Card format={translators.projects} />; }\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("projects.unused\n");
+}
+
+#[test]
+fn unused_traces_translator_props_through_jsx_spreads() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.noDescription", "No description"),
+            ("projects.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("card.tsx"),
+        "export function Card({format}) { return <p>{format('noDescription')}</p>; }\n",
+    )
+    .expect("write component");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {Card} from './card';\nconst tProjects = useTranslations('projects');\nconst cardProps = {format: tProjects};\nexport default function Page() { return <Card {...cardProps} />; }\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("projects.unused\n");
+}
+
+#[test]
+fn unused_conservatively_handles_unknown_jsx_spreads() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.noDescription", "No description"),
+            ("projects.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("card.tsx"),
+        "export function Card({format}) { return <p>{format('noDescription')}</p>; }\n",
+    )
+    .expect("write component");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {Card} from './card';\nexport default function Page({cardProps}) { return <Card {...cardProps} />; }\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("projects.unused\n");
+}
+
+#[test]
+fn unused_traces_jsx_component_through_star_re_export() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.noDescription", "No description"),
+            ("projects.unused", "Unused"),
+        ],
+    );
+    std::fs::create_dir_all(dir.path().join("components")).expect("mkdir components");
+    std::fs::write(
+        dir.path().join("components/card.tsx"),
+        "export function Card({tProjects}) { return <p>{tProjects('noDescription')}</p>; }\n",
+    )
+    .expect("write component");
+    std::fs::write(
+        dir.path().join("components/index.ts"),
+        "export * from './card';\n",
+    )
+    .expect("write barrel");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {Card} from './components';\nconst tProjects = useTranslations('projects');\nexport default function Page() { return <Card tProjects={tProjects} />; }\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("projects.unused\n");
+}
+
+#[test]
+fn unused_traces_default_jsx_component_through_re_export() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.noDescription", "No description"),
+            ("projects.unused", "Unused"),
+        ],
+    );
+    std::fs::create_dir_all(dir.path().join("components")).expect("mkdir components");
+    std::fs::write(
+        dir.path().join("components/card.tsx"),
+        "export default function Card({tProjects}) { return <p>{tProjects('noDescription')}</p>; }\n",
+    )
+    .expect("write component");
+    std::fs::write(
+        dir.path().join("components/index.ts"),
+        "export {default} from './card';\n",
+    )
+    .expect("write barrel");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport Card from './components';\nconst tProjects = useTranslations('projects');\nexport default function Page() { return <Card tProjects={tProjects} />; }\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("projects.unused\n");
+}
+
+#[test]
+fn unused_conservatively_protects_keys_from_unknown_jsx_translator_namespaces() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("products.articleNumber", "Article number"),
+            ("products.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        r#"
+        function Facts({controller}: {controller: unknown}) {
+          const {t} = controller;
+          return <p>{t('products.articleNumber')}</p>;
+        }
+        export default function Page({controller}: {controller: unknown}) {
+          return <Facts controller={controller} />;
+        }
+        "#,
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys", "--no-ts-checker"])
+        .assert()
+        .success()
+        .stdout("products.unused\n");
+}
+
+#[test]
+fn unused_respects_gitignored_files() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(dir.path(), &[("app.ignored", "Ignored")]);
+    std::fs::write(dir.path().join(".gitignore"), "ignored.tsx\n").expect("write gitignore");
+    std::fs::write(
+        dir.path().join("ignored.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('ignored');\n",
+    )
+    .expect("write ignored source");
+    Command::new("git")
+        .arg("init")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("unused")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Unused keys: 1 / 1 (100%)"));
+}
+
+#[test]
+fn unused_fallback_scanner_excludes_generated_directories() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(dir.path(), &[("app.generated", "Generated")]);
+    std::fs::create_dir_all(dir.path().join(".next")).expect("mkdir");
+    std::fs::write(
+        dir.path().join(".next/generated.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('generated');\n",
+    )
+    .expect("write generated source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("unused")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Unused keys: 1 / 1 (100%)"));
+}
+
+#[test]
+fn unused_ignores_declaration_files() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(dir.path(), &[("app.declared", "Declared")]);
+    std::fs::write(
+        dir.path().join("schema.d.ts"),
+        "import {z} from 'zod';\nexport const Schema = z.object({message: z.string()});\n",
+    )
+    .expect("write declaration source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("unused")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Unused keys: 1 / 1 (100%)"));
+}
+
+#[test]
+fn unused_scans_mjs_and_cjs_modules() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("app.fromMjs", "MJS"),
+            ("app.fromCjs", "CJS"),
+            ("app.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("mjs-usage.mjs"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('fromMjs');\n",
+    )
+    .expect("write mjs source");
+    std::fs::write(
+        dir.path().join("cjs-usage.cjs"),
+        "const nextIntl = require('next-intl');\nconst intl = nextIntl.useTranslations('app');\nintl('fromCjs');\n",
+    )
+    .expect("write cjs source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("app.unused\n");
+}
+
+#[test]
+fn unused_reports_dynamic_usage_locations() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("other.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt(key);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("unused")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Unused keys: 1 / 2 (50%)"))
+        .stdout(predicate::str::contains(
+            "Warning: dynamic translation key usage detected in 1 place(s):",
+        ))
+        .stdout(predicate::str::contains("./page.tsx:3"))
+        .stdout(predicate::str::contains(
+            "Warning: TypeScript checker failed:",
+        ));
+}
+
+#[test]
+fn unused_keys_reports_requested_typescript_checker_failure() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(dir.path(), &[("app.unused", "Unused")]);
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt(key);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("TypeScript checker failed"));
+}
+
+#[test]
+fn unused_resolves_finite_conditional_key_variables() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("files.folder-count", "Folders"),
+            ("files.subfolder-count", "Subfolders"),
+            ("files.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('files');\nconst folderCountKey = searchAllFolders ? 'folder-count' : 'subfolder-count';\nt(folderCountKey);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("files.unused\n");
+}
+
+#[test]
+fn unused_resolves_finite_object_map_lookup_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("notifications.errors.blocked", "Blocked"),
+            ("notifications.errors.denied", "Denied"),
+            (
+                "notifications.errors.registrationFailed",
+                "Registration failed",
+            ),
+            ("notifications.errors.unsupported", "Unsupported"),
+            ("notifications.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations();\nconst messageKeyByReason = {\n  blocked: 'notifications.errors.blocked',\n  denied: 'notifications.errors.denied',\n  registrationFailed: 'notifications.errors.registrationFailed',\n  unsupported: 'notifications.errors.unsupported',\n};\nt(messageKeyByReason[error.reason]);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("notifications.unused\n");
+}
+
+#[test]
+fn unused_resolves_typed_finite_domain_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("settings.timeTypes.categories.REGULAR", "Regular"),
+            ("settings.timeTypes.categories.ABSENCE", "Absence"),
+            ("settings.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\ntype Category = 'REGULAR' | 'ABSENCE';\ntype FormValues = { category: Category };\nconst t = useTranslations('settings');\nconst form = useForm<FormValues>();\nconst category = form.watch('category');\nt(`timeTypes.categories.${category}`);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_resolves_zod_inferred_property_domain_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("users.relations.parent", "Parent"),
+            ("users.relations.partner", "Partner"),
+            ("users.relations.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("emergency-contact-shared.ts"),
+        "export const EMERGENCY_CONTACT_RELATION_VALUES = ['parent', 'partner'] as const;\n",
+    )
+    .expect("write relation values");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {UseFormReturn, useWatch} from 'react-hook-form';\nimport {z} from 'zod';\nimport {EMERGENCY_CONTACT_RELATION_VALUES} from './emergency-contact-shared';\nconst EmergencyContactFormSchema = z.object({\n  relation: z.enum(EMERGENCY_CONTACT_RELATION_VALUES),\n});\ntype EmergencyContactFormValues = z.infer<typeof EmergencyContactFormSchema>;\nfunction Fields({form}: {form: UseFormReturn<EmergencyContactFormValues>}) {\n  const watchedValues = useWatch({ control: form.control }) as EmergencyContactFormValues | undefined;\n  const values = watchedValues ?? form.getValues();\n  const tRelation = useTranslations('users.relations');\n  tRelation(values.relation);\n}\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("users.relations.unused\n");
+}
+
+#[test]
+fn unused_resolves_finite_map_callback_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("template.tabs.overview.label", "Overview"),
+            ("template.tabs.variables.label", "Variables"),
+            ("template.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('template');\nconst TEMPLATE_TABS = ['overview', 'variables'] as const;\nTEMPLATE_TABS.map(tab => t(`tabs.${tab}.label`));\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("template.unused\n");
+}
+
+#[test]
+fn unused_resolves_finite_iterated_string_transforms() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("template.variables.types.number", "Number"),
+            ("template.variables.types.text", "Text"),
+            ("template.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('template');\nconst VARIABLE_TYPES = ['NUMBER', 'TEXT'] as const;\nVARIABLE_TYPES.map(type => t(`variables.types.${type.toLowerCase()}`));\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("template.unused\n");
+}
+
+#[test]
+fn unused_resolves_imported_finite_iterable_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("relation.parent", "Parent"),
+            ("relation.child", "Child"),
+            ("relation.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("relations.ts"),
+        "export const RELATIONS = ['parent', 'child'] as const;\n",
+    )
+    .expect("write values");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {RELATIONS} from './relations';\nconst t = useTranslations('relation');\nRELATIONS.map(relation => t(relation));\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("relation.unused\n");
+}
+
+#[test]
+fn unused_resolves_member_keys_from_imported_enum_value_constants() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("users.user-types.ADMIN", "Admin"),
+            ("users.user-types.PROJECT_MANAGER", "Project manager"),
+            ("users.user-types.EXTENDED_USER", "Extended user"),
+            ("users.user-types.USER", "User"),
+            ("users.user-types.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("users-presenter.ts"),
+        "import {TenantUserType} from '@digitech/db/types';\nexport const TENANT_USER_TYPE_VALUES = [\n  TenantUserType.ADMIN,\n  TenantUserType.PROJECT_MANAGER,\n  TenantUserType.EXTENDED_USER,\n  TenantUserType.USER,\n] as const;\n",
+    )
+    .expect("write values");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {TENANT_USER_TYPE_VALUES} from './users-presenter';\nconst tUsers = useTranslations('users');\ntUsers(`user-types.${row.original.userType}`);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("users.user-types.unused\n");
+}
+
+#[test]
+fn unused_resolves_export_specifier_finite_iterable_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("relation.parent", "Parent"),
+            ("relation.child", "Child"),
+            ("relation.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("relations.ts"),
+        "const RELATIONS = ['parent', 'child'] as const;\nexport { RELATIONS };\n",
+    )
+    .expect("write values");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {RELATIONS} from './relations';\nconst t = useTranslations('relation');\nfor (const relation of RELATIONS) { t(relation); }\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("relation.unused\n");
+}
+
+#[test]
+fn unused_resolves_imported_finite_return_helper_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("common.customers", "Customers"),
+            ("common.projects", "Projects"),
+            ("common.my-page", "My page"),
+            ("common.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("top-bar-state.ts"),
+        "export function resolveTitleKey(section) {\n  switch (section) {\n    case 'customers':\n      return 'customers';\n    case 'projects':\n      return 'projects';\n    default:\n      return 'my-page';\n  }\n}\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {resolveTitleKey} from './top-bar-state';\nconst t = useTranslations('common');\nt(resolveTitleKey(section));\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("common.unused\n");
+}
+
+#[test]
+fn unused_resolves_promise_all_destructured_imported_helper_translator() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("common.save", "Save"),
+            ("dashboard.sections.overview", "Overview"),
+            ("dashboard.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("dashboard-data.ts"),
+        "export function buildDashboardStateCopy(tDashboard) {\n  return {overview: tDashboard('sections.overview')};\n}\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {getTranslations} from 'next-intl/server';\nimport {buildDashboardStateCopy} from './dashboard-data';\nconst [{tenant}, tDashboard, tCommon] = await Promise.all([\n  params,\n  getTranslations('dashboard'),\n  getTranslations({locale, namespace: 'common'}),\n]);\nbuildDashboardStateCopy(tDashboard);\ntCommon('save');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("dashboard.unused\n");
+}
+
+#[test]
+fn unused_traces_translator_calls_inside_nested_callbacks() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("settings.validation.required", "Required"),
+            ("settings.validation.mismatch", "Mismatch"),
+            ("settings.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nfunction createSchema(t) {\n  return z.object({name: z.string().min(1, t('validation.required'))}).superRefine((values, ctx) => {\n    ctx.addIssue({message: t('validation.mismatch')});\n  });\n}\nconst t = useTranslations('settings');\ncreateSchema(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_traces_message_keys_in_workspace_package_exports() {
+    let dir = tempdir().expect("tempdir");
+    let workspace = dir.path();
+    let app = workspace.join("apps/app");
+    let package = workspace.join("packages/pdf");
+    std::fs::create_dir_all(&app).expect("mkdir app");
+    std::fs::create_dir_all(package.join("lib/offers")).expect("mkdir package");
+    std::fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages:\n  - apps/*\n  - packages/*\n",
+    )
+    .expect("write workspace");
+    std::fs::write(
+        package.join("package.json"),
+        "{\n  \"name\": \"@workspace/pdf\",\n  \"exports\": {\n    \"./offers\": \"./lib/offers/index.ts\"\n  }\n}\n",
+    )
+    .expect("write package json");
+    std::fs::write(
+        package.join("lib/offers/index.ts"),
+        "export {buildOfferPdfLabels} from './offer-pdf';\n",
+    )
+    .expect("write package index");
+    std::fs::write(
+        package.join("lib/offers/offer-pdf.ts"),
+        "function getMessage(messages, key) { return messages[key]; }\nexport function buildOfferPdfLabels(messages) {\n  const label = key => getMessage(messages, key);\n  return {title: label('customer-offer.title')};\n}\n",
+    )
+    .expect("write package source");
+    setup_next_intl_project_with_keys(
+        &app,
+        &[
+            ("customer-offer.title", "Title"),
+            ("customer-offer.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        app.join("route.ts"),
+        "import {buildOfferPdfLabels} from '@workspace/pdf/offers';\nimport messages from './messages/en.json';\nbuildOfferPdfLabels(messages);\n",
+    )
+    .expect("write app source");
+
+    trans_cmd()
+        .current_dir(&app)
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("customer-offer.unused\n");
+}
+
+#[test]
+fn unused_resolves_module_scope_helper_lookup_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.offers.opened", "Opened"),
+            ("projects.offers.status.declined", "Declined"),
+            ("projects.offers.status.draft", "Draft"),
+            ("projects.offers.status.sent", "Sent"),
+            ("projects.offers.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst statusViewByStatus = {\n  SENT: {labelKey: 'status.sent', className: 'sent'},\n  DECLINED: {labelKey: 'status.declined', className: 'declined'},\n} as const;\nconst openedStatusView = {labelKey: 'opened', className: 'opened'} as const;\nconst draftStatusView = {labelKey: 'status.draft', className: 'draft'} as const;\nfunction getStatusView(status, tProjectOffers, firstOpenedAt) {\n  const view = status === 'SENT' && firstOpenedAt ? openedStatusView : (statusViewByStatus[status] ?? draftStatusView);\n  return tProjectOffers(view.labelKey);\n}\nconst t = useTranslations('projects.offers');\ngetStatusView(status, t, firstOpenedAt);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("projects.offers.unused\n");
+}
+
+#[test]
+fn unused_resolves_nested_helpers_chained_receivers_and_label_wrappers() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("checklists.create-menu-label", "Checklist"),
+            ("checklists.preview.date-created", "Date created"),
+            ("common.item", "Item"),
+            ("common.time-entry", "Time entry"),
+            ("timesheets.hours-ordinary", "Hours"),
+            ("timesheets.stopwatch", "Stopwatch"),
+            ("common.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nfunction getTypeLabel(item, translate) {\n  return item.type === 'STOPWATCH' ? translate('timesheets.stopwatch') : translate('timesheets.hours-ordinary');\n}\nfunction getContextLabel(item, translate) {\n  return getTypeLabel(item, translate);\n}\nconst getOptions = translate => [\n  {label: translate('common.time-entry')},\n  {label: translate('checklists.create-menu-label')},\n];\nfunction getMessage(messages, key) { return messages[key]; }\nconst label = key => {\n  const value = getMessage(messages, key);\n  return typeof value === 'string' ? value : key;\n};\nconst t = useTranslations();\ngetContextLabel(item, t);\ngetOptions(t).map(option => option.label);\nlabel('checklists.preview.date-created');\nlabel('common.item');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("common.unused\n");
+}
+
+#[test]
+fn unused_resolves_imported_finite_record_return_helper_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("settings.navigation.profile", "Profile"),
+            ("settings.navigation.members", "Members"),
+            ("settings.navigation.auditLog", "Audit log"),
+            ("settings.navigation.sections.account", "Account"),
+            ("settings.navigation.sections.system", "System"),
+            ("settings.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("settings-sidebar-state.ts"),
+        "const ITEMS = [\n  {labelKey: 'navigation.profile'},\n  {labelKey: 'navigation.members'},\n  {labelKey: 'navigation.auditLog'},\n] as const;\nexport function getSettingsSidebarSections(isDeveloper) {\n  const sections = [\n    {labelKey: 'navigation.sections.account', items: ITEMS.slice(0, 2)},\n  ];\n  if (isDeveloper) {\n    sections.push({labelKey: 'navigation.sections.system', items: ITEMS.slice(2)});\n  }\n  return sections;\n}\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getSettingsSidebarSections} from './settings-sidebar-state';\nconst t = useTranslations('settings');\nconst sections = getSettingsSidebarSections(isDeveloper);\nsections.map(section => {\n  t(section.labelKey);\n  section.items.forEach(item => t(item.labelKey));\n});\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_resolves_imported_record_flat_map_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("common.home", "Home"),
+            ("common.offers", "Offers"),
+            ("common.projects", "Projects"),
+            ("common.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("footer-navigation.ts"),
+        "export const FOOTER_NAV_ITEMS: {id: string; labelKey: string}[] = [\n  {id: 'home', labelKey: 'common.home'},\n  {id: 'offers', labelKey: 'common.offers'},\n  {id: 'projects', labelKey: 'common.projects'},\n];\n",
+    )
+    .expect("write nav items");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {FOOTER_NAV_ITEMS} from './footer-navigation';\nconst t = useTranslations();\nFOOTER_NAV_ITEMS.flatMap(item => item.id === 'home' ? [] : [t(item.labelKey)]);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("common.unused\n");
+}
+
+#[test]
+fn unused_resolves_imported_record_indexed_return_helper_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("offers.history.event-created", "Created"),
+            ("offers.history.event-sent", "Sent"),
+            ("offers.history.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("event-config.ts"),
+        "const EVENT_TYPE_CONFIG: Record<string, {titleKey: string}> = {\n  CREATED: {titleKey: 'offers.history.event-created'},\n  SENT: {titleKey: 'offers.history.event-sent'},\n};\nexport function getEventConfig(eventType: string) {\n  return EVENT_TYPE_CONFIG[eventType];\n}\n",
+    )
+    .expect("write event config");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getEventConfig} from './event-config';\nconst t = useTranslations();\nconst config = getEventConfig(eventType);\nt(config.titleKey);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("offers.history.unused\n");
+}
+
+#[test]
+fn unused_resolves_hook_returned_record_iterable_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("common.home", "Home"),
+            ("common.offers", "Offers"),
+            ("common.projects", "Projects"),
+            ("common.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("footer-navigation.ts"),
+        "import {useMemo} from 'react';\nexport const FOOTER_NAV_ITEMS = [\n  {id: 'home', labelKey: 'common.home'},\n  {id: 'offers', labelKey: 'common.offers'},\n  {id: 'projects', labelKey: 'common.projects'},\n];\nexport function useFooterNavigationPreferences(itemIds: string[]) {\n  const visibleItems = useMemo(\n    () => FOOTER_NAV_ITEMS.filter(item => itemIds.includes(item.id)),\n    [itemIds],\n  );\n  return {visibleItems};\n}\n",
+    )
+    .expect("write nav hook");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {useFooterNavigationPreferences} from './footer-navigation';\nconst t = useTranslations();\nconst {visibleItems} = useFooterNavigationPreferences(itemIds);\nvisibleItems.map(item => t(item.labelKey));\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("common.unused\n");
+}
+
+#[test]
+fn unused_resolves_imported_finite_record_map_get_helper_keys() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("settings.navigation.profile", "Profile"),
+            ("settings.navigation.members", "Members"),
+            ("settings.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("settings-sidebar-state.ts"),
+        "const ITEMS = [\n  {id: 'profile', labelKey: 'navigation.profile'},\n  {id: 'members', labelKey: 'navigation.members'},\n] as const;\nconst ITEM_BY_ID = new Map(ITEMS.map(item => [item.id, item]));\nexport function getSettingsSidebarItemById(id) {\n  return ITEM_BY_ID.get(id) ?? null;\n}\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getSettingsSidebarItemById} from './settings-sidebar-state';\nconst t = useTranslations('settings');\nconst item = getSettingsSidebarItemById(id);\nif (item) {\n  t(item.labelKey);\n}\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_traces_named_helper_import_from_relative_file() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("settings.title", "Title"), ("settings.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("settings-helper.ts"),
+        "export function getTitle(tSettings) { return tSettings('title'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getTitle} from './settings-helper';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_traces_named_helper_import_from_parent_relative_file() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("projects.validation.customerRequired", "Required"),
+            ("projects.unused", "Unused"),
+        ],
+    );
+    std::fs::create_dir_all(dir.path().join("src/projects")).expect("mkdir projects");
+    std::fs::create_dir_all(dir.path().join("src/offers")).expect("mkdir offers");
+    std::fs::write(
+        dir.path().join("src/projects/project-form-shared.tsx"),
+        "export function createProjectFormSchema(tProjects) { return tProjects('validation.customerRequired'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("src/offers/offer-create-dialog.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {createProjectFormSchema} from '../projects/project-form-shared';\nconst tProjects = useTranslations('projects');\ncreateProjectFormSchema(tProjects);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("projects.unused\n");
+}
+
+#[test]
+fn unused_traces_named_helper_import_with_dotted_file_stem() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("checklists.stage-ongoing", "Ongoing"),
+            ("checklists.unused", "Unused"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("checklist-detail-page.shared.ts"),
+        "export function getChecklistStatusLabel(status, tChecklists) { return tChecklists('stage-ongoing'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getChecklistStatusLabel} from './checklist-detail-page.shared';\nconst tChecklists = useTranslations('checklists');\ngetChecklistStatusLabel('ONGOING', tChecklists);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("checklists.unused\n");
+}
+
+#[test]
+fn unused_traces_default_helper_import_from_relative_file() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("settings.title", "Title"), ("settings.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("settings-helper.ts"),
+        "export default function getTitle(tSettings) { return tSettings('title'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport getTitle from './settings-helper';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_traces_export_specifier_helper() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("settings.title", "Title"), ("settings.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("settings-helper.ts"),
+        "function getTitle(tSettings) { return tSettings('title'); }\nexport { getTitle };\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getTitle} from './settings-helper';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_traces_helper_import_through_tsconfig_path_alias() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("settings.title", "Title"), ("settings.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("tsconfig.json"),
+        r#"{
+          "compilerOptions": {
+            "baseUrl": ".",
+            "paths": {
+              "@/*": ["src/*"]
+            }
+          }
+        }"#,
+    )
+    .expect("write tsconfig");
+    std::fs::create_dir_all(dir.path().join("src")).expect("mkdir src");
+    std::fs::write(
+        dir.path().join("src/settings-helper.ts"),
+        "export function getTitle(tSettings) { return tSettings('title'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getTitle} from '@/settings-helper';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_traces_helper_import_via_index_file() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("settings.title", "Title"), ("settings.unused", "Unused")],
+    );
+    std::fs::create_dir_all(dir.path().join("helpers")).expect("mkdir helpers");
+    std::fs::write(
+        dir.path().join("helpers/index.ts"),
+        "export function getTitle(tSettings) { return tSettings('title'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getTitle} from './helpers';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_traces_helper_import_through_star_re_export() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("settings.title", "Title"), ("settings.unused", "Unused")],
+    );
+    std::fs::create_dir_all(dir.path().join("helpers")).expect("mkdir helpers");
+    std::fs::write(
+        dir.path().join("helpers/get-title.ts"),
+        "export function getTitle(tSettings) { return tSettings('title'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("helpers/index.ts"),
+        "export * from './get-title';\n",
+    )
+    .expect("write barrel");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getTitle} from './helpers';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_traces_default_helper_through_re_export() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("settings.title", "Title"), ("settings.unused", "Unused")],
+    );
+    std::fs::create_dir_all(dir.path().join("helpers")).expect("mkdir helpers");
+    std::fs::write(
+        dir.path().join("helpers/get-title.ts"),
+        "export default function getTitle(tSettings) { return tSettings('title'); }\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.path().join("helpers/index.ts"),
+        "export {default} from './get-title';\n",
+    )
+    .expect("write barrel");
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport getTitle from './helpers';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--keys"])
+        .assert()
+        .success()
+        .stdout("settings.unused\n");
+}
+
+#[test]
+fn unused_unresolved_import_with_translator_argument_is_dynamic() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(dir.path(), &[("settings.title", "Title")]);
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nimport {getTitle} from './missing';\nconst t = useTranslations('settings');\ngetTitle(t);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("unused")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Unused keys: 0 / 1 (0%)"))
+        .stdout(predicate::str::contains(
+            "Warning: dynamic translation key usage detected in 1 place(s):",
+        ));
+}
+
+#[test]
+fn unused_remove_removes_safe_unused_keys() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("app.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "remove", "--apply"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed 1 unused translation ids.",
+        ));
+
+    let en = load_language_translations(dir.path(), &config, "en").expect("load en");
+    let nb = load_language_translations(dir.path(), &config, "nb").expect("load nb");
+    assert!(en.contains_key("app.title"));
+    assert!(!en.contains_key("app.unused"));
+    assert!(!nb.contains_key("app.unused"));
+}
+
+#[test]
+fn unused_remove_requires_apply_before_deleting_keys() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("app.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "remove"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Warning!"))
+        .stderr(predicate::str::contains(
+            "This feature is experimental. I cannot fully guarantee that there are no false positives. Run with --apply to remove unused keys.",
+        ))
+        .stderr(predicate::str::contains("Error:").not());
+
+    let en = load_language_translations(dir.path(), &config, "en").expect("load en");
+    let nb = load_language_translations(dir.path(), &config, "nb").expect("load nb");
+    assert!(en.contains_key("app.unused"));
+    assert!(nb.contains_key("app.unused"));
+}
+
+#[test]
+fn unused_remove_excludes_exact_key_from_removal() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("app.title", "Title"),
+            ("app.keep", "Keep"),
+            ("app.remove", "Remove"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "remove", "--apply", "--exclude", "app.keep"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed 1 unused translation ids.",
+        ));
+
+    let en = load_language_translations(dir.path(), &config, "en").expect("load en");
+    let nb = load_language_translations(dir.path(), &config, "nb").expect("load nb");
+    assert!(en.contains_key("app.keep"));
+    assert!(nb.contains_key("app.keep"));
+    assert!(!en.contains_key("app.remove"));
+    assert!(!nb.contains_key("app.remove"));
+}
+
+#[test]
+fn unused_remove_excludes_wildcard_patterns_from_removal() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_next_intl_project_with_keys(
+        dir.path(),
+        &[
+            ("app.title", "Title"),
+            ("common.none", "None"),
+            ("project.status.draft", "Draft"),
+            ("project.status.published", "Published"),
+            ("project.other", "Other"),
+        ],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args([
+            "unused",
+            "remove",
+            "--apply",
+            "-x",
+            "common.none, project.status.*",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed 1 unused translation ids.",
+        ));
+
+    let en = load_language_translations(dir.path(), &config, "en").expect("load en");
+    assert!(en.contains_key("common.none"));
+    assert!(en.contains_key("project.status.draft"));
+    assert!(en.contains_key("project.status.published"));
+    assert!(!en.contains_key("project.other"));
+}
+
+#[test]
+fn unused_remove_force_still_respects_exclude_patterns() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("app.keep", "Keep")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\nt(key);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args([
+            "unused",
+            "--no-ts-checker",
+            "remove",
+            "--apply",
+            "--force",
+            "--exclude",
+            "app.*",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed 0 unused translation ids.",
+        ));
+
+    let en = load_language_translations(dir.path(), &config, "en").expect("load en");
+    assert!(en.contains_key("app.keep"));
+}
+
+#[test]
+fn unused_remove_refuses_dynamic_usage_without_force() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("app.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt(key);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--no-ts-checker", "remove", "--apply"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "dynamic translation key usage detected",
+        ));
+}
+
+#[test]
+fn unused_remove_force_allows_dynamic_usage() {
+    let dir = tempdir().expect("tempdir");
+    let config = setup_next_intl_project_with_keys(
+        dir.path(),
+        &[("app.title", "Title"), ("app.unused", "Unused")],
+    );
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useTranslations} from 'next-intl';\nconst t = useTranslations('app');\nt('title');\nt(key);\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "--no-ts-checker", "remove", "--apply", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed 1 unused translation ids.",
+        ));
+
+    let en = load_language_translations(dir.path(), &config, "en").expect("load en");
+    assert!(en.contains_key("app.title"));
+    assert!(!en.contains_key("app.unused"));
+}
+
+#[test]
+fn unused_remove_refuses_extraction_usage_even_with_force() {
+    let dir = tempdir().expect("tempdir");
+    setup_next_intl_project_with_keys(dir.path(), &[("app.unused", "Unused")]);
+    std::fs::write(
+        dir.path().join("page.tsx"),
+        "import {useExtracted} from 'next-intl';\nconst t = useExtracted();\nt('Close');\n",
+    )
+    .expect("write source");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["unused", "remove", "--apply", "--force"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "cannot remove unused keys while next-intl extraction usage is detected",
+        ));
+}
+
+#[test]
+fn unused_reports_react_intl_as_unsupported() {
+    let dir = tempdir().expect("tempdir");
+    setup_project(dir.path());
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("unused")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "trans unused currently supports next-intl mode only",
+        ));
 }
 
 #[test]

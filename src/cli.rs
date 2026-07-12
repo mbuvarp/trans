@@ -268,6 +268,22 @@ pub enum Command {
         #[arg(long = "ai", help = "Use AI to suggest fixes for verification errors")]
         ai: bool,
     },
+    #[command(about = "List or remove unused next-intl translation ids")]
+    Unused {
+        #[arg(
+            short = 'k',
+            long = "keys",
+            help = "Print unused keys only, without summary or warnings"
+        )]
+        keys: bool,
+        #[arg(
+            long = "no-ts-checker",
+            help = "Do not use the project TypeScript checker to resolve remaining dynamic keys"
+        )]
+        no_ts_checker: bool,
+        #[command(subcommand)]
+        command: Option<UnusedCommand>,
+    },
     #[command(about = "Sync missing ids from the primary language into all languages")]
     Sync,
     #[command(about = "Translate all missing values with AI")]
@@ -296,6 +312,30 @@ pub enum Command {
     DelLang {
         #[arg(value_name = "LANG", help = "Language code to remove (e.g. nb)")]
         lang: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum UnusedCommand {
+    #[command(about = "Remove unused translation ids from all language files")]
+    Remove {
+        #[arg(
+            long,
+            help = "Actually remove unused keys; required because unused removal is experimental"
+        )]
+        apply: bool,
+        #[arg(
+            long,
+            help = "Remove unused keys even when dynamic translation key usage is detected"
+        )]
+        force: bool,
+        #[arg(
+            short = 'x',
+            long = "exclude",
+            value_name = "PATTERNS",
+            help = "Comma-separated unused key patterns to keep, supports * wildcards"
+        )]
+        exclude: Option<String>,
     },
 }
 

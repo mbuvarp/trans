@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -9,7 +10,8 @@ use console::style;
 use dialoguer::Confirm;
 
 use trans::cli::{
-    Cli, Command, ConfigFormat, ConfigKey, ConfigSection, parse_lang_list, parse_values,
+    Cli, Command, ConfigFormat, ConfigKey, ConfigSection, UnusedCommand, parse_lang_list,
+    parse_values,
 };
 use trans::config::{
     ConfigField, ConfigFormat as ConfigFileFormat, ConfigMode, ExportFormat, TransConfig,
@@ -37,7 +39,10 @@ use trans::verify_ai::verify_with_ai;
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("Error: {err}");
+        match err {
+            TransError::CommandRefused(message) => eprintln!("{message}"),
+            err => eprintln!("Error: {err}"),
+        }
         process::exit(1);
     }
 }
@@ -455,6 +460,90 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Some(Command::Unused {
+            keys,
+            no_ts_checker,
+            command,
+        }) => {
+            let root = config_root(&effective_cwd)?;
+            let config = TransConfig::load_from_root(&root)?;
+            let use_ts_checker = !no_ts_checker;
+            match command {
+                None => {
+                    if keys {
+                        let ids = trans::unused::find_unused_keys_with_ts_checker(
+                            &root,
+                            &config,
+                            use_ts_checker,
+                        )?;
+                        for id in &ids {
+                            println!("{id}");
+                        }
+                    } else {
+                        let report = trans::unused::find_unused_with_ts_checker(
+                            &root,
+                            &config,
+                            use_ts_checker,
+                        )?;
+                        println!(
+                            "Unused keys: {} / {} ({}%)",
+                            style(report.unused_ids.len()).bold(),
+                            report.total_ids,
+                            percentage(report.unused_ids.len(), report.total_ids)
+                        );
+                        if !report.dynamic_usage_locations.is_empty() {
+                            println!();
+                            println!(
+                                "{}",
+                                style(format!(
+                                    "Warning: dynamic translation key usage detected in {} place(s):",
+                                    report.dynamic_usage_locations.len()
+                                ))
+                                .yellow()
+                            );
+                            for location in &report.dynamic_usage_locations {
+                                println!(
+                                    "{}",
+                                    format_terminal_link(&location.display, &location.url)
+                                );
+                            }
+                        }
+                        for warning in &report.warnings {
+                            if warning.starts_with("dynamic translation key usage detected") {
+                                continue;
+                            }
+                            println!();
+                            println!("{}", style(format!("Warning: {warning}")).yellow());
+                        }
+                    }
+                    Ok(())
+                }
+                Some(UnusedCommand::Remove {
+                    apply,
+                    force,
+                    exclude,
+                }) => {
+                    if !apply {
+                        return Err(TransError::CommandRefused(unused_remove_apply_warning()));
+                    }
+                    let report = trans::unused::remove_unused_with_ts_checker(
+                        &root,
+                        &config,
+                        force,
+                        use_ts_checker,
+                        exclude.as_deref(),
+                    )?;
+                    for warning in &report.warnings {
+                        eprintln!("Warning: {warning}");
+                    }
+                    println!(
+                        "Removed {} unused translation ids.",
+                        report.unused_ids.len()
+                    );
+                    Ok(())
+                }
+            }
+        }
         Some(Command::Sync) => {
             let root = config_root(&effective_cwd)?;
             let config = TransConfig::load_from_root(&root)?;
@@ -532,6 +621,29 @@ fn format_find_match_kind(kind: FindMatchKind) -> String {
         FindMatchKind::Exact => style("exact").green().to_string(),
         FindMatchKind::Casing => style("casing").yellow().to_string(),
         FindMatchKind::Partial => style("partial").color256(208).to_string(),
+    }
+}
+
+fn unused_remove_apply_warning() -> String {
+    format!(
+        "{} This feature is experimental. I cannot fully guarantee that there are no false positives. Run with --apply to remove unused keys.",
+        style("Warning!").color256(208).bold()
+    )
+}
+
+fn format_terminal_link(display: &str, url: &str) -> String {
+    if std::io::stdout().is_terminal() {
+        format!("\x1b]8;;{url}\x1b\\{display}\x1b]8;;\x1b\\")
+    } else {
+        display.to_string()
+    }
+}
+
+fn percentage(part: usize, total: usize) -> usize {
+    if total == 0 {
+        0
+    } else {
+        (part * 100 + total / 2) / total
     }
 }
 
