@@ -510,6 +510,7 @@ struct BoundArgumentEvidence {
 struct FiniteBoundArgumentEntry {
     values: Option<Vec<BoundArgumentEvidence>>,
     provenance: BTreeSet<usize>,
+    spread_provenance: BTreeSet<usize>,
 }
 
 #[derive(Default)]
@@ -5190,6 +5191,76 @@ fn assignment_target_unknown_container_path<'a>(
     Some((root, path))
 }
 
+fn assignment_target_identifier_names(target: &AssignmentTarget<'_>, names: &mut Vec<String>) {
+    match target {
+        AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+            names.push(identifier.name.to_string());
+        }
+        AssignmentTarget::ArrayAssignmentTarget(array) => {
+            for element in array.elements.iter().flatten() {
+                assignment_target_maybe_default_identifier_names(element, names);
+            }
+            if let Some(rest) = &array.rest {
+                assignment_target_identifier_names(&rest.target, names);
+            }
+        }
+        AssignmentTarget::ObjectAssignmentTarget(object) => {
+            for property in &object.properties {
+                match property {
+                    AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(property) => {
+                        names.push(property.binding.name.to_string());
+                    }
+                    AssignmentTargetProperty::AssignmentTargetPropertyProperty(property) => {
+                        assignment_target_maybe_default_identifier_names(&property.binding, names);
+                    }
+                }
+            }
+            if let Some(rest) = &object.rest {
+                assignment_target_identifier_names(&rest.target, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn assignment_target_maybe_default_identifier_names(
+    target: &AssignmentTargetMaybeDefault<'_>,
+    names: &mut Vec<String>,
+) {
+    match target {
+        AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(default) => {
+            assignment_target_identifier_names(&default.binding, names);
+        }
+        AssignmentTargetMaybeDefault::AssignmentTargetIdentifier(identifier) => {
+            names.push(identifier.name.to_string());
+        }
+        AssignmentTargetMaybeDefault::ArrayAssignmentTarget(array) => {
+            for element in array.elements.iter().flatten() {
+                assignment_target_maybe_default_identifier_names(element, names);
+            }
+            if let Some(rest) = &array.rest {
+                assignment_target_identifier_names(&rest.target, names);
+            }
+        }
+        AssignmentTargetMaybeDefault::ObjectAssignmentTarget(object) => {
+            for property in &object.properties {
+                match property {
+                    AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(property) => {
+                        names.push(property.binding.name.to_string());
+                    }
+                    AssignmentTargetProperty::AssignmentTargetPropertyProperty(property) => {
+                        assignment_target_maybe_default_identifier_names(&property.binding, names);
+                    }
+                }
+            }
+            if let Some(rest) = &object.rest {
+                assignment_target_identifier_names(&rest.target, names);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn singularize_constant_word(word: &str) -> String {
     if word.ends_with("ies") && word.len() > 3 {
         format!("{}y", &word[..word.len() - 3])
@@ -7299,11 +7370,23 @@ struct ReactWrapperReturnCollector {
     invalidated_finite_bound_argument_provenance: BTreeSet<usize>,
     next_finite_bound_argument_provenance: usize,
     conditional_control_flow_depth: usize,
+    finite_bound_capture_callables: BTreeMap<String, BTreeSet<String>>,
 }
 
 struct InlineWrapperReturnVisitor<'collector> {
     collector: &'collector ReactWrapperReturnCollector,
     returns_wrapper: bool,
+}
+
+#[derive(Default)]
+struct FiniteBoundCaptureNameCollector {
+    names: BTreeSet<String>,
+}
+
+impl<'a> Visit<'a> for FiniteBoundCaptureNameCollector {
+    fn visit_identifier_reference(&mut self, identifier: &IdentifierReference<'a>) {
+        self.names.insert(identifier.name.to_string());
+    }
 }
 
 impl<'a> Visit<'a> for InlineWrapperReturnVisitor<'_> {
@@ -7321,6 +7404,34 @@ impl<'a> Visit<'a> for InlineWrapperReturnVisitor<'_> {
 }
 
 impl ReactWrapperReturnCollector {
+    fn finite_bound_capture_names(expression: &Expression<'_>) -> Option<BTreeSet<String>> {
+        let mut collector = FiniteBoundCaptureNameCollector::default();
+        match expression.get_inner_expression() {
+            Expression::ArrowFunctionExpression(arrow) => {
+                collector.visit_arrow_function_expression(arrow);
+            }
+            Expression::FunctionExpression(function) => {
+                collector.visit_function(function, ScopeFlags::empty());
+            }
+            _ => return None,
+        }
+        Some(collector.names)
+    }
+
+    fn finite_bound_function_capture_names(function: &Function<'_>) -> BTreeSet<String> {
+        let mut collector = FiniteBoundCaptureNameCollector::default();
+        collector.visit_function(function, ScopeFlags::empty());
+        collector.names
+    }
+
+    fn finite_bound_capture_provenance(&self, names: &BTreeSet<String>) -> BTreeSet<usize> {
+        names
+            .iter()
+            .filter_map(|name| self.finite_bound_argument_arrays.get(name))
+            .flat_map(|entry| entry.provenance.iter().copied())
+            .collect()
+    }
+
     fn set_finite_bound_argument_declaration(
         &mut self,
         name: &str,
@@ -7354,7 +7465,12 @@ impl ReactWrapperReturnCollector {
             self.next_finite_bound_argument_provenance += 1;
             provenance.insert(id);
         }
-        Some(FiniteBoundArgumentEntry { values, provenance })
+        let spread_provenance = self.finite_bound_spread_provenance(expression);
+        Some(FiniteBoundArgumentEntry {
+            values,
+            provenance,
+            spread_provenance,
+        })
     }
 
     fn invalidate_finite_bound_argument_provenance(&mut self, provenance: BTreeSet<usize>) {
@@ -7362,6 +7478,16 @@ impl ReactWrapperReturnCollector {
             .extend(provenance.iter().copied());
         self.finite_bound_argument_arrays
             .retain(|_, entry| entry.provenance.is_disjoint(&provenance));
+    }
+
+    fn finite_bound_carrier_entry(
+        provenance: &BTreeSet<usize>,
+    ) -> Option<FiniteBoundArgumentEntry> {
+        (!provenance.is_empty()).then(|| FiniteBoundArgumentEntry {
+            values: None,
+            provenance: provenance.clone(),
+            spread_provenance: provenance.clone(),
+        })
     }
 
     fn argument_param_combinations(
@@ -7669,6 +7795,11 @@ impl ReactWrapperReturnCollector {
                 .finite_bound_argument_arrays
                 .get(identifier.name.as_str())
                 .map(|entry| entry.provenance.clone())
+                .or_else(|| {
+                    self.finite_bound_capture_callables
+                        .get(identifier.name.as_str())
+                        .map(|names| self.finite_bound_capture_provenance(names))
+                })
                 .unwrap_or_default(),
             Expression::ConditionalExpression(conditional) => {
                 let mut provenance = self.finite_bound_argument_provenance(&conditional.consequent);
@@ -7692,14 +7823,12 @@ impl ReactWrapperReturnCollector {
             Expression::CallExpression(call) => call
                 .arguments
                 .iter()
-                .filter_map(Argument::as_expression)
-                .flat_map(|argument| self.finite_bound_argument_provenance(argument))
+                .flat_map(|argument| self.finite_bound_call_argument_provenance(argument))
                 .collect(),
             Expression::NewExpression(new_expression) => new_expression
                 .arguments
                 .iter()
-                .filter_map(Argument::as_expression)
-                .flat_map(|argument| self.finite_bound_argument_provenance(argument))
+                .flat_map(|argument| self.finite_bound_call_argument_provenance(argument))
                 .collect(),
             Expression::AssignmentExpression(assignment) => {
                 if let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &assignment.left
@@ -7720,6 +7849,11 @@ impl ReactWrapperReturnCollector {
             Expression::AwaitExpression(await_expression) => {
                 self.finite_bound_argument_provenance(&await_expression.argument)
             }
+            Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => {
+                Self::finite_bound_capture_names(expression)
+                    .map(|names| self.finite_bound_capture_provenance(&names))
+                    .unwrap_or_default()
+            }
             Expression::ArrayExpression(array) => array
                 .elements
                 .iter()
@@ -7738,6 +7872,77 @@ impl ReactWrapperReturnCollector {
                     }
                 })
                 .collect(),
+            _ => BTreeSet::new(),
+        }
+    }
+
+    fn finite_bound_call_argument_provenance(&self, argument: &Argument<'_>) -> BTreeSet<usize> {
+        match argument {
+            Argument::SpreadElement(spread) => {
+                self.finite_bound_spread_provenance(&spread.argument)
+            }
+            _ => argument
+                .as_expression()
+                .map(|argument| self.finite_bound_argument_provenance(argument))
+                .unwrap_or_default(),
+        }
+    }
+
+    fn finite_bound_spread_provenance(&self, expression: &Expression<'_>) -> BTreeSet<usize> {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => self
+                .finite_bound_argument_arrays
+                .get(identifier.name.as_str())
+                .map(|entry| entry.spread_provenance.clone())
+                .unwrap_or_default(),
+            Expression::ConditionalExpression(conditional) => {
+                let mut provenance = self.finite_bound_spread_provenance(&conditional.consequent);
+                provenance.extend(self.finite_bound_spread_provenance(&conditional.alternate));
+                provenance
+            }
+            Expression::LogicalExpression(logical) => {
+                let mut provenance = self.finite_bound_spread_provenance(&logical.left);
+                provenance.extend(self.finite_bound_spread_provenance(&logical.right));
+                provenance
+            }
+            Expression::ArrayExpression(array) => array
+                .elements
+                .iter()
+                .flat_map(|element| match element {
+                    ArrayExpressionElement::SpreadElement(spread) => {
+                        self.finite_bound_spread_provenance(&spread.argument)
+                    }
+                    _ => element
+                        .as_expression()
+                        .map(|element| self.finite_bound_argument_provenance(element))
+                        .unwrap_or_default(),
+                })
+                .collect(),
+            Expression::StaticMemberExpression(member) => {
+                self.finite_bound_spread_provenance(&member.object)
+            }
+            Expression::ComputedMemberExpression(member) => {
+                self.finite_bound_spread_provenance(&member.object)
+            }
+            Expression::AwaitExpression(await_expression) => {
+                self.finite_bound_spread_provenance(&await_expression.argument)
+            }
+            Expression::AssignmentExpression(assignment) => {
+                if let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &assignment.left
+                    && let Some(entry) = self
+                        .finite_bound_argument_arrays
+                        .get(identifier.name.as_str())
+                {
+                    entry.spread_provenance.clone()
+                } else {
+                    self.finite_bound_spread_provenance(&assignment.right)
+                }
+            }
+            Expression::SequenceExpression(sequence) => sequence
+                .expressions
+                .last()
+                .map(|expression| self.finite_bound_spread_provenance(expression))
+                .unwrap_or_default(),
             _ => BTreeSet::new(),
         }
     }
@@ -8436,6 +8641,9 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         walk::walk_call_expression(self, call);
         let mut invalidated_provenance = BTreeSet::new();
+        if call.callee.get_member_expr().is_none() {
+            invalidated_provenance.extend(self.finite_bound_argument_provenance(&call.callee));
+        }
         if let Some(member) = call.callee.get_member_expr() {
             let receiver_provenance = self.finite_bound_argument_provenance(member.object());
             let known_nonmutating = member.static_property_name().is_some_and(|method| {
@@ -8463,11 +8671,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             }
         }
         for argument in &call.arguments {
-            if !matches!(argument, Argument::SpreadElement(_))
-                && let Some(argument) = argument.as_expression()
-            {
-                invalidated_provenance.extend(self.finite_bound_argument_provenance(argument));
-            }
+            invalidated_provenance.extend(self.finite_bound_call_argument_provenance(argument));
         }
         if !invalidated_provenance.is_empty() {
             self.invalidate_finite_bound_argument_provenance(invalidated_provenance);
@@ -8525,8 +8729,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         let provenance = expression
             .arguments
             .iter()
-            .filter_map(Argument::as_expression)
-            .flat_map(|argument| self.finite_bound_argument_provenance(argument))
+            .flat_map(|argument| self.finite_bound_call_argument_provenance(argument))
             .collect();
         self.invalidate_finite_bound_argument_provenance(provenance);
     }
@@ -8584,6 +8787,12 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         }
         if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
             let name = identifier.name.to_string();
+            if let Some(captures) = Self::finite_bound_capture_names(init) {
+                self.finite_bound_capture_callables
+                    .insert(name.clone(), captures);
+            } else {
+                self.finite_bound_capture_callables.remove(&name);
+            }
             let arguments = self.finite_bound_argument_entry(init);
             self.set_finite_bound_argument_declaration(&name, arguments);
             if !array_indexes.is_empty() {
@@ -8594,11 +8803,46 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 self.array_index_forward_values
                     .insert(name, array_index_forwards.clone());
             }
+        } else {
+            let provenance = self.finite_bound_argument_provenance(init);
+            for identifier in declarator.id.get_binding_identifiers() {
+                self.set_finite_bound_argument_declaration(
+                    identifier.name.as_str(),
+                    Self::finite_bound_carrier_entry(&provenance),
+                );
+            }
         }
     }
 
     fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
         walk::walk_assignment_expression(self, expression);
+        if matches!(
+            expression.left,
+            AssignmentTarget::ArrayAssignmentTarget(_)
+                | AssignmentTarget::ObjectAssignmentTarget(_)
+        ) {
+            let mut names = Vec::new();
+            assignment_target_identifier_names(&expression.left, &mut names);
+            if expression.operator == AssignmentOperator::Assign
+                && self.conditional_control_flow_depth == 0
+            {
+                let provenance = self.finite_bound_argument_provenance(&expression.right);
+                for name in names {
+                    if let Some(entry) = Self::finite_bound_carrier_entry(&provenance) {
+                        self.finite_bound_argument_arrays.insert(name, entry);
+                    } else {
+                        self.finite_bound_argument_arrays.remove(&name);
+                    }
+                }
+            } else {
+                let provenance = names
+                    .iter()
+                    .filter_map(|name| self.finite_bound_argument_arrays.get(name))
+                    .flat_map(|entry| entry.provenance.iter().copied())
+                    .collect();
+                self.invalidate_finite_bound_argument_provenance(provenance);
+            }
+        }
         let uncertain_identifier_provenance = match &expression.left {
             AssignmentTarget::AssignmentTargetIdentifier(identifier)
                 if expression.operator != AssignmentOperator::Assign
@@ -8630,6 +8874,12 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             && let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &expression.left
         {
             let name = identifier.name.to_string();
+            if let Some(captures) = Self::finite_bound_capture_names(&expression.right) {
+                self.finite_bound_capture_callables
+                    .insert(name.clone(), captures);
+            } else {
+                self.finite_bound_capture_callables.remove(&name);
+            }
             if let Some(arguments) = self.finite_bound_argument_entry(&expression.right) {
                 self.finite_bound_argument_arrays
                     .insert(name.clone(), arguments);
@@ -8757,7 +9007,16 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         }
     }
 
-    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
+        if function.r#type == FunctionType::FunctionDeclaration
+            && let Some(identifier) = &function.id
+        {
+            self.finite_bound_capture_callables.insert(
+                identifier.name.to_string(),
+                Self::finite_bound_function_capture_names(function),
+            );
+        }
+    }
 
     fn visit_arrow_function_expression(&mut self, _arrow: &ArrowFunctionExpression<'a>) {}
 }
@@ -11635,6 +11894,7 @@ impl SourceIndexCollector {
             invalidated_finite_bound_argument_provenance: BTreeSet::new(),
             next_finite_bound_argument_provenance: 0,
             conditional_control_flow_depth: 0,
+            finite_bound_capture_callables: BTreeMap::new(),
         }
     }
 
@@ -25371,6 +25631,8 @@ mod tests {
               nested[0][0](nestedKey);
               const [constructed] = await constructedForward();
               constructed[0][0](constructedKey);
+              const [destructured] = await destructuredForward();
+              destructured[0][0](destructuredKey);
               async function inner(factory) { return Promise.all([factory(), draw]); }
               async function outer(factory) { return Promise.all([factory(), draw]); }
               async function initializedForward() {
@@ -25390,6 +25652,13 @@ mod tests {
                 consume(holder);
                 return outer(inner.bind(null, ...args));
               }
+              async function destructuredForward() {
+                const args = [draw];
+                const holder = {carrier: [args]};
+                const {carrier} = holder;
+                mutate(...carrier);
+                return outer(inner.bind(null, ...args));
+              }
             }
             "#,
         );
@@ -25398,7 +25667,7 @@ mod tests {
             .iter()
             .map(|usage| usage.line)
             .collect::<BTreeSet<_>>();
-        for line in [4, 6, 8] {
+        for line in [4, 6, 8, 10] {
             assert!(
                 lines.contains(&line),
                 "missing line {line}; dynamic lines: {lines:?}"
@@ -25437,6 +25706,149 @@ mod tests {
             .map(|usage| usage.line)
             .collect::<BTreeSet<_>>();
         for line in [4, 6] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn destructured_bindings_preserve_finite_bound_provenance() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [objectValue] = await objectForward();
+              objectValue[0][0](objectKey);
+              const [arrayValue] = await arrayForward();
+              arrayValue[0][0](arrayKey);
+              const [assignedValue] = await assignedForward();
+              assignedValue[0][0](assignedKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function objectForward() {
+                const args = [draw];
+                const holder = {args};
+                const {args: alias} = holder;
+                mutate(alias);
+                return outer(inner.bind(null, ...args));
+              }
+              async function arrayForward() {
+                const args = [draw];
+                const holder = [args];
+                const [alias] = holder;
+                mutate(alias);
+                return outer(inner.bind(null, ...args));
+              }
+              async function assignedForward() {
+                const args = [draw];
+                const holder = {args};
+                let alias;
+                ({args: alias} = holder);
+                mutate(alias);
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [4, 6, 8] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spread_carriers_expose_nested_finite_bound_arrays() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [called] = await callForward();
+              called[0][0](callKey);
+              const [constructed] = await constructedForward();
+              constructed[0][0](constructedKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function callForward() {
+                const args = [draw];
+                const carrier = [args];
+                mutate(...carrier);
+                return outer(inner.bind(null, ...args));
+              }
+              async function constructedForward() {
+                const args = [draw];
+                const carrier = [args];
+                new Mutator(...carrier);
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [4, 6] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invoked_and_escaping_closures_invalidate_captured_finite_bound_arrays() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [inline] = await inlineForward();
+              inline[0][0](inlineKey);
+              const [variable] = await variableForward();
+              variable[0][0](variableKey);
+              const [declared] = await declaredForward();
+              declared[0][0](declaredKey);
+              const [escaped] = await escapedForward();
+              escaped[0][0](escapedKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function inlineForward() {
+                const args = [draw];
+                (() => { args[0] = runtimeFactory; })();
+                return outer(inner.bind(null, ...args));
+              }
+              async function variableForward() {
+                const change = () => { args[0] = runtimeFactory; };
+                const args = [draw];
+                change();
+                return outer(inner.bind(null, ...args));
+              }
+              async function declaredForward() {
+                function change() { args[0] = runtimeFactory; }
+                const args = [draw];
+                change();
+                return outer(inner.bind(null, ...args));
+              }
+              async function escapedForward() {
+                const args = [draw];
+                run(() => { args[0] = runtimeFactory; });
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [4, 6, 8, 10] {
             assert!(
                 lines.contains(&line),
                 "missing line {line}; dynamic lines: {lines:?}"
