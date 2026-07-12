@@ -20089,6 +20089,68 @@ impl SourceUsageCollector {
         }
     }
 
+    fn bind_pattern_message_paths(
+        &mut self,
+        pattern: &BindingPattern<'_>,
+        base_paths: &FiniteStrings,
+        path: &[String],
+    ) {
+        match pattern {
+            BindingPattern::BindingIdentifier(identifier) => {
+                let paths = base_paths
+                    .iter()
+                    .map(|base| {
+                        path.iter().fold(base.clone(), |prefix, part| {
+                            join_message_path(&prefix, part)
+                        })
+                    })
+                    .collect();
+                self.message_object_paths
+                    .insert(identifier.name.to_string(), paths);
+            }
+            BindingPattern::AssignmentPattern(assignment) => {
+                self.bind_pattern_message_paths(&assignment.left, base_paths, path);
+            }
+            BindingPattern::ObjectPattern(object) => {
+                for property in &object.properties {
+                    let names = if property.computed {
+                        property
+                            .key
+                            .as_expression()
+                            .and_then(|key| self.finite_strings_from_expression(key))
+                    } else {
+                        property
+                            .key
+                            .static_name()
+                            .map(|name| finite_string(name.to_string()))
+                    };
+                    let Some(names) = names else {
+                        continue;
+                    };
+                    for name in names {
+                        let mut property_path = path.to_vec();
+                        property_path.push(name);
+                        self.bind_pattern_message_paths(
+                            &property.value,
+                            base_paths,
+                            &property_path,
+                        );
+                    }
+                }
+            }
+            BindingPattern::ArrayPattern(array) => {
+                for (index, element) in array.elements.iter().enumerate() {
+                    let Some(element) = element else {
+                        continue;
+                    };
+                    let mut element_path = path.to_vec();
+                    element_path.push(index.to_string());
+                    self.bind_pattern_message_paths(element, base_paths, &element_path);
+                }
+            }
+        }
+    }
+
     fn dynamic_message_prefixes_from_expression(
         &self,
         expression: &Expression<'_>,
@@ -21917,6 +21979,12 @@ impl SourceUsageCollector {
         let Some((property, remaining)) = path.split_first() else {
             return self.translator_binding_from_expression(expression);
         };
+        if remaining.is_empty()
+            && TRANSLATOR_METHODS.contains(&property.as_str())
+            && let Some(binding) = self.translator_binding_from_expression(expression)
+        {
+            return Some(binding);
+        }
         match expression.get_inner_expression() {
             Expression::ObjectExpression(_) => self
                 .translator_object_bindings_from_expression(expression)?
@@ -23149,7 +23217,13 @@ impl SourceUsageCollector {
                 });
                 true
             }
-            _ => false,
+            _ => {
+                let Some(binding) = self.translator_binding_from_argument(callback) else {
+                    return false;
+                };
+                self.record_translator_keys(&binding, Some(values), callback.span().start);
+                true
+            }
         }
     }
 
@@ -24548,9 +24622,8 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             array
         });
         self.mask_binding_pattern(&declarator.id);
-        if let (Some(name), Some(paths)) = (binding_identifier_name(&declarator.id), message_paths)
-        {
-            self.message_object_paths.insert(name.to_string(), paths);
+        if let Some(paths) = &message_paths {
+            self.bind_pattern_message_paths(&declarator.id, paths, &[]);
         }
         if let Some((name, resolution)) = local_wrapper_resolution {
             self.register_local_wrapper_resolution(name, resolution);
@@ -25916,6 +25989,55 @@ mod tests {
                 .iter()
                 .any(|usage| usage.namespace == "app")
         );
+    }
+
+    #[test]
+    fn binds_destructured_message_namespaces() {
+        let scan = scan(
+            r#"
+            import {useMessages} from 'next-intl';
+            const {Navigation, Footer: {copy}} = useMessages();
+            render(Navigation.title);
+            render(copy.label);
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("Navigation.title"));
+        assert!(scan.used_ids.contains("Footer.copy.label"));
+    }
+
+    #[test]
+    fn binds_destructured_translator_methods() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const {rich} = useTranslations('common');
+            rich('title');
+            const t = useTranslations('admin');
+            const {raw: renderRaw} = t;
+            renderRaw('description');
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.used_ids.contains("admin.description"));
+    }
+
+    #[test]
+    fn finite_iterables_accept_translators_as_direct_callbacks() {
+        let scan = scan(
+            r#"
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('common');
+            const keys = ['title'] as const;
+            keys.map(t);
+            const richKeys = ['description'] as const;
+            richKeys.forEach(t.rich);
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.title"));
+        assert!(scan.used_ids.contains("common.description"));
     }
 
     #[test]
