@@ -472,10 +472,12 @@ struct WrapperCallableTarget {
     name: String,
     bound_argument_targets: BTreeMap<usize, BTreeSet<WrapperCallableTarget>>,
     bound_wrapper_arguments: BTreeSet<usize>,
+    bound_argument_params: BTreeMap<usize, BTreeSet<usize>>,
     bound_argument_count: usize,
     bound_unknown_from: Option<usize>,
     bound_unknown_may_wrap: bool,
     bound_unknown_targets: BTreeSet<WrapperCallableTarget>,
+    bound_unknown_params: BTreeSet<usize>,
 }
 
 impl WrapperCallableTarget {
@@ -485,10 +487,12 @@ impl WrapperCallableTarget {
             name,
             bound_argument_targets: BTreeMap::new(),
             bound_wrapper_arguments: BTreeSet::new(),
+            bound_argument_params: BTreeMap::new(),
             bound_argument_count: 0,
             bound_unknown_from: None,
             bound_unknown_may_wrap: false,
             bound_unknown_targets: BTreeSet::new(),
+            bound_unknown_params: BTreeSet::new(),
         }
     }
 }
@@ -7391,45 +7395,110 @@ impl ReactWrapperReturnCollector {
                         .expect("bind member checked")
                         .object(),
                 );
-                let bound_arguments = call.arguments.iter().skip(1).collect::<Vec<_>>();
-                let unknown_position = bound_arguments
+                let mut fixed_arguments = Vec::<Option<&Expression<'_>>>::new();
+                let mut unknown_arguments = Vec::<&Expression<'_>>::new();
+                let mut unknown_position = None;
+                for argument in call.arguments.iter().skip(1) {
+                    match argument {
+                        Argument::SpreadElement(spread) => {
+                            if let Expression::ArrayExpression(array) =
+                                spread.argument.get_inner_expression()
+                            {
+                                for element in &array.elements {
+                                    match element {
+                                        ArrayExpressionElement::SpreadElement(spread) => {
+                                            if unknown_position.is_none() {
+                                                unknown_position = Some(fixed_arguments.len());
+                                            }
+                                            unknown_arguments.push(&spread.argument);
+                                        }
+                                        ArrayExpressionElement::Elision(_) => {
+                                            if unknown_position.is_none() {
+                                                fixed_arguments.push(None);
+                                            }
+                                        }
+                                        _ => {
+                                            let argument = element.as_expression();
+                                            if unknown_position.is_some() {
+                                                if let Some(argument) = argument {
+                                                    unknown_arguments.push(argument);
+                                                }
+                                            } else {
+                                                fixed_arguments.push(argument);
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                if unknown_position.is_none() {
+                                    unknown_position = Some(fixed_arguments.len());
+                                }
+                                unknown_arguments.push(&spread.argument);
+                            }
+                        }
+                        _ => {
+                            let argument = argument.as_expression();
+                            if unknown_position.is_some() {
+                                if let Some(argument) = argument {
+                                    unknown_arguments.push(argument);
+                                }
+                            } else {
+                                fixed_arguments.push(argument);
+                            }
+                        }
+                    }
+                }
+                let fixed_count = fixed_arguments.len();
+                let fixed_argument_targets = fixed_arguments
                     .iter()
-                    .position(|argument| matches!(argument, Argument::SpreadElement(_)));
-                let fixed_count = unknown_position.unwrap_or(bound_arguments.len());
-                let fixed_argument_targets = bound_arguments
-                    .iter()
-                    .take(fixed_count)
                     .enumerate()
                     .filter_map(|(index, argument)| {
-                        let targets = self.wrapper_callable_targets(argument.as_expression()?);
+                        let targets = self.wrapper_callable_targets(argument.as_ref()?);
                         (!targets.is_empty()).then_some((index, targets))
                     })
                     .collect::<BTreeMap<_, _>>();
-                let fixed_wrapper_arguments = bound_arguments
+                let fixed_wrapper_arguments = fixed_arguments
                     .iter()
-                    .take(fixed_count)
                     .enumerate()
                     .filter_map(|(index, argument)| {
                         argument
-                            .as_expression()
                             .is_some_and(|argument| {
                                 self.inline_expression_returns_wrapper(argument)
                             })
                             .then_some(index)
                     })
                     .collect::<BTreeSet<_>>();
-                let unknown_targets = bound_arguments
+                let parameter_origins = |argument: &Expression<'_>| {
+                    self.forwards_from_expression(argument)
+                        .into_iter()
+                        .filter_map(|forward| match forward {
+                            TranslatorReturnForward::ParameterCall { param_index, .. } => {
+                                Some(param_index)
+                            }
+                            _ => None,
+                        })
+                        .collect::<BTreeSet<_>>()
+                };
+                let fixed_argument_params = fixed_arguments
                     .iter()
-                    .skip(fixed_count)
-                    .filter_map(|argument| argument.as_expression())
+                    .enumerate()
+                    .filter_map(|(index, argument)| {
+                        let params = parameter_origins(argument.as_ref()?);
+                        (!params.is_empty()).then_some((index, params))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let unknown_targets = unknown_arguments
+                    .iter()
                     .flat_map(|argument| self.wrapper_callable_targets(argument))
                     .collect::<BTreeSet<_>>();
+                let unknown_params = unknown_arguments
+                    .iter()
+                    .flat_map(|argument| parameter_origins(argument))
+                    .collect::<BTreeSet<_>>();
                 let unknown_may_wrap = unknown_position.is_some()
-                    || bound_arguments.iter().skip(fixed_count).any(|argument| {
-                        argument.as_expression().is_some_and(|argument| {
-                            self.inline_expression_returns_wrapper(argument)
-                        })
-                    });
+                    || unknown_arguments
+                        .iter()
+                        .any(|argument| self.inline_expression_returns_wrapper(argument));
                 targets = targets
                     .into_iter()
                     .map(|mut target| {
@@ -7443,6 +7512,14 @@ impl ReactWrapperReturnCollector {
                                     .values()
                                     .flat_map(|targets| targets.iter().cloned()),
                             );
+                            target.bound_unknown_params.extend(
+                                fixed_argument_params
+                                    .values()
+                                    .flat_map(|params| params.iter().copied()),
+                            );
+                            target
+                                .bound_unknown_params
+                                .extend(unknown_params.iter().copied());
                             target.bound_unknown_may_wrap |= !fixed_wrapper_arguments.is_empty();
                             return target;
                         }
@@ -7454,6 +7531,13 @@ impl ReactWrapperReturnCollector {
                                 .or_default()
                                 .extend(targets.iter().cloned());
                         }
+                        for (index, params) in &fixed_argument_params {
+                            target
+                                .bound_argument_params
+                                .entry(offset + index)
+                                .or_default()
+                                .extend(params.iter().copied());
+                        }
                         target
                             .bound_wrapper_arguments
                             .extend(fixed_wrapper_arguments.iter().map(|index| offset + index));
@@ -7462,6 +7546,7 @@ impl ReactWrapperReturnCollector {
                             target.bound_unknown_from = Some(target.bound_argument_count);
                             target.bound_unknown_may_wrap = unknown_may_wrap;
                             target.bound_unknown_targets = unknown_targets.clone();
+                            target.bound_unknown_params = unknown_params.clone();
                         }
                         target
                     })
@@ -13201,30 +13286,36 @@ impl SourceUsageCollector {
             resolution.indexes.extend(target_resolution.indexes);
             for (index, target_params) in target_resolution.parameters {
                 let mut concrete_wrapper = false;
-                let mapped = target_params
+                let mut forwarded_wrapper_params = BTreeSet::new();
+                let mut mapped = target_params
                     .into_iter()
                     .filter_map(|param_index| {
                         let mapped = argument_params.get(param_index).copied().flatten();
                         if mapped.is_none() {
                             concrete_wrapper |= wrapper_arguments.contains(&param_index);
                             if let Some(targets) = argument_targets.get(&param_index) {
-                                concrete_wrapper |= targets.iter().any(|target| {
-                                    self.resolved_wrapper_callable_target_at_depth(
-                                        target,
-                                        &resolution.definition_shadowed_bindings,
-                                        visited,
-                                    )
-                                    .is_some_and(
-                                        |resolution| {
-                                            resolution.direct || !resolution.indexes.is_empty()
-                                        },
-                                    )
-                                });
+                                for target in targets {
+                                    let Some(target_resolution) = self
+                                        .resolved_wrapper_callable_target_at_depth(
+                                            target,
+                                            &resolution.definition_shadowed_bindings,
+                                            visited,
+                                        )
+                                    else {
+                                        continue;
+                                    };
+                                    concrete_wrapper |= target_resolution.direct
+                                        || !target_resolution.indexes.is_empty();
+                                    forwarded_wrapper_params.extend(
+                                        target_resolution.parameters.values().flatten().copied(),
+                                    );
+                                }
                             }
                         }
                         mapped
                     })
                     .collect::<BTreeSet<_>>();
+                mapped.extend(forwarded_wrapper_params);
                 if concrete_wrapper {
                     resolution.indexes.insert(index);
                 }
@@ -13262,6 +13353,12 @@ impl SourceUsageCollector {
             for param in params {
                 if param < target.bound_argument_count {
                     wrapper_argument |= target.bound_wrapper_arguments.contains(&param);
+                    if let Some(params) = target.bound_argument_params.get(&param) {
+                        remaining
+                            .entry(index)
+                            .or_default()
+                            .extend(params.iter().copied());
+                    }
                     if let Some(targets) = target.bound_argument_targets.get(&param) {
                         wrapper_argument |= targets.iter().any(|target| {
                             self.resolved_wrapper_callable_target_at_depth(
@@ -13276,6 +13373,10 @@ impl SourceUsageCollector {
                     }
                 } else if target.bound_unknown_from.is_some_and(|from| param >= from) {
                     wrapper_argument |= target.bound_unknown_may_wrap;
+                    remaining
+                        .entry(index)
+                        .or_default()
+                        .extend(target.bound_unknown_params.iter().copied());
                     wrapper_argument |= target.bound_unknown_targets.iter().any(|target| {
                         self.resolved_wrapper_callable_target_at_depth(
                             target,
@@ -19346,9 +19447,14 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 self.hoisted_local_wrapper_resolutions(&case.consequent, &shadowed_bindings),
             );
         }
+        self.visit_expression(&statement.discriminant);
         self.pending_lexical_bindings = Some(bindings);
         self.pending_local_wrapper_resolutions = Some(resolutions);
-        walk::walk_switch_statement(self, statement);
+        self.enter_scope(ScopeFlags::empty(), &statement.scope_id);
+        for case in &statement.cases {
+            self.visit_switch_case(case);
+        }
+        self.leave_scope();
     }
 
     fn visit_ts_type_alias_declaration(&mut self, declaration: &TSTypeAliasDeclaration<'a>) {
@@ -24386,6 +24492,57 @@ mod tests {
     }
 
     #[test]
+    fn bound_wrapper_arguments_preserve_forwarder_parameter_origins() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function scope() {
+              const [nested] = await forward(useBaseValues);
+              nested[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward(factory) {
+                return outer(inner.bind(null, factory));
+              }
+            }
+            "#,
+        );
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 6));
+    }
+
+    #[test]
+    fn finite_bound_spreads_preserve_their_exact_wrapper_contents() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function scope() {
+              const [empty] = await emptyForward();
+              empty[0][0](emptyKey);
+              const [ordinary] = await ordinaryForward();
+              ordinary[0][0](ordinaryKey);
+              const [values] = await wrapperForward();
+              values[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function emptyForward() { return outer(inner.bind(null, ...[])); }
+              async function ordinaryForward() { return outer(inner.bind(null, ...[draw])); }
+              async function wrapperForward() { return outer(inner.bind(null, ...[useBaseValues])); }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(!lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&8), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&10), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
     fn block_inline_callbacks_do_not_imply_wrapper_returns() {
         let scan = scan(
             r#"
@@ -24432,6 +24589,38 @@ mod tests {
             function useBaseValues() { return useMemo(() => runtimeValues(), []); }
             async function scope() {
               switch (mode) {
+                default:
+                  async function forward() { return aggregate(useBaseValues); }
+                  const aggregate = async factory => Promise.all([factory(), draw]);
+                  const [values] = await forward();
+                  values[0](runtimeKey);
+              }
+            }
+            "#,
+        )
+        .expect("write main");
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 11));
+    }
+
+    #[test]
+    fn switch_metadata_survives_scoped_discriminant_expressions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper = dir.path().join("helper.ts");
+        let main = dir.path().join("main.ts");
+        fs::write(
+            &helper,
+            "export async function aggregate() { return [draw]; }",
+        )
+        .expect("write helper");
+        fs::write(
+            &main,
+            r#"
+            import {useMemo} from 'react';
+            import {aggregate} from './helper';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function scope() {
+              switch ((() => mode)()) {
                 default:
                   async function forward() { return aggregate(useBaseValues); }
                   const aggregate = async factory => Promise.all([factory(), draw]);
