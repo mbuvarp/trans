@@ -123,6 +123,7 @@ pub struct UsageScan {
     pub used_key_suffixes: BTreeSet<String>,
     pub dynamic_usages: Vec<DynamicUsage>,
     pub extraction_usages: Vec<String>,
+    message_value_reads: Vec<DynamicUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -546,6 +547,7 @@ enum ImportedName {
 enum NextIntlFactory {
     UseTranslations,
     GetTranslations,
+    CreateTranslator,
     UseMessages,
     GetMessages,
 }
@@ -555,6 +557,9 @@ impl NextIntlFactory {
         match (source, name) {
             ("next-intl", "useTranslations") => Some(Self::UseTranslations),
             ("next-intl/server", "getTranslations") => Some(Self::GetTranslations),
+            ("next-intl", "createTranslator") | ("use-intl/core", "createTranslator") => {
+                Some(Self::CreateTranslator)
+            }
             ("next-intl", "useMessages") => Some(Self::UseMessages),
             ("next-intl/server", "getMessages") => Some(Self::GetMessages),
             _ => None,
@@ -701,7 +706,25 @@ struct WorkspacePackage {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TsConfig {
+    #[serde(default)]
+    extends: Option<TsConfigExtends>,
     compiler_options: Option<TsCompilerOptions>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum TsConfigExtends {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl TsConfigExtends {
+    fn values(&self) -> Vec<&str> {
+        match self {
+            Self::One(value) => vec![value],
+            Self::Many(values) => values.iter().map(String::as_str).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1137,6 +1160,7 @@ fn find_unused_with_options(
     let primary = load_language_translations(root, config, &config.primary_language)?;
     let source_files = discover_source_files(root)?;
     let mut scan = collect_usage_from_files(root, &source_files)?;
+    protect_message_subtree_reads(&mut scan, primary.keys());
     let ts_checker_error = use_ts_checker
         .then(|| apply_ts_checker_fallback(root, &mut scan).err())
         .flatten();
@@ -1193,6 +1217,22 @@ fn find_unused_with_options(
         extraction_usage_detected: !scan.extraction_usages.is_empty(),
         ts_checker_failed: ts_checker_error.is_some(),
     })
+}
+
+fn protect_message_subtree_reads<'a>(
+    scan: &mut UsageScan,
+    message_ids: impl Iterator<Item = &'a String>,
+) {
+    let message_ids = message_ids.collect::<Vec<_>>();
+    scan.dynamic_usages.extend(
+        scan.message_value_reads
+            .iter()
+            .filter(|read| {
+                let prefix = format!("{}.", read.namespace);
+                message_ids.iter().any(|id| id.starts_with(&prefix))
+            })
+            .cloned(),
+    );
 }
 
 fn write_snapshot(root: &Path, config: &TransConfig, snapshot: &TranslationSnapshot) -> Result<()> {
@@ -1258,6 +1298,9 @@ fn merge_usage_scan(combined: &mut UsageScan, scan: UsageScan) {
     combined.used_key_suffixes.extend(scan.used_key_suffixes);
     combined.dynamic_usages.extend(scan.dynamic_usages);
     combined.extraction_usages.extend(scan.extraction_usages);
+    combined
+        .message_value_reads
+        .extend(scan.message_value_reads);
 }
 
 fn finish_usage_scan(mut scan: UsageScan) -> UsageScan {
@@ -4008,38 +4051,67 @@ impl PathAliases {
     fn load(root: &Path) -> Self {
         for file_name in ["tsconfig.json", "jsconfig.json"] {
             let path = root.join(file_name);
-            let Ok(contents) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let stripped = strip_json_comments(&contents);
-            let Ok(config) = serde_json::from_str::<TsConfig>(&stripped) else {
-                continue;
-            };
-            let Some(options) = config.compiler_options else {
-                return Self::default();
-            };
-
-            let base_url = options.base_url.map(|value| root.join(value));
-            let base = base_url.clone().unwrap_or_else(|| root.to_path_buf());
-            let mut paths = Vec::new();
-            if let Some(config_paths) = options.paths {
-                for (alias, targets) in config_paths {
-                    let (prefix, suffix) = split_alias_pattern(&alias);
-                    paths.push(PathAlias {
-                        prefix,
-                        suffix,
-                        targets: targets
-                            .into_iter()
-                            .map(|target| base.join(target).to_string_lossy().to_string())
-                            .collect(),
-                    });
-                }
+            if let Some(aliases) = Self::load_file(&path, &mut BTreeSet::new(), 0) {
+                return aliases;
             }
-
-            return Self { base_url, paths };
         }
 
         Self::default()
+    }
+
+    fn load_file(path: &Path, visited: &mut BTreeSet<PathBuf>, depth: usize) -> Option<Self> {
+        if depth > 16 {
+            return None;
+        }
+        let path = normalize_path(path);
+        if !visited.insert(path.clone()) {
+            return None;
+        }
+        let contents = fs::read_to_string(&path).ok()?;
+        let stripped = strip_json_comments(&contents);
+        let config = serde_json::from_str::<TsConfig>(&stripped).ok()?;
+        let directory = path.parent()?;
+        let mut aliases = Self::default();
+
+        if let Some(extensions) = &config.extends {
+            for extension in extensions.values() {
+                let Some(base_path) = resolve_extended_tsconfig(directory, extension) else {
+                    continue;
+                };
+                if let Some(base) = Self::load_file(&base_path, visited, depth + 1) {
+                    aliases = base;
+                }
+            }
+        }
+
+        if let Some(options) = config.compiler_options {
+            let declared_base_url = options
+                .base_url
+                .map(|base_url| normalize_path(&directory.join(base_url)));
+            if let Some(base_url) = &declared_base_url {
+                aliases.base_url = Some(base_url.clone());
+            }
+            if let Some(config_paths) = options.paths {
+                let base = declared_base_url.unwrap_or_else(|| directory.to_path_buf());
+                aliases.paths = config_paths
+                    .into_iter()
+                    .map(|(alias, targets)| {
+                        let (prefix, suffix) = split_alias_pattern(&alias);
+                        PathAlias {
+                            prefix,
+                            suffix,
+                            targets: targets
+                                .into_iter()
+                                .map(|target| base.join(target).to_string_lossy().to_string())
+                                .collect(),
+                        }
+                    })
+                    .collect();
+            }
+        }
+
+        visited.remove(&path);
+        Some(aliases)
     }
 
     fn expand(&self, source: &str) -> Vec<PathBuf> {
@@ -4065,6 +4137,27 @@ impl PathAliases {
 
         candidates
     }
+}
+
+fn resolve_extended_tsconfig(directory: &Path, extension: &str) -> Option<PathBuf> {
+    let base = if Path::new(extension).is_absolute() {
+        PathBuf::from(extension)
+    } else if extension.starts_with('.') {
+        directory.join(extension)
+    } else {
+        directory.ancestors().find_map(|ancestor| {
+            let candidate = ancestor.join("node_modules").join(extension);
+            candidate.exists().then_some(candidate)
+        })?
+    };
+
+    [
+        base.clone(),
+        PathBuf::from(format!("{}.json", base.to_string_lossy())),
+        base.join("tsconfig.json"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
 }
 
 impl WorkspacePackages {
@@ -4427,6 +4520,7 @@ struct SourceUsageCollector {
     file_index: Option<SourceFileIndex>,
     use_translations: BTreeSet<String>,
     get_translations: BTreeSet<String>,
+    create_translators: BTreeSet<String>,
     use_messages: BTreeSet<String>,
     get_messages: BTreeSet<String>,
     message_object_paths: BTreeMap<String, FiniteStrings>,
@@ -4489,6 +4583,7 @@ struct LocalWrapperResolution {
 struct BindingEnvironment {
     use_translations: BTreeSet<String>,
     get_translations: BTreeSet<String>,
+    create_translators: BTreeSet<String>,
     use_messages: BTreeSet<String>,
     get_messages: BTreeSet<String>,
     message_object_paths: BTreeMap<String, FiniteStrings>,
@@ -16469,6 +16564,16 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                     match specifier {
                         ImportDeclarationSpecifier::ImportSpecifier(specifier) => {
                             if let Some(imported) = module_export_name(&specifier.imported) {
+                                if matches!(
+                                    NextIntlFactory::direct(source, imported),
+                                    Some(
+                                        NextIntlFactory::UseTranslations
+                                            | NextIntlFactory::GetTranslations
+                                    )
+                                ) {
+                                    self.translation_factories
+                                        .insert(specifier.local.name.to_string());
+                                }
                                 self.imports.insert(
                                     specifier.local.name.to_string(),
                                     ImportTarget {
@@ -16620,7 +16725,7 @@ impl<'a> Visit<'a> for SourceIndexCollector {
             );
         }
         for (source, imported, local) in commonjs_declarator_imports(declarator) {
-            if source != "next-intl" && source != "next-intl/server" {
+            if source != "next-intl" && source != "next-intl/server" && source != "use-intl/core" {
                 continue;
             }
             match imported.as_deref() {
@@ -16630,8 +16735,11 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                 None if source == "next-intl" => {
                     self.next_intl_namespaces.insert(local);
                 }
-                None => {
+                None if source == "next-intl/server" => {
                     self.next_intl_server_namespaces.insert(local);
+                }
+                None => {
+                    self.namespace_imports.insert(local, source);
                 }
                 _ => {}
             }
@@ -17039,6 +17147,7 @@ impl SourceUsageCollector {
             .and_then(|project| project.files.get(path).cloned());
         let mut use_translations = BTreeSet::new();
         let mut get_translations = BTreeSet::new();
+        let mut create_translators = BTreeSet::new();
         let mut use_messages = BTreeSet::new();
         let mut get_messages = BTreeSet::new();
         if let (Some(project), Some(file)) = (project.as_ref(), file_index.as_ref()) {
@@ -17049,6 +17158,9 @@ impl SourceUsageCollector {
                     }
                     Some(NextIntlFactory::GetTranslations) => {
                         get_translations.insert(local.clone());
+                    }
+                    Some(NextIntlFactory::CreateTranslator) => {
+                        create_translators.insert(local.clone());
                     }
                     Some(NextIntlFactory::UseMessages) => {
                         use_messages.insert(local.clone());
@@ -17072,6 +17184,7 @@ impl SourceUsageCollector {
             file_index,
             use_translations,
             get_translations,
+            create_translators,
             use_messages,
             get_messages,
             message_object_paths: BTreeMap::new(),
@@ -17125,6 +17238,7 @@ impl SourceUsageCollector {
         BindingEnvironment {
             use_translations: self.use_translations.clone(),
             get_translations: self.get_translations.clone(),
+            create_translators: self.create_translators.clone(),
             use_messages: self.use_messages.clone(),
             get_messages: self.get_messages.clone(),
             message_object_paths: self.message_object_paths.clone(),
@@ -17167,6 +17281,7 @@ impl SourceUsageCollector {
     fn restore_binding_environment(&mut self, environment: BindingEnvironment) {
         self.use_translations = environment.use_translations;
         self.get_translations = environment.get_translations;
+        self.create_translators = environment.create_translators;
         self.use_messages = environment.use_messages;
         self.get_messages = environment.get_messages;
         self.message_object_paths = environment.message_object_paths;
@@ -17227,6 +17342,7 @@ impl SourceUsageCollector {
         self.finite_constants.remove(name);
         self.use_translations.remove(name);
         self.get_translations.remove(name);
+        self.create_translators.remove(name);
         self.use_messages.remove(name);
         self.get_messages.remove(name);
         self.message_object_paths.remove(name);
@@ -17849,6 +17965,9 @@ impl SourceUsageCollector {
             ("next-intl/server", "getTranslations") => {
                 self.get_translations.insert(local.to_string());
             }
+            ("next-intl", "createTranslator") | ("use-intl/core", "createTranslator") => {
+                self.create_translators.insert(local.to_string());
+            }
             ("next-intl", "useMessages") => {
                 self.use_messages.insert(local.to_string());
             }
@@ -18228,8 +18347,7 @@ impl SourceUsageCollector {
 
         match first {
             Argument::ObjectExpression(object) => {
-                let mut spread = false;
-                for property in &object.properties {
+                for property in object.properties.iter().rev() {
                     match property {
                         ObjectPropertyKind::ObjectProperty(property) => {
                             if property
@@ -18246,14 +18364,10 @@ impl SourceUsageCollector {
                                     .unwrap_or(NamespaceArg::Dynamic);
                             }
                         }
-                        ObjectPropertyKind::SpreadProperty(_) => spread = true,
+                        ObjectPropertyKind::SpreadProperty(_) => return NamespaceArg::Dynamic,
                     }
                 }
-                if spread {
-                    NamespaceArg::Dynamic
-                } else {
-                    NamespaceArg::Unscoped
-                }
+                NamespaceArg::Unscoped
             }
             _ => NamespaceArg::Dynamic,
         }
@@ -19657,7 +19771,11 @@ impl SourceUsageCollector {
     fn is_translation_factory_callee(&self, expression: &Expression<'_>) -> bool {
         matches!(
             self.next_intl_factory_callee(expression),
-            Some(NextIntlFactory::UseTranslations | NextIntlFactory::GetTranslations)
+            Some(
+                NextIntlFactory::UseTranslations
+                    | NextIntlFactory::GetTranslations
+                    | NextIntlFactory::CreateTranslator
+            )
         )
     }
 
@@ -19676,6 +19794,9 @@ impl SourceUsageCollector {
             if self.get_translations.contains(callee) {
                 return Some(NextIntlFactory::GetTranslations);
             }
+            if self.create_translators.contains(callee) {
+                return Some(NextIntlFactory::CreateTranslator);
+            }
             if self.use_messages.contains(callee) {
                 return Some(NextIntlFactory::UseMessages);
             }
@@ -19693,6 +19814,9 @@ impl SourceUsageCollector {
             }
             "useMessages" if self.next_intl_namespaces.contains(object.name.as_str()) => {
                 Some(NextIntlFactory::UseMessages)
+            }
+            "createTranslator" if self.next_intl_namespaces.contains(object.name.as_str()) => {
+                Some(NextIntlFactory::CreateTranslator)
             }
             "getTranslations"
                 if self
@@ -19798,15 +19922,43 @@ impl SourceUsageCollector {
         }
     }
 
-    fn record_message_member_paths(&mut self, paths: FiniteStrings) {
-        self.scan
-            .used_ids
-            .extend(paths.into_iter().filter(|path| !path.is_empty()));
+    fn record_message_member_paths(&mut self, paths: FiniteStrings, start: u32) {
+        for path in paths.into_iter().filter(|path| !path.is_empty()) {
+            self.scan.used_ids.insert(path.clone());
+            self.scan.message_value_reads.push(DynamicUsage {
+                namespace: path,
+                namespace_unknown: false,
+                path: self.path.clone(),
+                line: self.line_number(start),
+                possible_keys: None,
+                key_start: None,
+                key_end: None,
+            });
+        }
     }
 
     fn record_dynamic_message_prefixes(&mut self, prefixes: FiniteStrings, start: u32) {
         for prefix in prefixes {
             self.record_dynamic_usage((!prefix.is_empty()).then_some(prefix.as_str()), start);
+        }
+    }
+
+    fn record_create_translator_usage(&mut self, call: &CallExpression<'_>) {
+        if self.next_intl_factory_callee(&call.callee) != Some(NextIntlFactory::CreateTranslator) {
+            return;
+        }
+        match self.call_namespace(call) {
+            NamespaceArg::Scoped(namespace) => {
+                self.record_dynamic_usage(Some(&namespace), call.span.start);
+            }
+            NamespaceArg::Finite(namespaces) => {
+                for namespace in namespaces {
+                    self.record_dynamic_usage(Some(&namespace), call.span.start);
+                }
+            }
+            NamespaceArg::Unscoped | NamespaceArg::Dynamic => {
+                self.record_dynamic_usage(None, call.span.start);
+            }
         }
     }
 
@@ -21465,10 +21617,22 @@ impl SourceUsageCollector {
     }
 
     fn maybe_extraction_call(&self, call: &CallExpression<'_>) -> bool {
-        let Some(callee) = self.callee_identifier(&call.callee) else {
+        if let Some(callee) = self.callee_identifier(&call.callee) {
+            return self.use_extracted.contains(callee) || self.get_extracted.contains(callee);
+        }
+        let Some(member) = call.callee.get_member_expr() else {
             return false;
         };
-        self.use_extracted.contains(callee) || self.get_extracted.contains(callee)
+        let Some(object) = member.object().get_identifier_reference() else {
+            return false;
+        };
+        match member.static_property_name().as_deref() {
+            Some("useExtracted") => self.next_intl_namespaces.contains(object.name.as_str()),
+            Some("getExtracted") => self
+                .next_intl_server_namespaces
+                .contains(object.name.as_str()),
+            _ => false,
+        }
     }
 
     fn return_helper_for_callee(&self, expression: &Expression<'_>) -> Option<FiniteStrings> {
@@ -23875,7 +24039,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
 
     fn visit_import_declaration(&mut self, declaration: &ImportDeclaration<'a>) {
         let source = declaration.source.value.as_str();
-        if source == "next-intl" || source == "next-intl/server" {
+        if source == "next-intl" || source == "next-intl/server" || source == "use-intl/core" {
             if let Some(specifiers) = &declaration.specifiers {
                 for specifier in specifiers {
                     match specifier {
@@ -23896,7 +24060,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                             let local = specifier.local.name.to_string();
                             if source == "next-intl" {
                                 self.next_intl_namespaces.insert(local);
-                            } else {
+                            } else if source == "next-intl/server" {
                                 self.next_intl_server_namespaces.insert(local);
                             }
                         }
@@ -24218,7 +24382,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             self.register_local_wrapper_resolution(name, resolution);
         }
         for (source, imported, local) in commonjs_declarator_imports(declarator) {
-            if source != "next-intl" && source != "next-intl/server" {
+            if source != "next-intl" && source != "next-intl/server" && source != "use-intl/core" {
                 continue;
             }
             match imported {
@@ -24226,9 +24390,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 None if source == "next-intl" => {
                     self.next_intl_namespaces.insert(local);
                 }
-                None => {
+                None if source == "next-intl/server" => {
                     self.next_intl_server_namespaces.insert(local);
                 }
+                None => {}
             }
         }
         self.track_destructured_translator_bindings(&declarator.id);
@@ -24582,6 +24747,8 @@ impl<'a> Visit<'a> for SourceUsageCollector {
 
         self.invalidate_escaped_translator_argument_arrays(call);
 
+        self.record_create_translator_usage(call);
+
         if self.maybe_extraction_call(call) {
             self.record_extraction_usage();
         }
@@ -24738,7 +24905,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     .into_iter()
                     .map(|path| join_message_path(&path, member.property.name.as_str()))
                     .collect();
-                self.record_message_member_paths(paths);
+                self.record_message_member_paths(paths, member.span.start);
                 self.cover_message_member_span(member.span.start, member.span.end);
             } else if let Some(prefixes) =
                 self.dynamic_message_prefixes_from_expression(&member.object)
@@ -24762,7 +24929,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                                 .map(move |property| join_message_path(&prefix, property))
                         })
                         .collect();
-                    self.record_message_member_paths(paths);
+                    self.record_message_member_paths(paths, member.span.start);
                 } else {
                     self.record_dynamic_message_prefixes(prefixes, member.span.start);
                 }
@@ -25308,6 +25475,152 @@ mod tests {
         assert!(surrounded.matches("common.nested.dialog.title"));
         assert!(!surrounded.matches("prefix.common.dialog.title"));
         assert!(!surrounded.matches("common.dialog.title.trailing"));
+    }
+
+    #[test]
+    fn resolves_aliases_from_extended_tsconfig() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("src/components")).expect("create source directory");
+        fs::write(
+            dir.path().join("tsconfig.base.json"),
+            r#"{
+              "compilerOptions": {
+                "baseUrl": ".",
+                "paths": {"@/*": ["src/*"]}
+              }
+            }"#,
+        )
+        .expect("write base config");
+        fs::write(
+            dir.path().join("tsconfig.json"),
+            r#"{"extends": "./tsconfig.base"}"#,
+        )
+        .expect("write child config");
+
+        let aliases = PathAliases::load(dir.path());
+        assert_eq!(
+            aliases.expand("@/components/Card"),
+            vec![dir.path().join("src/components/Card")]
+        );
+    }
+
+    #[test]
+    fn child_tsconfig_paths_stay_relative_to_the_child_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let package = dir.path().join("node_modules/@config/next");
+        fs::create_dir_all(&package).expect("create config package");
+        fs::write(
+            package.join("tsconfig.json"),
+            r#"{"compilerOptions": {"baseUrl": "."}}"#,
+        )
+        .expect("write package config");
+        fs::write(
+            dir.path().join("tsconfig.json"),
+            r#"{
+              "extends": "@config/next",
+              "compilerOptions": {"paths": {"@/*": ["./src/*"]}}
+            }"#,
+        )
+        .expect("write child config");
+
+        let aliases = PathAliases::load(dir.path());
+        assert_eq!(
+            aliases.expand("@/components/Card"),
+            vec![dir.path().join("src/components/Card")]
+        );
+    }
+
+    #[test]
+    fn recognizes_core_create_translator() {
+        let direct_scan = scan(
+            r#"
+            import {createTranslator} from 'use-intl/core';
+            const t = createTranslator({locale, messages, namespace: 'common'});
+            t(runtimeKey);
+            "#,
+        );
+
+        assert!(
+            direct_scan
+                .dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+
+        let finite_scan = scan(
+            r#"
+            import {createTranslator} from 'next-intl';
+            function createEmailTranslator(namespace: 'invite' | 'password') {
+              return createTranslator({locale, messages, namespace});
+            }
+            "#,
+        );
+        let namespaces = finite_scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.namespace.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(namespaces, BTreeSet::from(["invite", "password"]));
+    }
+
+    #[test]
+    fn later_namespace_spreads_make_factories_dynamic() {
+        let scan = scan(
+            r#"
+            import {getTranslations} from 'next-intl/server';
+            const t = await getTranslations({namespace: 'Admin', ...opts});
+            t('title');
+            "#,
+        );
+
+        assert!(!scan.used_ids.contains("Admin.title"));
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace.is_empty())
+        );
+    }
+
+    #[test]
+    fn detects_namespace_imported_extraction_usage() {
+        let scan = scan(
+            r#"
+            import * as intl from 'next-intl';
+            import * as server from 'next-intl/server';
+            intl.useExtracted();
+            await server.getExtracted();
+            "#,
+        );
+
+        assert_eq!(scan.extraction_usages.len(), 2);
+    }
+
+    #[test]
+    fn message_object_reads_protect_known_subtrees() {
+        let mut scan = scan(
+            r#"
+            import {useMessages} from 'next-intl';
+            const messages = useMessages();
+            Object.values(messages.Navigation);
+            render(messages.Footer.copy);
+            "#,
+        );
+        let ids = BTreeMap::from([
+            ("Navigation.title".to_string(), String::new()),
+            ("Navigation.copy".to_string(), String::new()),
+            ("Footer.copy".to_string(), String::new()),
+            ("Footer.copyright.year".to_string(), String::new()),
+        ]);
+        protect_message_subtree_reads(&mut scan, ids.keys());
+
+        assert!(is_dynamic_protected(
+            "Navigation.title",
+            &scan.dynamic_usages
+        ));
+        assert!(!is_dynamic_protected(
+            "Footer.copyright.year",
+            &scan.dynamic_usages
+        ));
     }
 
     #[test]
