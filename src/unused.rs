@@ -430,6 +430,7 @@ struct WrapperBoundCall {
     namespace: Option<String>,
     name: String,
     arguments: Vec<BTreeSet<TranslatorReturnForward>>,
+    unknown_layout: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2718,43 +2719,53 @@ impl ProjectIndex {
                     )
                 };
                 for (index, params) in parameter_indexes {
-                    if params.into_iter().any(|param| {
-                        bound.arguments.get(param).is_some_and(|forwards| {
-                            forwards.iter().any(|forward| match forward {
-                                TranslatorReturnForward::Local(name)
-                                | TranslatorReturnForward::ForwardCall {
-                                    namespace: None,
-                                    name,
-                                    ..
-                                } => {
-                                    self.wrapper_return_for_local_at_depth(path, name, depth + 1)
-                                        || file.imports.get(name).is_some_and(|target| {
+                    if bound.unknown_layout
+                        || params.into_iter().any(|param| {
+                            bound.arguments.get(param).is_some_and(|forwards| {
+                                forwards.iter().any(|forward| match forward {
+                                    TranslatorReturnForward::Local(name)
+                                    | TranslatorReturnForward::ForwardCall {
+                                        namespace: None,
+                                        name,
+                                        ..
+                                    } => {
+                                        self.wrapper_return_for_local_at_depth(
+                                            path,
+                                            name,
+                                            depth + 1,
+                                        ) || file.imports.get(name).is_some_and(|target| {
                                             self.wrapper_return_for_import_at_depth(
                                                 path,
                                                 target,
                                                 depth + 1,
                                             )
                                         })
-                                }
-                                TranslatorReturnForward::NamespaceMember { namespace, name }
-                                | TranslatorReturnForward::ForwardCall {
-                                    namespace: Some(namespace),
-                                    name,
-                                    ..
-                                } => file.namespace_imports.get(namespace).is_some_and(|source| {
-                                    self.wrapper_return_for_import_at_depth(
-                                        path,
-                                        &ImportTarget {
-                                            source: source.clone(),
-                                            imported: ImportedName::Named(name.clone()),
+                                    }
+                                    TranslatorReturnForward::NamespaceMember {
+                                        namespace,
+                                        name,
+                                    }
+                                    | TranslatorReturnForward::ForwardCall {
+                                        namespace: Some(namespace),
+                                        name,
+                                        ..
+                                    } => file.namespace_imports.get(namespace).is_some_and(
+                                        |source| {
+                                            self.wrapper_return_for_import_at_depth(
+                                                path,
+                                                &ImportTarget {
+                                                    source: source.clone(),
+                                                    imported: ImportedName::Named(name.clone()),
+                                                },
+                                                depth + 1,
+                                            )
                                         },
-                                        depth + 1,
-                                    )
-                                }),
-                                TranslatorReturnForward::ParameterCall { .. } => false,
+                                    ),
+                                    TranslatorReturnForward::ParameterCall { .. } => false,
+                                })
                             })
                         })
-                    }) {
+                    {
                         indexes.insert(index);
                     }
                 }
@@ -2927,6 +2938,9 @@ impl ProjectIndex {
             .collect::<BTreeMap<_, _>>();
         if let Some(bound_calls) = file.wrapper_bound_calls.get(name) {
             for bound in bound_calls {
+                if bound.unknown_layout {
+                    continue;
+                }
                 let resolved = if let Some(namespace) = &bound.namespace {
                     file.namespace_imports
                         .get(namespace)
@@ -11021,6 +11035,11 @@ impl SourceIndexCollector {
                         .unwrap_or_default()
                 })
                 .collect(),
+            unknown_layout: call
+                .arguments
+                .iter()
+                .skip(1)
+                .any(|argument| matches!(argument, Argument::SpreadElement(_))),
         });
         if namespace.is_some() {
             return summary;
@@ -11817,7 +11836,7 @@ impl<'a> Visit<'a> for SourceIndexCollector {
         if self.scope_depth == 1 {
             self.module_bindings.insert(identifier.name.to_string());
         }
-        if self.pending_var_bindings.contains(identifier.name.as_str()) {
+        if self.pending_var_bindings.remove(identifier.name.as_str()) {
             let owner = self
                 .scope_is_function
                 .iter()
@@ -13532,6 +13551,13 @@ impl SourceUsageCollector {
         let Expression::CallExpression(call) = expression else {
             return None;
         };
+        self.potential_wrapper_array_indexes_for_call(call)
+    }
+
+    fn potential_wrapper_array_indexes_for_call(
+        &self,
+        call: &CallExpression<'_>,
+    ) -> Option<BTreeSet<usize>> {
         if let Some(identifier) = call.callee.get_identifier_reference()
             && let (Some(project), Some(file)) = (&self.project, &self.file_index)
         {
@@ -13795,7 +13821,7 @@ impl SourceUsageCollector {
                 &finite_string(member.property.name.to_string()),
             ),
             Expression::ComputedMemberExpression(member) => self
-                .finite_strings_from_expression(&member.expression)
+                .finite_wrapper_properties_from_expression(&member.expression)
                 .map(|properties| {
                     self.potential_wrapper_subobject_paths(&member.object, &properties)
                 })
@@ -13812,6 +13838,14 @@ impl SourceUsageCollector {
                         included: BTreeSet::from(["1".to_string()]),
                         excluded: BTreeSet::new(),
                     }
+                } else if let Some(indexes) = self.potential_wrapper_array_indexes_for_call(call) {
+                    PotentialWrapperPaths {
+                        included: indexes
+                            .into_iter()
+                            .flat_map(|index| [index.to_string(), format!("{index}.*")])
+                            .collect(),
+                        excluded: BTreeSet::new(),
+                    }
                 } else {
                     self.object_assign_wrapper_paths(call)
                         .map(|(paths, _)| paths)
@@ -13820,6 +13854,18 @@ impl SourceUsageCollector {
             }
             _ => PotentialWrapperPaths::default(),
         }
+    }
+
+    fn finite_wrapper_properties_from_expression(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<FiniteStrings> {
+        self.finite_strings_from_expression(expression).or_else(|| {
+            let Expression::NumericLiteral(literal) = expression.get_inner_expression() else {
+                return None;
+            };
+            Some(finite_string(literal.value.to_string()))
+        })
     }
 
     fn potential_wrapper_subobject_paths(
@@ -13877,7 +13923,7 @@ impl SourceUsageCollector {
     ) -> bool {
         let paths = self.potential_wrapper_callable_paths_from_expression(&member.object);
         let path_matches = self
-            .finite_strings_from_expression(&member.expression)
+            .finite_wrapper_properties_from_expression(&member.expression)
             .map_or_else(
                 || paths.included.iter().any(|path| !path.contains('.')),
                 |properties| properties.iter().any(|property| paths.contains(property)),
@@ -22754,6 +22800,52 @@ mod tests {
     }
 
     #[test]
+    fn spread_bound_arguments_do_not_assume_positional_parameter_indexes() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            const args = [useBaseValues];
+            const bound = aggregate.bind(null, ...args);
+            const [values, cleanup] = await bound();
+            values[0](runtimeKey);
+            cleanup('layer');
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&8), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&9), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn whole_aggregate_results_preserve_wrapper_array_indexes() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            const result = await aggregate(useBaseValues);
+            result[0](directKey);
+            result[0][0](runtimeKey);
+            result[1]('layer');
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&7), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&8), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
     fn shadowed_assignments_do_not_update_module_aliases() {
         let scan = scan(
             r#"
@@ -22764,6 +22856,25 @@ mod tests {
             function mutate(alias) { alias = aggregate; }
             mutate(draw);
             const [value] = await alias(useBaseValues);
+            value[0]('ordinary');
+            "#,
+        );
+        assert!(scan.dynamic_usages.is_empty(), "{:#?}", scan.dynamic_usages);
+    }
+
+    #[test]
+    fn nested_initializer_bindings_do_not_consume_outer_var_hoists() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            var holder = (() => {
+              let holder;
+              holder = aggregate;
+              return draw;
+            })();
+            const [value] = await holder(useBaseValues);
             value[0]('ordinary');
             "#,
         );
