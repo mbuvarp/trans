@@ -430,7 +430,14 @@ struct WrapperBoundCall {
     namespace: Option<String>,
     name: String,
     arguments: Vec<BTreeSet<TranslatorReturnForward>>,
-    unknown_layout: bool,
+    unknown_from: Option<usize>,
+}
+
+fn bind_unknown_parameter_from(arguments: &[Argument<'_>]) -> Option<usize> {
+    arguments
+        .iter()
+        .position(|argument| matches!(argument, Argument::SpreadElement(_)))
+        .map(|index| index.saturating_sub(1))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2719,7 +2726,9 @@ impl ProjectIndex {
                     )
                 };
                 for (index, params) in parameter_indexes {
-                    if bound.unknown_layout
+                    if bound
+                        .unknown_from
+                        .is_some_and(|from| params.iter().any(|param| *param >= from))
                         || params.into_iter().any(|param| {
                             bound.arguments.get(param).is_some_and(|forwards| {
                                 forwards.iter().any(|forward| match forward {
@@ -2938,7 +2947,7 @@ impl ProjectIndex {
             .collect::<BTreeMap<_, _>>();
         if let Some(bound_calls) = file.wrapper_bound_calls.get(name) {
             for bound in bound_calls {
-                if bound.unknown_layout {
+                if bound.unknown_from.is_some() {
                     continue;
                 }
                 let resolved = if let Some(namespace) = &bound.namespace {
@@ -11021,10 +11030,7 @@ impl SourceIndexCollector {
         } else {
             return summary;
         };
-        let unknown_layout = call
-            .arguments
-            .iter()
-            .any(|argument| matches!(argument, Argument::SpreadElement(_)));
+        let unknown_from = bind_unknown_parameter_from(&call.arguments);
         summary.bound_calls.push(WrapperBoundCall {
             namespace: namespace.clone(),
             name: target.clone(),
@@ -11039,7 +11045,7 @@ impl SourceIndexCollector {
                         .unwrap_or_default()
                 })
                 .collect(),
-            unknown_layout,
+            unknown_from,
         });
         if namespace.is_some() {
             return summary;
@@ -11848,7 +11854,7 @@ impl<'a> Visit<'a> for SourceIndexCollector {
         } else if let Some(bindings) = self.scope_binding_names.last_mut() {
             bindings.insert(identifier.name.to_string());
         }
-        if matches!(identifier.name.as_str(), "Object" | "Promise") {
+        if matches!(identifier.name.as_str(), "Object" | "Promise" | "Reflect") {
             self.shadowed_builtins.insert(identifier.name.to_string());
         }
     }
@@ -13560,16 +13566,29 @@ impl SourceUsageCollector {
     ) -> Option<BTreeSet<usize>> {
         let mut target = &call.callee;
         let mut argument_offset = 0;
-        let mut apply = false;
+        let mut apply_arguments_index = None;
         if let Some(member) = call.callee.get_member_expr() {
-            match member.static_property_name() {
-                Some("call") => {
+            let reflect_apply = member.static_property_name() == Some("apply")
+                && member
+                    .object()
+                    .get_identifier_reference()
+                    .is_some_and(|identifier| identifier.name == "Reflect")
+                && self
+                    .file_index
+                    .as_ref()
+                    .is_none_or(|file| !file.shadowed_builtins.contains("Reflect"));
+            match (reflect_apply, member.static_property_name()) {
+                (true, _) => {
+                    target = call.arguments.first().and_then(Argument::as_expression)?;
+                    apply_arguments_index = Some(2);
+                }
+                (false, Some("call")) => {
                     target = member.object();
                     argument_offset = 1;
                 }
-                Some("apply") => {
+                (false, Some("apply")) => {
                     target = member.object();
-                    apply = true;
+                    apply_arguments_index = Some(1);
                 }
                 _ => {}
             }
@@ -13577,46 +13596,44 @@ impl SourceUsageCollector {
         if let Some((mut indexes, parameter_indexes)) =
             self.wrapper_array_resolution_for_callee(target)
         {
-            let unknown_layout = call
-                .arguments
-                .iter()
-                .any(|argument| matches!(argument, Argument::SpreadElement(_)));
             for (index, params) in parameter_indexes {
-                let wrapper_argument = if unknown_layout {
-                    true
-                } else if apply {
-                    match call
-                        .arguments
-                        .get(1)
-                        .and_then(Argument::as_expression)
-                        .map(Expression::get_inner_expression)
-                    {
-                        Some(Expression::ArrayExpression(arguments))
-                            if !arguments.elements.iter().any(|argument| {
-                                matches!(argument, ArrayExpressionElement::SpreadElement(_))
-                            }) =>
+                let wrapper_argument = if let Some(arguments_index) = apply_arguments_index {
+                    if call.arguments.iter().enumerate().any(|(index, argument)| {
+                        index <= arguments_index && matches!(argument, Argument::SpreadElement(_))
+                    }) {
+                        true
+                    } else {
+                        match call
+                            .arguments
+                            .get(arguments_index)
+                            .and_then(Argument::as_expression)
+                            .map(Expression::get_inner_expression)
                         {
-                            params.into_iter().any(|param_index| {
-                                arguments
-                                    .elements
-                                    .get(param_index)
-                                    .and_then(ArrayExpressionElement::as_expression)
-                                    .is_some_and(|argument| {
-                                        self.expression_is_wrapper_returning_callable(argument)
-                                    })
-                            })
+                            Some(Expression::ArrayExpression(arguments))
+                                if !arguments.elements.iter().any(|argument| {
+                                    matches!(argument, ArrayExpressionElement::SpreadElement(_))
+                                }) =>
+                            {
+                                params.into_iter().any(|param_index| {
+                                    arguments
+                                        .elements
+                                        .get(param_index)
+                                        .and_then(ArrayExpressionElement::as_expression)
+                                        .is_some_and(|argument| {
+                                            self.expression_is_wrapper_returning_callable(argument)
+                                        })
+                                })
+                            }
+                            Some(_) => true,
+                            None => false,
                         }
-                        Some(_) => true,
-                        None => false,
                     }
                 } else {
                     params.into_iter().any(|param_index| {
-                        call.arguments
-                            .get(param_index + argument_offset)
-                            .and_then(Argument::as_expression)
-                            .is_some_and(|argument| {
-                                self.expression_is_wrapper_returning_callable(argument)
-                            })
+                        self.invocation_parameter_may_be_wrapper(
+                            &call.arguments,
+                            param_index + argument_offset,
+                        )
                     })
                 };
                 if wrapper_argument {
@@ -13663,6 +13680,42 @@ impl SourceUsageCollector {
         &self,
         callee: &Expression<'_>,
     ) -> Option<(BTreeSet<usize>, BTreeMap<usize, BTreeSet<usize>>)> {
+        if let Expression::CallExpression(bind) = callee.get_inner_expression()
+            && let Some(member) = bind.callee.get_member_expr()
+            && member.static_property_name() == Some("bind")
+        {
+            let (mut indexes, parameter_indexes) =
+                self.wrapper_array_resolution_for_callee(member.object())?;
+            let unknown_from = bind_unknown_parameter_from(&bind.arguments);
+            let bound_count = bind.arguments.len().saturating_sub(1);
+            let mut remaining = BTreeMap::<usize, BTreeSet<usize>>::new();
+            for (index, params) in parameter_indexes {
+                let wrapper_argument = params.iter().any(|param_index| {
+                    unknown_from.is_some_and(|from| *param_index >= from)
+                        || bind
+                            .arguments
+                            .get(param_index + 1)
+                            .and_then(Argument::as_expression)
+                            .is_some_and(|argument| {
+                                self.expression_is_wrapper_returning_callable(argument)
+                            })
+                });
+                if wrapper_argument {
+                    indexes.insert(index);
+                }
+                if unknown_from.is_none() {
+                    remaining.insert(
+                        index,
+                        params
+                            .into_iter()
+                            .filter(|param_index| *param_index >= bound_count)
+                            .map(|param_index| param_index - bound_count)
+                            .collect(),
+                    );
+                }
+            }
+            return Some((indexes, remaining));
+        }
         let (project, file) = (self.project.as_ref()?, self.file_index.as_ref()?);
         if let Some(identifier) = callee.get_identifier_reference() {
             let name = identifier.name.as_str();
@@ -13695,6 +13748,27 @@ impl SourceUsageCollector {
                 .unwrap_or_default(),
             project.wrapper_array_parameter_indexes_for_import(&self.path, &target),
         ))
+    }
+
+    fn invocation_parameter_may_be_wrapper(
+        &self,
+        arguments: &[Argument<'_>],
+        position: usize,
+    ) -> bool {
+        for (index, argument) in arguments.iter().enumerate() {
+            if index > position {
+                return false;
+            }
+            if matches!(argument, Argument::SpreadElement(_)) {
+                return true;
+            }
+            if index == position {
+                return argument.as_expression().is_some_and(|argument| {
+                    self.expression_is_wrapper_returning_callable(argument)
+                });
+            }
+        }
+        false
     }
 
     fn expression_is_wrapper_returning_callable(&self, expression: &Expression<'_>) -> bool {
@@ -22962,6 +23036,76 @@ mod tests {
         assert!(!lines.contains(&7), "dynamic lines: {lines:?}");
         assert!(lines.contains(&9), "dynamic lines: {lines:?}");
         assert!(!lines.contains(&10), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn inline_bind_invocations_preserve_wrapper_parameter_indexes() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            const [fixed, fixedCleanup] = await aggregate.bind(null, useBaseValues)();
+            fixed[0](fixedKey);
+            fixedCleanup('fixed-layer');
+            const partialResult = await aggregate.bind(null)(useBaseValues);
+            partialResult[0][0](partialKey);
+            partialResult[1]('partial-layer');
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&7), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&9), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&10), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn reflect_apply_preserves_wrapper_parameter_indexes() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            const result = await Reflect.apply(aggregate, null, [useBaseValues]);
+            result[0][0](runtimeKey);
+            result[1]('layer');
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&7), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn spreads_after_fixed_parameters_do_not_promote_earlier_indexes() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory, options) { return Promise.all([factory(), draw]); }
+            const [direct] = await aggregate(draw, ...runtimeOptions);
+            direct[0]('direct-ordinary');
+            const bound = aggregate.bind(null, draw, ...runtimeOptions);
+            const [indirect] = await bound();
+            indirect[0]('bound-ordinary');
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(!lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&9), "dynamic lines: {lines:?}");
     }
 
     #[test]
