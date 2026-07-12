@@ -12,7 +12,7 @@ use oxc_ast::ast::{
     AssignmentExpression, AssignmentTarget, AssignmentTargetMaybeDefault, AssignmentTargetProperty,
     AwaitExpression, BinaryExpression, BindingIdentifier, BindingPattern, BlockStatement,
     CallExpression, CatchParameter, Class, ClassType, ComputedMemberExpression,
-    ConditionalExpression, Declaration, ExportAllDeclaration, ExportDefaultDeclaration,
+    ConditionalExpression, Declaration, Decorator, ExportAllDeclaration, ExportDefaultDeclaration,
     ExportDefaultDeclarationKind, ExportNamedDeclaration, Expression, ForOfStatement,
     ForStatementLeft, Function, FunctionBody, FunctionType, IdentifierReference, ImportDeclaration,
     ImportDeclarationSpecifier, ImportExpression, JSXAttributeItem, JSXAttributeName,
@@ -7441,6 +7441,29 @@ impl ReactWrapperReturnCollector {
         collector.captures
     }
 
+    fn finite_bound_parameter_default_captures(
+        params: &oxc_ast::ast::FormalParameters<'_>,
+    ) -> BTreeMap<String, BTreeSet<String>> {
+        let mut captures = BTreeMap::<String, BTreeSet<String>>::new();
+        for param in &params.items {
+            let mut collector = FiniteBoundCaptureNameCollector::default();
+            collector.visit_binding_pattern(&param.pattern);
+            if let Some(initializer) = &param.initializer {
+                collector.visit_expression(initializer);
+            }
+            if collector.names.is_empty() {
+                continue;
+            }
+            for identifier in param.pattern.get_binding_identifiers() {
+                captures
+                    .entry(identifier.name.to_string())
+                    .or_default()
+                    .extend(collector.names.iter().cloned());
+            }
+        }
+        captures
+    }
+
     fn set_finite_bound_capture_declaration(
         &mut self,
         name: &str,
@@ -9161,14 +9184,6 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         let captures = self
             .finite_bound_capture_names_from_expression(&statement.right)
             .unwrap_or_default();
-        let mut iteration_provenance = BTreeSet::new();
-        if !self.finite_bound_expression_is_known_array(&statement.right) {
-            iteration_provenance.extend(self.finite_bound_argument_provenance(&statement.right));
-        }
-        if statement.r#await {
-            iteration_provenance.extend(self.finite_bound_capture_provenance(&captures));
-        }
-        self.invalidate_finite_bound_argument_provenance(iteration_provenance);
         let disposes_iteration_values = matches!(
             &statement.left,
             ForStatementLeft::VariableDeclaration(declaration)
@@ -9177,6 +9192,17 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                     VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing
                 )
         );
+        let mut iteration_provenance = BTreeSet::new();
+        if !self.finite_bound_expression_is_known_array(&statement.right) {
+            iteration_provenance.extend(self.finite_bound_argument_provenance(&statement.right));
+        }
+        if statement.r#await {
+            iteration_provenance.extend(self.finite_bound_capture_provenance(&captures));
+        }
+        if disposes_iteration_values {
+            iteration_provenance.extend(self.finite_bound_capture_provenance(&captures));
+        }
+        self.invalidate_finite_bound_argument_provenance(iteration_provenance);
         let alias_sources = Self::finite_bound_capture_alias_sources(&statement.right);
         let previous = names
             .iter()
@@ -9496,8 +9522,9 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         ) {
             let provenance = self.finite_bound_argument_provenance(init);
             if let Some(scope) = self.finite_bound_argument_scopes.last_mut() {
-                scope.disposal_provenance.extend(provenance);
+                scope.disposal_provenance.extend(provenance.iter().copied());
             }
+            self.invalidate_finite_bound_argument_provenance(provenance);
         }
         let wrapper = self.expression_returns_wrapper(init);
         let forwards = self.forwards_from_expression(init);
@@ -9933,6 +9960,16 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         self.invalidate_finite_bound_argument_provenance(provenance);
     }
 
+    fn visit_decorator(&mut self, decorator: &Decorator<'a>) {
+        walk::walk_decorator(self, decorator);
+        let captures = self
+            .finite_bound_capture_names_from_expression(&decorator.expression)
+            .unwrap_or_default();
+        self.record_escaped_finite_bound_captures(captures);
+        let provenance = self.finite_bound_argument_provenance(&decorator.expression);
+        self.invalidate_finite_bound_argument_provenance(provenance);
+    }
+
     fn visit_class(&mut self, class: &Class<'a>) {
         if class.r#type == ClassType::ClassDeclaration
             && let Some(identifier) = &class.id
@@ -9953,6 +9990,16 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 identifier.name.as_str(),
                 Some(Self::finite_bound_function_capture_names(function)),
             );
+        }
+        for parameter in &function.params.items {
+            for decorator in &parameter.decorators {
+                self.visit_decorator(decorator);
+            }
+        }
+        if let Some(rest) = &function.params.rest {
+            for decorator in &rest.decorators {
+                self.visit_decorator(decorator);
+            }
         }
     }
 
@@ -12800,8 +12847,16 @@ impl SourceIndexCollector {
             namespaces.remove(&name);
             transparent_namespaces.remove(&name);
         }
-        let finite_bound_capture_callables =
+        let mut finite_bound_capture_callables =
             ReactWrapperReturnCollector::finite_bound_function_declaration_captures(body);
+        for (name, captures) in
+            ReactWrapperReturnCollector::finite_bound_parameter_default_captures(params)
+        {
+            finite_bound_capture_callables
+                .entry(name)
+                .or_default()
+                .extend(captures);
+        }
         ReactWrapperReturnCollector {
             memo_identifiers,
             state_identifiers,
@@ -27933,6 +27988,121 @@ mod tests {
                 "missing line {line}; dynamic lines: {lines:?}"
             );
         }
+    }
+
+    #[test]
+    fn using_acquisition_invalidates_before_the_resource_scope_body() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              const [iterated] = await iterationForward();
+              iterated[0][0](iterationKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const args = [draw];
+                {
+                  using resource = {
+                    get [Symbol.dispose]() {
+                      args[0] = runtimeFactory;
+                      return () => {};
+                    }
+                  };
+                  return outer(inner.bind(null, ...args));
+                }
+              }
+              async function iterationForward() {
+                const args = [draw];
+                const resource = {
+                  get [Symbol.dispose]() {
+                    args[0] = runtimeFactory;
+                    return () => {};
+                  }
+                };
+                for (using value of [resource]) {
+                  return outer(inner.bind(null, ...args));
+                }
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [4, 6] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decorators_invalidate_captured_finite_bound_arrays() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [classValue] = await classForward();
+              classValue[0][0](classKey);
+              const [parameterValue] = await parameterForward();
+              parameterValue[0][0](parameterKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function classForward() {
+                const args = [draw];
+                const decorate = () => { args[0] = runtimeFactory; };
+                @decorate class Example {}
+                return outer(inner.bind(null, ...args));
+              }
+              async function parameterForward() {
+                const args = [draw];
+                const decorate = () => { args[0] = runtimeFactory; };
+                class Example { method(@decorate value: string) {} }
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [4, 6] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn callable_parameter_defaults_seed_capture_provenance() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward(change = () => { args[0] = runtimeFactory; }) {
+                const args = [draw];
+                change();
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
     }
 
     #[test]
