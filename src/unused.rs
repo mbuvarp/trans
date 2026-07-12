@@ -4002,6 +4002,7 @@ struct SourceUsageCollector {
     injected_bindings: BTreeSet<String>,
     summarized_dynamic_key_spans: BTreeSet<(usize, usize)>,
     pending_var_bindings: Option<BTreeSet<String>>,
+    pending_local_wrapper_resolutions: Option<BTreeMap<String, LocalWrapperResolution>>,
     scan: UsageScan,
 }
 
@@ -4010,6 +4011,7 @@ struct LocalWrapperResolution {
     direct: bool,
     indexes: BTreeSet<usize>,
     parameters: BTreeMap<usize, BTreeSet<usize>>,
+    forwards: BTreeSet<TranslatorReturnForward>,
 }
 
 #[derive(Debug, Clone)]
@@ -12547,6 +12549,7 @@ impl SourceUsageCollector {
             injected_bindings: BTreeSet::new(),
             summarized_dynamic_key_spans,
             pending_var_bindings: None,
+            pending_local_wrapper_resolutions: None,
             scan: UsageScan::default(),
         }
     }
@@ -12727,7 +12730,129 @@ impl SourceUsageCollector {
                     (!parameters.is_empty()).then_some((index, parameters))
                 })
                 .collect(),
+            forwards: summary.forwards,
         }
+    }
+
+    fn hoisted_local_wrapper_resolutions(
+        &self,
+        body: &FunctionBody<'_>,
+    ) -> BTreeMap<String, LocalWrapperResolution> {
+        body.statements
+            .iter()
+            .filter_map(|statement| {
+                let Statement::FunctionDeclaration(function) = statement else {
+                    return None;
+                };
+                let name = function.id.as_ref()?.name.to_string();
+                Some((name, self.local_wrapper_resolution_for_function(function)))
+            })
+            .collect()
+    }
+
+    fn resolved_local_wrapper(&self, name: &str) -> Option<LocalWrapperResolution> {
+        self.resolved_local_wrapper_at_depth(name, &mut BTreeSet::new())
+    }
+
+    fn resolved_local_wrapper_at_depth(
+        &self,
+        name: &str,
+        visited: &mut BTreeSet<String>,
+    ) -> Option<LocalWrapperResolution> {
+        if !visited.insert(name.to_string()) {
+            return self.local_wrapper_resolutions.get(name).cloned();
+        }
+        let mut resolution = self.local_wrapper_resolutions.get(name)?.clone();
+        let forwards = std::mem::take(&mut resolution.forwards);
+        for forward in forwards {
+            let TranslatorReturnForward::ForwardCall {
+                namespace,
+                name: target,
+                argument_params,
+            } = forward
+            else {
+                continue;
+            };
+            let target_resolution =
+                if namespace.is_none() && self.local_wrapper_resolutions.contains_key(&target) {
+                    self.resolved_local_wrapper_at_depth(&target, visited)
+                } else {
+                    self.project_wrapper_resolution_for_name(namespace.as_deref(), &target)
+                };
+            let Some(target_resolution) = target_resolution else {
+                continue;
+            };
+            resolution.direct |= target_resolution.direct;
+            resolution.indexes.extend(target_resolution.indexes);
+            for (index, target_params) in target_resolution.parameters {
+                let mut unresolved = false;
+                let mapped = target_params
+                    .into_iter()
+                    .filter_map(|param_index| {
+                        let mapped = argument_params.get(param_index).copied().flatten();
+                        unresolved |= mapped.is_none();
+                        mapped
+                    })
+                    .collect::<BTreeSet<_>>();
+                if unresolved {
+                    resolution.indexes.insert(index);
+                }
+                if !mapped.is_empty() {
+                    resolution
+                        .parameters
+                        .entry(index)
+                        .or_default()
+                        .extend(mapped);
+                }
+            }
+        }
+        visited.remove(name);
+        Some(resolution)
+    }
+
+    fn project_wrapper_resolution_for_name(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Option<LocalWrapperResolution> {
+        let (project, file) = (self.project.as_ref()?, self.file_index.as_ref()?);
+        let target = namespace.and_then(|namespace| {
+            file.namespace_imports
+                .get(namespace)
+                .map(|source| ImportTarget {
+                    source: source.clone(),
+                    imported: ImportedName::Named(name.to_string()),
+                })
+        });
+        let imported = target.as_ref().or_else(|| file.imports.get(name));
+        let direct = imported.map_or_else(
+            || project.wrapper_return_for_local(&self.path, name),
+            |target| project.wrapper_return_for_import(&self.path, target),
+        );
+        let indexes = imported.map_or_else(
+            || {
+                project
+                    .wrapper_array_indexes_for_local(&self.path, name)
+                    .unwrap_or_default()
+            },
+            |target| {
+                project
+                    .wrapper_array_indexes_for_import(&self.path, target)
+                    .unwrap_or_default()
+            },
+        );
+        let parameters = imported.map_or_else(
+            || project.wrapper_array_parameter_indexes_for_local(&self.path, name),
+            |target| project.wrapper_array_parameter_indexes_for_import(&self.path, target),
+        );
+        (direct || !indexes.is_empty() || !parameters.is_empty()).then_some(
+            LocalWrapperResolution {
+                direct,
+                indexes,
+                parameters,
+                forwards: BTreeSet::new(),
+            },
+        )
     }
 
     fn remove_translator_array_alias(&mut self, name: &str) {
@@ -13664,7 +13789,19 @@ impl SourceUsageCollector {
         let mut argument_offset = 0;
         let mut apply_arguments_index = None;
         let mut nullish_apply_is_empty = false;
-        if let Some(member) = call.callee.get_member_expr() {
+        let direct_namespace_resolution = call.callee.get_member_expr().and_then(|member| {
+            matches!(member.static_property_name(), Some("call" | "apply")).then_some(())?;
+            let namespace = member.object().get_identifier_reference()?;
+            self.file_index
+                .as_ref()?
+                .namespace_imports
+                .contains_key(namespace.name.as_str())
+                .then(|| self.wrapper_array_resolution_for_callee(&call.callee))?
+                .filter(|(indexes, parameters)| !indexes.is_empty() || !parameters.is_empty())
+        });
+        if direct_namespace_resolution.is_none()
+            && let Some(member) = call.callee.get_member_expr()
+        {
             let reflect_apply = member.static_property_name() == Some("apply")
                 && member
                     .object()
@@ -13693,7 +13830,7 @@ impl SourceUsageCollector {
             }
         }
         if let Some((mut indexes, parameter_indexes)) =
-            self.wrapper_array_resolution_for_callee(target)
+            direct_namespace_resolution.or_else(|| self.wrapper_array_resolution_for_callee(target))
         {
             for (index, params) in parameter_indexes {
                 let wrapper_argument = if let Some(arguments_index) = apply_arguments_index {
@@ -13844,8 +13981,8 @@ impl SourceUsageCollector {
         let (project, file) = (self.project.as_ref()?, self.file_index.as_ref()?);
         if let Some(identifier) = callee.get_identifier_reference() {
             let name = identifier.name.as_str();
-            if let Some(resolution) = self.local_wrapper_resolutions.get(name) {
-                return Some((resolution.indexes.clone(), resolution.parameters.clone()));
+            if let Some(resolution) = self.resolved_local_wrapper(name) {
+                return Some((resolution.indexes, resolution.parameters));
             }
             if self.shadowed_project_bindings.contains(name) {
                 return None;
@@ -13936,7 +14073,7 @@ impl SourceUsageCollector {
         };
         if let Some(identifier) = expression.get_identifier_reference() {
             let name = identifier.name.as_str();
-            if let Some(resolution) = self.local_wrapper_resolutions.get(name) {
+            if let Some(resolution) = self.resolved_local_wrapper(name) {
                 return resolution.direct || !resolution.indexes.is_empty();
             }
             if self.shadowed_project_bindings.contains(name) {
@@ -13970,6 +14107,12 @@ impl SourceUsageCollector {
     }
 
     fn call_returns_potential_wrapper(&self, call: &CallExpression<'_>) -> bool {
+        if matches!(
+            call.callee.get_inner_expression(),
+            Expression::ConditionalExpression(_) | Expression::LogicalExpression(_)
+        ) {
+            return self.expression_is_wrapper_returning_callable(&call.callee);
+        }
         let Some(project) = &self.project else {
             return false;
         };
@@ -13978,7 +14121,7 @@ impl SourceUsageCollector {
         };
         if let Some(identifier) = call.callee.get_identifier_reference() {
             let name = identifier.name.as_str();
-            if let Some(resolution) = self.local_wrapper_resolutions.get(name) {
+            if let Some(resolution) = self.resolved_local_wrapper(name) {
                 return resolution.direct || !resolution.indexes.is_empty();
             }
             if self.shadowed_project_bindings.contains(name) {
@@ -18628,6 +18771,12 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 }
             }
         }
+        if let Some(resolutions) = self.pending_local_wrapper_resolutions.take() {
+            for (name, resolution) in resolutions {
+                self.mask_binding_name(&name);
+                self.local_wrapper_resolutions.insert(name, resolution);
+            }
+        }
     }
 
     fn leave_scope(&mut self) {
@@ -18707,9 +18856,14 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         let outer_environment = (function.r#type == FunctionType::FunctionExpression)
             .then(|| self.binding_environment());
         if let Some(id) = &function.id {
+            let precomputed = self
+                .local_wrapper_resolutions
+                .get(id.name.as_str())
+                .cloned();
             self.mask_binding_name(id.name.as_str());
             if self.scope_depth > 1 {
-                let resolution = self.local_wrapper_resolution_for_function(function);
+                let resolution = precomputed
+                    .unwrap_or_else(|| self.local_wrapper_resolution_for_function(function));
                 self.local_wrapper_resolutions
                     .insert(id.name.to_string(), resolution);
             }
@@ -18722,6 +18876,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             .body
             .as_ref()
             .map(|body| function_var_bindings(body));
+        self.pending_local_wrapper_resolutions = function
+            .body
+            .as_ref()
+            .map(|body| self.hoisted_local_wrapper_resolutions(body));
         walk::walk_function(self, function, flags);
         if let Some(environment) = outer_environment {
             self.restore_binding_environment(environment);
@@ -18730,6 +18888,8 @@ impl<'a> Visit<'a> for SourceUsageCollector {
 
     fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
         self.pending_var_bindings = Some(function_var_bindings(&arrow.body));
+        self.pending_local_wrapper_resolutions =
+            Some(self.hoisted_local_wrapper_resolutions(&arrow.body));
         walk::walk_arrow_function_expression(self, arrow);
     }
 
@@ -23317,6 +23477,124 @@ mod tests {
             logical[1]('logical-layer');
             "#,
         );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&7), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&9), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&10), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn conditional_direct_wrapper_callees_preserve_callable_children() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            const values = (enabled ? useBaseValues : draw)();
+            values[0](runtimeKey);
+            "#,
+        );
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 5));
+    }
+
+    #[test]
+    fn hoisted_local_wrapper_declarations_resolve_before_visitation() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function scope() {
+              const [values, cleanup] = await aggregate(useBaseValues);
+              values[0](runtimeKey);
+              cleanup('layer');
+              async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&7), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn local_forwarders_resolve_local_and_imported_wrapper_helpers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper = dir.path().join("helper.ts");
+        let main = dir.path().join("main.ts");
+        fs::write(
+            &helper,
+            "export async function imported(factory) { return Promise.all([factory(), draw]); }",
+        )
+        .expect("write helper");
+        fs::write(
+            &main,
+            r#"
+            import {useMemo} from 'react';
+            import {imported} from './helper';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function scope() {
+              const [localValues, localCleanup] = await localForward(useBaseValues);
+              localValues[0](localKey);
+              localCleanup('local-layer');
+              const [importedValues, importedCleanup] = await importedForward(useBaseValues);
+              importedValues[0](importedKey);
+              importedCleanup('imported-layer');
+              async function aggregate(factory) { return Promise.all([factory(), draw]); }
+              async function localForward(factory) { return aggregate(factory); }
+              async function importedForward(factory) { return imported(factory); }
+            }
+            "#,
+        )
+        .expect("write main");
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&7), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&8), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&10), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&11), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn namespace_helpers_named_call_and_apply_resolve_directly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper = dir.path().join("helper.ts");
+        let main = dir.path().join("main.ts");
+        fs::write(
+            &helper,
+            r#"
+            export async function call(factory) { return Promise.all([factory(), draw]); }
+            export async function apply(factory) { return Promise.all([factory(), draw]); }
+            "#,
+        )
+        .expect("write helper");
+        fs::write(
+            &main,
+            r#"
+            import {useMemo} from 'react';
+            import * as Helpers from './helper';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            const [called, callCleanup] = await Helpers.call(useBaseValues);
+            called[0](callKey);
+            callCleanup('call-layer');
+            const applied = await Helpers.apply(useBaseValues);
+            applied[0][0](applyKey);
+            applied[1]('apply-layer');
+            "#,
+        )
+        .expect("write main");
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
         let lines = scan
             .dynamic_usages
             .iter()
