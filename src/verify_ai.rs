@@ -125,11 +125,11 @@ fn handle_key_mismatch(
                 &primary_value,
             )?;
             print_suggestion("<missing>", &suggestion);
-            if confirm_apply()? {
-                if let Some(translations) = translations_by_language.get_mut(&mismatch.language) {
-                    translations.insert(id.clone(), suggestion);
-                    languages_changed.insert(mismatch.language.clone());
-                }
+            if confirm_apply()?
+                && let Some(translations) = translations_by_language.get_mut(&mismatch.language)
+            {
+                translations.insert(id.clone(), suggestion);
+                languages_changed.insert(mismatch.language.clone());
             }
         }
     }
@@ -144,14 +144,12 @@ fn handle_key_mismatch(
             print_issue_header(&format!("Extra id in '{}': {}", mismatch.language, id));
             let suggestion = run_extra_id_suggestion(settings, &mismatch.language, &id, &value)?;
             print_suggestion(&value, &suggestion);
-            if confirm_apply()? {
-                if suggestion.trim().to_uppercase().starts_with("DELETE") {
-                    if let Some(translations) = translations_by_language.get_mut(&mismatch.language)
-                    {
-                        translations.remove(&id);
-                        languages_changed.insert(mismatch.language.clone());
-                    }
-                }
+            if confirm_apply()?
+                && suggestion.trim().to_uppercase().starts_with("DELETE")
+                && let Some(translations) = translations_by_language.get_mut(&mismatch.language)
+            {
+                translations.remove(&id);
+                languages_changed.insert(mismatch.language.clone());
             }
         }
     }
@@ -183,11 +181,11 @@ fn handle_format_issue(
         references,
     )?;
     print_suggestion(&issue.value, &suggestion);
-    if confirm_apply()? {
-        if let Some(translations) = translations_by_language.get_mut(&issue.language) {
-            translations.insert(issue.id.clone(), suggestion);
-            languages_changed.insert(issue.language.clone());
-        }
+    if confirm_apply()?
+        && let Some(translations) = translations_by_language.get_mut(&issue.language)
+    {
+        translations.insert(issue.id.clone(), suggestion);
+        languages_changed.insert(issue.language.clone());
     }
     if issue.language == config.primary_language {
         println!(

@@ -276,10 +276,10 @@ fn extract_text_from_value(body: &str) -> Option<String> {
             None => continue,
         };
         for content in contents {
-            if let Some(text) = content.get("text").and_then(|t| t.as_str()) {
-                if !text.trim().is_empty() {
-                    return Some(text.to_string());
-                }
+            if let Some(text) = content.get("text").and_then(|t| t.as_str())
+                && !text.trim().is_empty()
+            {
+                return Some(text.to_string());
             }
         }
     }

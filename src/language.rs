@@ -23,20 +23,20 @@ pub fn language_display_name(code: &str) -> String {
         return code.to_string();
     };
     let mut name = language.to_name().to_string();
-    if let Some(script) = tag.script.as_deref() {
-        if let Ok(script_code) = ScriptCode::from_str(script) {
-            name.push_str(" (");
-            name.push_str(script_code.name());
-            name.push(')');
-            return name;
-        }
+    if let Some(script) = tag.script.as_deref()
+        && let Ok(script_code) = ScriptCode::from_str(script)
+    {
+        name.push_str(" (");
+        name.push_str(script_code.name());
+        name.push(')');
+        return name;
     }
-    if let Some(region) = tag.region.as_deref() {
-        if let Some(country) = Country::from_alpha2_ignore_case(region) {
-            name.push_str(" (");
-            name.push_str(country.name);
-            name.push(')');
-        }
+    if let Some(region) = tag.region.as_deref()
+        && let Some(country) = Country::from_alpha2_ignore_case(region)
+    {
+        name.push_str(" (");
+        name.push_str(country.name);
+        name.push(')');
     }
     name
 }
@@ -55,9 +55,7 @@ fn parse_language_tag(code: &str) -> Option<LanguageTag> {
         return None;
     }
     let language = lang.to_ascii_lowercase();
-    if Language::from_639_1(&language).is_none() {
-        return None;
-    }
+    Language::from_639_1(&language)?;
 
     let mut region = None;
     let mut script = None;
@@ -65,9 +63,7 @@ fn parse_language_tag(code: &str) -> Option<LanguageTag> {
         let subtag = parts[1];
         if subtag.len() == 2 && subtag.chars().all(|c| c.is_ascii_alphabetic()) {
             region = Some(subtag.to_ascii_uppercase());
-            if Country::from_alpha2_ignore_case(subtag).is_none() {
-                return None;
-            }
+            Country::from_alpha2_ignore_case(subtag)?;
         } else if subtag.len() == 4 && subtag.chars().all(|c| c.is_ascii_alphabetic()) {
             let normalized = normalize_script(subtag);
             if ScriptCode::from_str(&normalized).is_err() {

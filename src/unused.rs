@@ -521,6 +521,23 @@ struct FiniteBoundArgumentEntry {
 }
 
 type FiniteBoundCaptureBinding = (String, usize);
+type CaptureScopeIds = BTreeSet<usize>;
+type CaptureDependencyDepths = BTreeMap<String, CaptureScopeIds>;
+type CaptureBindingProvenance = BTreeMap<FiniteBoundCaptureBinding, CaptureScopeIds>;
+type FiniteBoundCaptureValueState = (
+    CaptureScopeIds,
+    BTreeSet<FiniteBoundCaptureBinding>,
+    CaptureDependencyDepths,
+    CaptureDependencyDepths,
+    CaptureBindingProvenance,
+);
+type FiniteBoundCaptureMemberState = (CaptureDependencyDepths, CaptureScopeIds);
+type WrapperArgumentParamCombination = (
+    Vec<Option<usize>>,
+    BTreeMap<usize, BTreeSet<WrapperCallableTarget>>,
+    BTreeSet<usize>,
+);
+type WrapperArrayResolution = (BTreeSet<usize>, BTreeMap<usize, BTreeSet<usize>>);
 
 #[derive(Default)]
 struct FiniteBoundArgumentScope {
@@ -1361,10 +1378,10 @@ fn apply_ts_checker_fallback(root: &Path, scan: &mut UsageScan) -> std::result::
         Err(error) => return Err(format!("could not start Node.js: {error}")),
     };
 
-    if let Some(stdin) = child.stdin.as_mut() {
-        if stdin.write_all(&input).is_err() {
-            return Err("could not send queries to the TypeScript checker".to_string());
-        }
+    if let Some(stdin) = child.stdin.as_mut()
+        && stdin.write_all(&input).is_err()
+    {
+        return Err("could not send queries to the TypeScript checker".to_string());
     }
 
     let output = child
@@ -2608,26 +2625,26 @@ impl ProjectIndex {
                 None
             };
 
-            if forward.argument_array.safe_layout {
-                if let Some(target) = target {
-                    for usage in target.param_usages {
-                        let Some(indexes) = forward.argument_array.bindings.get(usage.param_index)
-                        else {
-                            continue;
-                        };
-                        for param_index in indexes {
-                            summary.param_usages.push(HelperParamUsage {
-                                param_index: *param_index,
-                                param_path: usage.param_path.clone(),
-                                keys: usage.keys.clone(),
-                                query: usage.query.clone(),
-                                translator_like: usage.translator_like,
-                                direct_translator: usage.direct_translator,
-                            });
-                        }
+            if forward.argument_array.safe_layout
+                && let Some(target) = target
+            {
+                for usage in target.param_usages {
+                    let Some(indexes) = forward.argument_array.bindings.get(usage.param_index)
+                    else {
+                        continue;
+                    };
+                    for param_index in indexes {
+                        summary.param_usages.push(HelperParamUsage {
+                            param_index: *param_index,
+                            param_path: usage.param_path.clone(),
+                            keys: usage.keys.clone(),
+                            query: usage.query.clone(),
+                            translator_like: usage.translator_like,
+                            direct_translator: usage.direct_translator,
+                        });
                     }
-                    continue;
                 }
+                continue;
             }
 
             for param_index in forward.fallback_params {
@@ -4097,10 +4114,10 @@ impl ProjectIndex {
             }
         }
 
-        if let Some(candidate) = self.packages.expand(source) {
-            if let Some(path) = self.resolve_candidate(&candidate) {
-                return Some(path);
-            }
+        if let Some(candidate) = self.packages.expand(source)
+            && let Some(path) = self.resolve_candidate(&candidate)
+        {
+            return Some(path);
         }
 
         None
@@ -4211,10 +4228,10 @@ impl PathAliases {
             }
         }
 
-        if candidates.is_empty() {
-            if let Some(base_url) = &self.base_url {
-                candidates.push(base_url.join(source));
-            }
+        if candidates.is_empty()
+            && let Some(base_url) = &self.base_url
+        {
+            candidates.push(base_url.join(source));
         }
 
         candidates
@@ -4291,12 +4308,11 @@ fn workspace_root(root: &Path) -> Option<PathBuf> {
         .arg(root)
         .args(["rev-parse", "--show-toplevel"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-            if !path.as_os_str().is_empty() {
-                return Some(path);
-            }
+        let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        if !path.as_os_str().is_empty() {
+            return Some(path);
         }
     }
 
@@ -4323,11 +4339,11 @@ fn collect_workspace_packages(root: &Path, packages: &mut BTreeMap<String, Works
                 continue;
             }
             collect_workspace_packages(&path, packages);
-        } else if file_type.is_file() && path.file_name().is_some_and(|name| name == "package.json")
+        } else if file_type.is_file()
+            && path.file_name().is_some_and(|name| name == "package.json")
+            && let Some(package) = workspace_package_from_package_json(&path)
         {
-            if let Some(package) = workspace_package_from_package_json(&path) {
-                packages.insert(package.0, package.1);
-            }
+            packages.insert(package.0, package.1);
         }
     }
 }
@@ -4859,74 +4875,43 @@ impl<'a> Visit<'a> for CallbackTranslatorReturnCollector<'_> {
     fn visit_arrow_function_expression(&mut self, _arrow: &ArrowFunctionExpression<'a>) {}
 }
 
+#[derive(Clone, Copy)]
+struct HelperSummaryContext<'a> {
+    helpers: &'a BTreeMap<String, HelperSummary>,
+    finite_constants: &'a BTreeMap<String, FiniteStrings>,
+    finite_iterables: &'a BTreeMap<String, FiniteStrings>,
+    finite_object_maps: &'a FiniteObjectMaps,
+    finite_record_constants: &'a FiniteRecordBindings,
+    finite_record_iterables: &'a FiniteRecordBindings,
+    finite_record_maps: &'a FiniteRecordMaps,
+    enum_member_domains: &'a TypeDomains,
+    source_context: Option<&'a SourceQueryContext>,
+}
+
 fn helper_summary_from_expression_with_context(
     expression: &Expression<'_>,
-    helpers: &BTreeMap<String, HelperSummary>,
-    finite_constants: &BTreeMap<String, FiniteStrings>,
-    finite_iterables: &BTreeMap<String, FiniteStrings>,
-    finite_object_maps: &FiniteObjectMaps,
-    finite_record_constants: &FiniteRecordBindings,
-    finite_record_iterables: &FiniteRecordBindings,
-    finite_record_maps: &FiniteRecordMaps,
-    enum_member_domains: &TypeDomains,
-    source_context: Option<&SourceQueryContext>,
+    context: HelperSummaryContext<'_>,
 ) -> Option<HelperSummary> {
     match expression.get_inner_expression() {
-        Expression::ArrowFunctionExpression(arrow) => Some(helper_summary_from_arrow_with_context(
-            arrow,
-            helpers,
-            finite_constants,
-            finite_iterables,
-            finite_object_maps,
-            finite_record_constants,
-            finite_record_iterables,
-            finite_record_maps,
-            enum_member_domains,
-            source_context,
-        )),
-        Expression::FunctionExpression(function) => helper_summary_from_function_with_context(
-            function,
-            helpers,
-            finite_constants,
-            finite_iterables,
-            finite_object_maps,
-            finite_record_constants,
-            finite_record_iterables,
-            finite_record_maps,
-            enum_member_domains,
-            source_context,
-        ),
-        Expression::Identifier(identifier) => helpers.get(identifier.name.as_str()).cloned(),
+        Expression::ArrowFunctionExpression(arrow) => {
+            Some(helper_summary_from_arrow_with_context(arrow, context))
+        }
+        Expression::FunctionExpression(function) => {
+            helper_summary_from_function_with_context(function, context)
+        }
+        Expression::Identifier(identifier) => {
+            context.helpers.get(identifier.name.as_str()).cloned()
+        }
         Expression::ConditionalExpression(conditional) => {
-            let mut consequent = helper_summary_from_expression_with_context(
-                &conditional.consequent,
-                helpers,
-                finite_constants,
-                finite_iterables,
-                finite_object_maps,
-                finite_record_constants,
-                finite_record_iterables,
-                finite_record_maps,
-                enum_member_domains,
-                source_context,
-            )?;
-            let alternate = helper_summary_from_expression_with_context(
-                &conditional.alternate,
-                helpers,
-                finite_constants,
-                finite_iterables,
-                finite_object_maps,
-                finite_record_constants,
-                finite_record_iterables,
-                finite_record_maps,
-                enum_member_domains,
-                source_context,
-            )?;
+            let mut consequent =
+                helper_summary_from_expression_with_context(&conditional.consequent, context)?;
+            let alternate =
+                helper_summary_from_expression_with_context(&conditional.alternate, context)?;
             consequent.param_usages.extend(alternate.param_usages);
             consequent.forwards.extend(alternate.forwards);
             Some(consequent)
         }
-        Expression::CallExpression(call) => bound_helper_summary_from_call(call, helpers),
+        Expression::CallExpression(call) => bound_helper_summary_from_call(call, context.helpers),
         _ => None,
     }
 }
@@ -4936,7 +4921,7 @@ fn bound_helper_summary_from_call(
     helpers: &BTreeMap<String, HelperSummary>,
 ) -> Option<HelperSummary> {
     let member = call.callee.get_member_expr()?;
-    if member.static_property_name().as_deref() != Some("bind") {
+    if member.static_property_name() != Some("bind") {
         return None;
     }
     let helper_name = member
@@ -5006,71 +4991,27 @@ fn bound_helper_summary_from_call(
 
 fn helper_summary_from_arrow_with_context(
     arrow: &ArrowFunctionExpression<'_>,
-    helpers: &BTreeMap<String, HelperSummary>,
-    finite_constants: &BTreeMap<String, FiniteStrings>,
-    finite_iterables: &BTreeMap<String, FiniteStrings>,
-    finite_object_maps: &FiniteObjectMaps,
-    finite_record_constants: &FiniteRecordBindings,
-    finite_record_iterables: &FiniteRecordBindings,
-    finite_record_maps: &FiniteRecordMaps,
-    enum_member_domains: &TypeDomains,
-    source_context: Option<&SourceQueryContext>,
+    context: HelperSummaryContext<'_>,
 ) -> HelperSummary {
-    helper_summary_from_body_with_context(
-        &arrow.params,
-        &arrow.body,
-        helpers,
-        finite_constants,
-        finite_iterables,
-        finite_object_maps,
-        finite_record_constants,
-        finite_record_iterables,
-        finite_record_maps,
-        enum_member_domains,
-        source_context,
-    )
+    helper_summary_from_body_with_context(&arrow.params, &arrow.body, context)
 }
 
 fn helper_summary_from_function_with_context(
     function: &Function<'_>,
-    helpers: &BTreeMap<String, HelperSummary>,
-    finite_constants: &BTreeMap<String, FiniteStrings>,
-    finite_iterables: &BTreeMap<String, FiniteStrings>,
-    finite_object_maps: &FiniteObjectMaps,
-    finite_record_constants: &FiniteRecordBindings,
-    finite_record_iterables: &FiniteRecordBindings,
-    finite_record_maps: &FiniteRecordMaps,
-    enum_member_domains: &TypeDomains,
-    source_context: Option<&SourceQueryContext>,
+    context: HelperSummaryContext<'_>,
 ) -> Option<HelperSummary> {
     let body = function.body.as_ref()?;
     Some(helper_summary_from_body_with_context(
         &function.params,
         body,
-        helpers,
-        finite_constants,
-        finite_iterables,
-        finite_object_maps,
-        finite_record_constants,
-        finite_record_iterables,
-        finite_record_maps,
-        enum_member_domains,
-        source_context,
+        context,
     ))
 }
 
 fn helper_summary_from_body_with_context(
     params: &oxc_ast::ast::FormalParameters<'_>,
     body: &FunctionBody<'_>,
-    helpers: &BTreeMap<String, HelperSummary>,
-    finite_constants: &BTreeMap<String, FiniteStrings>,
-    finite_iterables: &BTreeMap<String, FiniteStrings>,
-    finite_object_maps: &FiniteObjectMaps,
-    finite_record_constants: &FiniteRecordBindings,
-    finite_record_iterables: &FiniteRecordBindings,
-    finite_record_maps: &FiniteRecordMaps,
-    enum_member_domains: &TypeDomains,
-    source_context: Option<&SourceQueryContext>,
+    context: HelperSummaryContext<'_>,
 ) -> HelperSummary {
     let mut param_names = BTreeMap::new();
     let mut param_paths = BTreeMap::new();
@@ -5084,14 +5025,14 @@ fn helper_summary_from_body_with_context(
         );
     }
 
-    let mut helpers = helpers.clone();
-    let mut finite_constants = finite_constants.clone();
-    let mut finite_iterables = finite_iterables.clone();
-    let mut finite_object_maps = finite_object_maps.clone();
-    let mut finite_record_constants = finite_record_constants.clone();
-    let mut finite_record_iterables = finite_record_iterables.clone();
-    let mut finite_record_maps = finite_record_maps.clone();
-    let mut enum_member_domains = enum_member_domains.clone();
+    let mut helpers = context.helpers.clone();
+    let mut finite_constants = context.finite_constants.clone();
+    let mut finite_iterables = context.finite_iterables.clone();
+    let mut finite_object_maps = context.finite_object_maps.clone();
+    let mut finite_record_constants = context.finite_record_constants.clone();
+    let mut finite_record_iterables = context.finite_record_iterables.clone();
+    let mut finite_record_maps = context.finite_record_maps.clone();
+    let mut enum_member_domains = context.enum_member_domains.clone();
     for name in param_names.keys() {
         helpers.remove(name);
         finite_constants.remove(name);
@@ -5115,7 +5056,7 @@ fn helper_summary_from_body_with_context(
         finite_record_maps,
         enum_member_domains,
         param_argument_arrays: BTreeMap::new(),
-        source_context: source_context.cloned(),
+        source_context: context.source_context.cloned(),
         usages: Vec::new(),
         forwards: Vec::new(),
         jsx_forwards: Vec::new(),
@@ -5196,15 +5137,7 @@ fn collect_parameter_bindings(
 fn jsx_component_summary_from_body(
     pattern: &BindingPattern<'_>,
     body: &FunctionBody<'_>,
-    helpers: &BTreeMap<String, HelperSummary>,
-    finite_constants: &BTreeMap<String, FiniteStrings>,
-    finite_iterables: &BTreeMap<String, FiniteStrings>,
-    finite_object_maps: &FiniteObjectMaps,
-    finite_record_constants: &FiniteRecordBindings,
-    finite_record_iterables: &FiniteRecordBindings,
-    finite_record_maps: &FiniteRecordMaps,
-    enum_member_domains: &TypeDomains,
-    source_context: &SourceQueryContext,
+    context: HelperSummaryContext<'_>,
 ) -> Option<JsxComponentSummary> {
     let BindingPattern::ObjectPattern(object) = pattern else {
         return None;
@@ -5232,16 +5165,16 @@ fn jsx_component_summary_from_body(
     let mut collector = HelperBodyCollector {
         param_names,
         param_paths: BTreeMap::new(),
-        helpers: helpers.clone(),
-        finite_constants: finite_constants.clone(),
-        finite_iterables: finite_iterables.clone(),
-        finite_object_maps: finite_object_maps.clone(),
-        finite_record_constants: finite_record_constants.clone(),
-        finite_record_iterables: finite_record_iterables.clone(),
-        finite_record_maps: finite_record_maps.clone(),
-        enum_member_domains: enum_member_domains.clone(),
+        helpers: context.helpers.clone(),
+        finite_constants: context.finite_constants.clone(),
+        finite_iterables: context.finite_iterables.clone(),
+        finite_object_maps: context.finite_object_maps.clone(),
+        finite_record_constants: context.finite_record_constants.clone(),
+        finite_record_iterables: context.finite_record_iterables.clone(),
+        finite_record_maps: context.finite_record_maps.clone(),
+        enum_member_domains: context.enum_member_domains.clone(),
         param_argument_arrays: BTreeMap::new(),
-        source_context: Some(source_context.clone()),
+        source_context: context.source_context.cloned(),
         usages: Vec::new(),
         forwards: Vec::new(),
         jsx_forwards: Vec::new(),
@@ -5317,7 +5250,7 @@ fn message_key_helper_from_expression(expression: &Expression<'_>) -> Option<usi
 
 fn message_key_helper_from_function(function: &Function<'_>) -> Option<usize> {
     let body = function.body.as_ref()?;
-    Some(message_key_helper_from_body(&function.params, body)?)
+    message_key_helper_from_body(&function.params, body)
 }
 
 fn message_key_helper_from_body(
@@ -5366,9 +5299,19 @@ fn finite_record_return_summary_from_expression(
 fn finite_record_return_summary_from_arrow(
     arrow: &ArrowFunctionExpression<'_>,
 ) -> Option<FiniteRecords> {
-    if arrow.expression {
-        if let Some(Statement::ExpressionStatement(statement)) = arrow.body.statements.first() {
-            return finite_record_from_expression(
+    if arrow.expression
+        && let Some(Statement::ExpressionStatement(statement)) = arrow.body.statements.first()
+    {
+        return finite_record_from_expression(
+            &statement.expression,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .or_else(|| {
+            finite_record_iterable_from_expression(
                 &statement.expression,
                 &BTreeMap::new(),
                 &BTreeMap::new(),
@@ -5376,89 +5319,18 @@ fn finite_record_return_summary_from_arrow(
                 &BTreeMap::new(),
                 &BTreeMap::new(),
             )
-            .or_else(|| {
-                finite_record_iterable_from_expression(
-                    &statement.expression,
-                    &BTreeMap::new(),
-                    &BTreeMap::new(),
-                    &BTreeMap::new(),
-                    &BTreeMap::new(),
-                    &BTreeMap::new(),
-                )
-            });
-        }
+        });
     }
-    finite_record_return_summary_from_body(
-        &arrow.body,
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeSet::new(),
-        BTreeSet::new(),
-    )
+    finite_record_return_summary_from_body(&arrow.body, FiniteRecordReturnContext::default())
 }
 
 fn finite_record_return_summary_from_function(function: &Function<'_>) -> Option<FiniteRecords> {
     let body = function.body.as_ref()?;
-    finite_record_return_summary_from_body(
-        body,
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeSet::new(),
-        BTreeSet::new(),
-    )
+    finite_record_return_summary_from_body(body, FiniteRecordReturnContext::default())
 }
 
-fn finite_record_return_summary_from_function_with_context(
-    function: &Function<'_>,
-    constants: &BTreeMap<String, FiniteStrings>,
-    iterables: &BTreeMap<String, FiniteStrings>,
-    object_maps: &FiniteObjectMaps,
-    record_constants: &FiniteRecordBindings,
-    record_iterables: &FiniteRecordBindings,
-    record_maps: &FiniteRecordMaps,
-    enum_member_domains: &TypeDomains,
-    mut react_use_memo_identifiers: BTreeSet<String>,
-    mut react_namespaces: BTreeSet<String>,
-) -> Option<FiniteRecords> {
-    let body = function.body.as_ref()?;
-    for parameter in &function.params.items {
-        for identifier in parameter.pattern.get_binding_identifiers() {
-            react_use_memo_identifiers.remove(identifier.name.as_str());
-            react_namespaces.remove(identifier.name.as_str());
-        }
-    }
-    if let Some(rest) = &function.params.rest {
-        for identifier in rest.rest.argument.get_binding_identifiers() {
-            react_use_memo_identifiers.remove(identifier.name.as_str());
-            react_namespaces.remove(identifier.name.as_str());
-        }
-    }
-    finite_record_return_summary_from_body(
-        body,
-        constants.clone(),
-        iterables.clone(),
-        object_maps.clone(),
-        record_constants.clone(),
-        record_iterables.clone(),
-        record_maps.clone(),
-        enum_member_domains.clone(),
-        react_use_memo_identifiers,
-        react_namespaces,
-    )
-}
-
-fn finite_record_return_summary_from_body(
-    body: &FunctionBody<'_>,
+#[derive(Default)]
+struct FiniteRecordReturnContext {
     finite_constants: BTreeMap<String, FiniteStrings>,
     finite_iterables: BTreeMap<String, FiniteStrings>,
     finite_object_maps: FiniteObjectMaps,
@@ -5468,17 +5340,46 @@ fn finite_record_return_summary_from_body(
     enum_member_domains: TypeDomains,
     react_use_memo_identifiers: BTreeSet<String>,
     react_namespaces: BTreeSet<String>,
+}
+
+fn finite_record_return_summary_from_function_with_context(
+    function: &Function<'_>,
+    mut context: FiniteRecordReturnContext,
+) -> Option<FiniteRecords> {
+    let body = function.body.as_ref()?;
+    for parameter in &function.params.items {
+        for identifier in parameter.pattern.get_binding_identifiers() {
+            context
+                .react_use_memo_identifiers
+                .remove(identifier.name.as_str());
+            context.react_namespaces.remove(identifier.name.as_str());
+        }
+    }
+    if let Some(rest) = &function.params.rest {
+        for identifier in rest.rest.argument.get_binding_identifiers() {
+            context
+                .react_use_memo_identifiers
+                .remove(identifier.name.as_str());
+            context.react_namespaces.remove(identifier.name.as_str());
+        }
+    }
+    finite_record_return_summary_from_body(body, context)
+}
+
+fn finite_record_return_summary_from_body(
+    body: &FunctionBody<'_>,
+    context: FiniteRecordReturnContext,
 ) -> Option<FiniteRecords> {
     let mut collector = ReturnRecordCollector {
-        finite_constants,
-        finite_iterables,
-        finite_object_maps,
-        finite_record_constants,
-        finite_record_iterables,
-        finite_record_maps,
-        enum_member_domains,
-        react_use_memo_identifiers,
-        react_namespaces,
+        finite_constants: context.finite_constants,
+        finite_iterables: context.finite_iterables,
+        finite_object_maps: context.finite_object_maps,
+        finite_record_constants: context.finite_record_constants,
+        finite_record_iterables: context.finite_record_iterables,
+        finite_record_maps: context.finite_record_maps,
+        enum_member_domains: context.enum_member_domains,
+        react_use_memo_identifiers: context.react_use_memo_identifiers,
+        react_namespaces: context.react_namespaces,
         return_records: Vec::new(),
         unknown_return: false,
     };
@@ -5493,15 +5394,15 @@ fn finite_record_return_summary_from_body(
 }
 
 fn finite_return_summary_from_arrow(arrow: &ArrowFunctionExpression<'_>) -> Option<FiniteStrings> {
-    if arrow.expression {
-        if let Some(Statement::ExpressionStatement(statement)) = arrow.body.statements.first() {
-            return finite_strings_from_expression(
-                &statement.expression,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-            );
-        }
+    if arrow.expression
+        && let Some(Statement::ExpressionStatement(statement)) = arrow.body.statements.first()
+    {
+        return finite_strings_from_expression(
+            &statement.expression,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
     }
     finite_return_summary_from_body(&arrow.body)
 }
@@ -6895,13 +6796,11 @@ where
                         );
                     }
                 }
-                if unresolved {
-                    if !entries.bindings.is_empty() {
-                        entries.bindings.insert(
-                            format!("@entry{}", entries.bindings.len()),
-                            dynamic_translator_binding(),
-                        );
-                    }
+                if unresolved && !entries.bindings.is_empty() {
+                    entries.bindings.insert(
+                        format!("@entry{}", entries.bindings.len()),
+                        dynamic_translator_binding(),
+                    );
                 }
                 if unresolved {
                     entries.mark_unknown("");
@@ -7060,11 +6959,20 @@ fn finite_records_from_callback_argument(
 ) -> Option<FiniteRecords> {
     match callback {
         Argument::ArrowFunctionExpression(arrow) => {
-            if arrow.expression {
-                if let Some(Statement::ExpressionStatement(statement)) =
+            if arrow.expression
+                && let Some(Statement::ExpressionStatement(statement)) =
                     arrow.body.statements.first()
-                {
-                    return finite_record_iterable_from_expression(
+            {
+                return finite_record_iterable_from_expression(
+                    &statement.expression,
+                    constants,
+                    object_maps,
+                    enum_member_domains,
+                    record_iterables,
+                    record_maps,
+                )
+                .or_else(|| {
+                    finite_record_from_expression(
                         &statement.expression,
                         constants,
                         object_maps,
@@ -7072,42 +6980,32 @@ fn finite_records_from_callback_argument(
                         record_iterables,
                         record_maps,
                     )
-                    .or_else(|| {
-                        finite_record_from_expression(
-                            &statement.expression,
-                            constants,
-                            object_maps,
-                            enum_member_domains,
-                            record_iterables,
-                            record_maps,
-                        )
-                    });
-                }
+                });
             }
             finite_record_return_summary_from_body(
                 &arrow.body,
-                constants.clone(),
-                iterables.clone(),
-                object_maps.clone(),
-                BTreeMap::new(),
-                record_iterables.clone(),
-                record_maps.clone(),
-                enum_member_domains.clone(),
-                BTreeSet::new(),
-                BTreeSet::new(),
+                FiniteRecordReturnContext {
+                    finite_constants: constants.clone(),
+                    finite_iterables: iterables.clone(),
+                    finite_object_maps: object_maps.clone(),
+                    finite_record_iterables: record_iterables.clone(),
+                    finite_record_maps: record_maps.clone(),
+                    enum_member_domains: enum_member_domains.clone(),
+                    ..Default::default()
+                },
             )
         }
         Argument::FunctionExpression(function) => finite_record_return_summary_from_body(
             function.body.as_ref()?,
-            constants.clone(),
-            iterables.clone(),
-            object_maps.clone(),
-            BTreeMap::new(),
-            record_iterables.clone(),
-            record_maps.clone(),
-            enum_member_domains.clone(),
-            BTreeSet::new(),
-            BTreeSet::new(),
+            FiniteRecordReturnContext {
+                finite_constants: constants.clone(),
+                finite_iterables: iterables.clone(),
+                finite_object_maps: object_maps.clone(),
+                finite_record_iterables: record_iterables.clone(),
+                finite_record_maps: record_maps.clone(),
+                enum_member_domains: enum_member_domains.clone(),
+                ..Default::default()
+            },
         ),
         _ => None,
     }
@@ -7242,9 +7140,7 @@ fn finite_record_from_object(
         if property.kind != PropertyKind::Init || property.method || property.computed {
             return None;
         }
-        let Some(key) = property.key.static_name() else {
-            return None;
-        };
+        let key = property.key.static_name()?;
         if let Some(values) = finite_strings_from_expression(
             &property.value,
             constants,
@@ -7368,7 +7264,7 @@ fn finite_record_iterable_from_expression(
                 record_iterables,
                 record_maps,
             )?;
-            match method.as_ref() {
+            match method {
                 "filter" => Some(records),
                 "slice" => {
                     let start = call.arguments.first().and_then(argument_usize).unwrap_or(0);
@@ -7710,7 +7606,7 @@ fn finite_strings_from_call(
         enum_member_domains,
     )?;
 
-    transform_finite_strings(values, &method)
+    transform_finite_strings(values, method)
 }
 
 fn transform_finite_strings(values: FiniteStrings, method: &str) -> Option<FiniteStrings> {
@@ -8310,22 +8206,16 @@ impl ReactWrapperReturnCollector {
     fn finite_bound_capture_value_state(
         &self,
         captures: &BTreeSet<String>,
-    ) -> (
-        BTreeSet<usize>,
-        BTreeSet<FiniteBoundCaptureBinding>,
-        BTreeMap<String, BTreeSet<usize>>,
-        BTreeMap<String, BTreeSet<usize>>,
-        BTreeMap<FiniteBoundCaptureBinding, BTreeSet<usize>>,
-    ) {
+    ) -> FiniteBoundCaptureValueState {
         let provenance = self.finite_bound_capture_provenance(captures);
         let resolved_names = captures
             .iter()
-            .filter_map(|capture| {
-                (!self
+            .filter(|&capture| {
+                !self
                     .finite_bound_capture_provenance(&BTreeSet::from([capture.clone()]))
-                    .is_empty())
-                .then(|| self.finite_bound_capture_binding(capture))
+                    .is_empty()
             })
+            .map(|capture| self.finite_bound_capture_binding(capture))
             .collect();
         let dependency_depths = captures
             .iter()
@@ -9793,7 +9683,7 @@ impl ReactWrapperReturnCollector {
         &self,
         binding: &FiniteBoundCaptureBinding,
         path: &str,
-    ) -> Option<(BTreeMap<String, BTreeSet<usize>>, BTreeSet<usize>)> {
+    ) -> Option<FiniteBoundCaptureMemberState> {
         let aliases = self
             .finite_bound_capture_aliases
             .get(binding)
@@ -10329,11 +10219,7 @@ impl ReactWrapperReturnCollector {
     fn argument_param_combinations(
         &self,
         call: &CallExpression<'_>,
-    ) -> Vec<(
-        Vec<Option<usize>>,
-        BTreeMap<usize, BTreeSet<WrapperCallableTarget>>,
-        BTreeSet<usize>,
-    )> {
+    ) -> Vec<WrapperArgumentParamCombination> {
         let mut combinations = Vec::new();
         let argument_count = call.arguments.len();
         let argument_targets = call
@@ -12015,15 +11901,14 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             JSXElementName::IdentifierReference(identifier) => {
                 self.record_escaped_finite_bound_identifier(identifier.name.as_str());
             }
-            JSXElementName::MemberExpression(member) => match &member.object {
-                JSXMemberExpressionObject::IdentifierReference(identifier) => {
+            JSXElementName::MemberExpression(member) => {
+                if let JSXMemberExpressionObject::IdentifierReference(identifier) = &member.object {
                     self.record_escaped_finite_bound_member(
                         identifier.name.as_str(),
                         member.property.name.as_str(),
                     );
                 }
-                _ => {}
-            },
+            }
             _ => {}
         }
         let mut provenance = match &element.opening_element.name {
@@ -12746,12 +12631,11 @@ impl<'a> Visit<'a> for MessageKeyHelperCollector {
             walk::walk_call_expression(self, call);
             return;
         };
-        if callee == "getMessage" {
-            if let Some(Argument::Identifier(identifier)) = call.arguments.get(1) {
-                if let Some(index) = self.param_names.get(identifier.name.as_str()) {
-                    self.param_indexes.insert(*index);
-                }
-            }
+        if callee == "getMessage"
+            && let Some(Argument::Identifier(identifier)) = call.arguments.get(1)
+            && let Some(index) = self.param_names.get(identifier.name.as_str())
+        {
+            self.param_indexes.insert(*index);
         }
         walk::walk_call_expression(self, call);
     }
@@ -12762,6 +12646,20 @@ impl<'a> Visit<'a> for MessageKeyHelperCollector {
 }
 
 impl HelperBodyCollector {
+    fn helper_summary_context(&self) -> HelperSummaryContext<'_> {
+        HelperSummaryContext {
+            helpers: &self.helpers,
+            finite_constants: &self.finite_constants,
+            finite_iterables: &self.finite_iterables,
+            finite_object_maps: &self.finite_object_maps,
+            finite_record_constants: &self.finite_record_constants,
+            finite_record_iterables: &self.finite_record_iterables,
+            finite_record_maps: &self.finite_record_maps,
+            enum_member_domains: &self.enum_member_domains,
+            source_context: self.source_context.as_ref(),
+        }
+    }
+
     fn record_dynamic_jsx_param_refs(&mut self, expression: &Expression<'_>) {
         for name in forwarded_identifier_names(expression) {
             if let Some(param_index) = self.param_names.get(&name) {
@@ -13065,7 +12963,7 @@ impl HelperBodyCollector {
 
     fn invalidate_escaped_param_argument_arrays(&mut self, call: &CallExpression<'_>) {
         let safe_apply_index = call.callee.get_member_expr().and_then(|member| {
-            (member.static_property_name().as_deref() == Some("apply")
+            (member.static_property_name() == Some("apply")
                 && self.helper_summary_for_callee(member.object()).is_some())
             .then_some(1)
         });
@@ -13450,7 +13348,7 @@ impl HelperBodyCollector {
         let Some(method) = member.static_property_name() else {
             return false;
         };
-        if !matches!(method.as_ref(), "map" | "flatMap" | "forEach") {
+        if !matches!(method, "map" | "flatMap" | "forEach") {
             return false;
         }
         let Some(values) = self.finite_iterable_from_expression(member.object()) else {
@@ -13512,7 +13410,7 @@ impl HelperBodyCollector {
         let Some(method) = member.static_property_name() else {
             return false;
         };
-        if !matches!(method.as_ref(), "map" | "flatMap" | "forEach") {
+        if !matches!(method, "map" | "flatMap" | "forEach") {
             return false;
         }
         let Some(values) = self.finite_record_iterable_from_expression(member.object()) else {
@@ -13648,21 +13546,10 @@ impl<'a> Visit<'a> for HelperBodyCollector {
             .and_then(Expression::get_identifier_reference)
             .and_then(|source| self.param_paths.get(source.name.as_str()).cloned());
         let derived_helper = declarator.init.as_ref().and_then(|init| {
-            helper_summary_from_expression_with_context(
-                init,
-                &self.helpers,
-                &self.finite_constants,
-                &self.finite_iterables,
-                &self.finite_object_maps,
-                &self.finite_record_constants,
-                &self.finite_record_iterables,
-                &self.finite_record_maps,
-                &self.enum_member_domains,
-                self.source_context.as_ref(),
-            )
+            helper_summary_from_expression_with_context(init, self.helper_summary_context())
         });
         let param_argument_array = (declarator.kind == VariableDeclarationKind::Const)
-            .then(|| declarator.init.as_ref())
+            .then_some(declarator.init.as_ref())
             .flatten()
             .and_then(|init| self.param_argument_array_from_expression(init));
         let param_argument_array_alias = declarator
@@ -13702,74 +13589,68 @@ impl<'a> Visit<'a> for HelperBodyCollector {
             self.param_argument_arrays
                 .insert(name.to_string(), bindings);
         }
-        if declarator.kind == VariableDeclarationKind::Const {
-            if let Some(name) = binding_identifier_name(&declarator.id) {
-                if let Some(init) = &declarator.init {
-                    let mut domains = BTreeMap::new();
-                    record_enum_member_domains_from_expression(init, &mut domains);
-                    for (name, values) in domains {
-                        self.record_enum_domain_before_change(&name);
-                        self.enum_member_domains
-                            .entry(name)
-                            .or_default()
-                            .extend(values);
-                    }
-                    if let Some(values) = finite_strings_from_expression(
-                        init,
-                        &self.finite_constants,
-                        &self.finite_object_maps,
-                        &self.enum_member_domains,
-                    ) {
-                        self.finite_constants.insert(name.to_string(), values);
-                    }
-                    if let Some(values) = self.finite_iterable_from_expression(init) {
-                        self.finite_iterables.insert(name.to_string(), values);
-                    }
-                    if let Some(values) = finite_object_map_from_expression(
-                        init,
-                        &self.finite_constants,
-                        &self.finite_object_maps,
-                        &self.enum_member_domains,
-                    ) {
-                        self.finite_object_maps.insert(name.to_string(), values);
-                    }
-                    if let Some(values) = self.finite_record_iterable_from_expression(init) {
-                        self.finite_record_iterables
-                            .insert(name.to_string(), values);
-                    }
-                    if let Some(values) = self.finite_record_from_expression(init) {
-                        self.finite_record_constants
-                            .insert(name.to_string(), values);
-                    }
-                    if let Some(values) = finite_record_map_from_expression(
-                        init,
-                        &self.finite_constants,
-                        &self.finite_object_maps,
-                        &self.enum_member_domains,
-                        &self.finite_record_iterables,
-                        &self.finite_record_maps,
-                    ) {
-                        self.finite_record_maps.insert(name.to_string(), values);
-                    }
-                }
+        if declarator.kind == VariableDeclarationKind::Const
+            && let Some(name) = binding_identifier_name(&declarator.id)
+            && let Some(init) = &declarator.init
+        {
+            let mut domains = BTreeMap::new();
+            record_enum_member_domains_from_expression(init, &mut domains);
+            for (name, values) in domains {
+                self.record_enum_domain_before_change(&name);
+                self.enum_member_domains
+                    .entry(name)
+                    .or_default()
+                    .extend(values);
+            }
+            if let Some(values) = finite_strings_from_expression(
+                init,
+                &self.finite_constants,
+                &self.finite_object_maps,
+                &self.enum_member_domains,
+            ) {
+                self.finite_constants.insert(name.to_string(), values);
+            }
+            if let Some(values) = self.finite_iterable_from_expression(init) {
+                self.finite_iterables.insert(name.to_string(), values);
+            }
+            if let Some(values) = finite_object_map_from_expression(
+                init,
+                &self.finite_constants,
+                &self.finite_object_maps,
+                &self.enum_member_domains,
+            ) {
+                self.finite_object_maps.insert(name.to_string(), values);
+            }
+            if let Some(values) = self.finite_record_iterable_from_expression(init) {
+                self.finite_record_iterables
+                    .insert(name.to_string(), values);
+            }
+            if let Some(values) = self.finite_record_from_expression(init) {
+                self.finite_record_constants
+                    .insert(name.to_string(), values);
+            }
+            if let Some(values) = finite_record_map_from_expression(
+                init,
+                &self.finite_constants,
+                &self.finite_object_maps,
+                &self.enum_member_domains,
+                &self.finite_record_iterables,
+                &self.finite_record_maps,
+            ) {
+                self.finite_record_maps.insert(name.to_string(), values);
             }
         }
         walk::walk_variable_declarator(self, declarator);
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if let Some(member) = call.callee.get_member_expr() {
-            if let Some(method) = member.static_property_name()
-                && ARRAY_MUTATING_METHODS.contains(&method.as_ref())
-            {
-                if let Some(identifier) = member.object().get_identifier_reference() {
-                    if let Some(array) =
-                        self.param_argument_arrays.get_mut(identifier.name.as_str())
-                    {
-                        array.safe_layout = false;
-                    }
-                }
-            }
+        if let Some(member) = call.callee.get_member_expr()
+            && let Some(method) = member.static_property_name()
+            && ARRAY_MUTATING_METHODS.contains(&method)
+            && let Some(identifier) = member.object().get_identifier_reference()
+            && let Some(array) = self.param_argument_arrays.get_mut(identifier.name.as_str())
+        {
+            array.safe_layout = false;
         }
 
         self.invalidate_escaped_param_argument_arrays(call);
@@ -13862,22 +13743,22 @@ impl<'a> Visit<'a> for HelperBodyCollector {
     fn visit_arrow_function_expression(&mut self, _arrow: &ArrowFunctionExpression<'a>) {}
 
     fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
-        if let Some(name) = assignment_target_member_object_name(&expression.left) {
-            if let Some(array) = self.param_argument_arrays.get_mut(name) {
-                array.safe_layout = false;
-            }
+        if let Some(name) = assignment_target_member_object_name(&expression.left)
+            && let Some(array) = self.param_argument_arrays.get_mut(name)
+        {
+            array.safe_layout = false;
         }
         walk::walk_assignment_expression(self, expression);
     }
 
     fn visit_for_of_statement(&mut self, statement: &ForOfStatement<'a>) {
-        if let Some(values) = self.finite_record_iterable_from_expression(&statement.right) {
-            if let Some(binding) = self.for_of_binding_name(statement).map(str::to_string) {
-                self.with_finite_record_constant(&binding, values, |collector| {
-                    collector.visit_statement(&statement.body);
-                });
-                return;
-            }
+        if let Some(values) = self.finite_record_iterable_from_expression(&statement.right)
+            && let Some(binding) = self.for_of_binding_name(statement).map(str::to_string)
+        {
+            self.with_finite_record_constant(&binding, values, |collector| {
+                collector.visit_statement(&statement.body);
+            });
+            return;
         }
 
         let Some(values) = self.finite_iterable_from_expression(&statement.right) else {
@@ -14033,12 +13914,11 @@ impl<'a> Visit<'a> for ReturnRecordCollector {
                 .remove(identifier.name.as_str());
             self.react_namespaces.remove(identifier.name.as_str());
         }
-        if declarator.kind == VariableDeclarationKind::Const {
-            if let Some(name) = binding_identifier_name(&declarator.id) {
-                if let Some(init) = &declarator.init {
-                    self.record_const_init(name, init);
-                }
-            }
+        if declarator.kind == VariableDeclarationKind::Const
+            && let Some(name) = binding_identifier_name(&declarator.id)
+            && let Some(init) = &declarator.init
+        {
+            self.record_const_init(name, init);
         }
         walk::walk_variable_declarator(self, declarator);
     }
@@ -14051,31 +13931,30 @@ impl<'a> Visit<'a> for ReturnRecordCollector {
         if member
             .static_property_name()
             .is_some_and(|method| method == "push")
+            && let Some(object) = member.object().get_identifier_reference()
         {
-            if let Some(object) = member.object().get_identifier_reference() {
-                let mut appended = Vec::new();
-                for argument in &call.arguments {
-                    let Argument::ObjectExpression(object) = argument else {
-                        continue;
-                    };
-                    if let Some(record) = finite_record_from_object(
-                        object,
-                        &self.finite_constants,
-                        &self.finite_object_maps,
-                        &self.enum_member_domains,
-                        &self.finite_record_iterables,
-                        &self.finite_record_maps,
-                    ) {
-                        appended.push(record);
-                    }
+            let mut appended = Vec::new();
+            for argument in &call.arguments {
+                let Argument::ObjectExpression(object) = argument else {
+                    continue;
+                };
+                if let Some(record) = finite_record_from_object(
+                    object,
+                    &self.finite_constants,
+                    &self.finite_object_maps,
+                    &self.enum_member_domains,
+                    &self.finite_record_iterables,
+                    &self.finite_record_maps,
+                ) {
+                    appended.push(record);
                 }
-                if !appended.is_empty() {
-                    self.finite_record_iterables
-                        .entry(object.name.to_string())
-                        .or_default()
-                        .extend(appended);
-                    return;
-                }
+            }
+            if !appended.is_empty() {
+                self.finite_record_iterables
+                    .entry(object.name.to_string())
+                    .or_default()
+                    .extend(appended);
+                return;
             }
         }
         walk::walk_call_expression(self, call);
@@ -14128,30 +14007,29 @@ impl ReturnValueCollector {
 
 impl<'a> Visit<'a> for ReturnValueCollector {
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
-        if declarator.kind == VariableDeclarationKind::Const {
-            if let Some(name) = binding_identifier_name(&declarator.id) {
-                if let Some(init) = &declarator.init {
-                    record_enum_member_domains_from_expression(init, &mut self.enum_member_domains);
-                    if let Some(values) = finite_strings_from_expression(
-                        init,
-                        &self.finite_constants,
-                        &self.finite_object_maps,
-                        &self.enum_member_domains,
-                    ) {
-                        self.finite_constants.insert(name.to_string(), values);
-                    }
-                    if let Some(values) = self.finite_iterable_from_expression(init) {
-                        self.finite_iterables.insert(name.to_string(), values);
-                    }
-                    if let Some(values) = finite_object_map_from_expression(
-                        init,
-                        &self.finite_constants,
-                        &self.finite_object_maps,
-                        &self.enum_member_domains,
-                    ) {
-                        self.finite_object_maps.insert(name.to_string(), values);
-                    }
-                }
+        if declarator.kind == VariableDeclarationKind::Const
+            && let Some(name) = binding_identifier_name(&declarator.id)
+            && let Some(init) = &declarator.init
+        {
+            record_enum_member_domains_from_expression(init, &mut self.enum_member_domains);
+            if let Some(values) = finite_strings_from_expression(
+                init,
+                &self.finite_constants,
+                &self.finite_object_maps,
+                &self.enum_member_domains,
+            ) {
+                self.finite_constants.insert(name.to_string(), values);
+            }
+            if let Some(values) = self.finite_iterable_from_expression(init) {
+                self.finite_iterables.insert(name.to_string(), values);
+            }
+            if let Some(values) = finite_object_map_from_expression(
+                init,
+                &self.finite_constants,
+                &self.finite_object_maps,
+                &self.enum_member_domains,
+            ) {
+                self.finite_object_maps.insert(name.to_string(), values);
             }
         }
         walk::walk_variable_declarator(self, declarator);
@@ -14548,10 +14426,8 @@ impl TranslatorReturnCollector {
                             })
                     })
                     .collect::<Vec<_>>();
-                argument_params
-                    .iter()
-                    .any(Option::is_some)
-                    .then(|| {
+                if argument_params.iter().any(Option::is_some) {
+                    {
                         BTreeSet::from([TranslatorReturnForward::ForwardCall {
                             namespace,
                             name,
@@ -14559,8 +14435,10 @@ impl TranslatorReturnCollector {
                             argument_targets: BTreeMap::new(),
                             wrapper_arguments: BTreeSet::new(),
                         }])
-                    })
-                    .unwrap_or_default()
+                    }
+                } else {
+                    Default::default()
+                }
             }
             Expression::AwaitExpression(await_expression) => {
                 self.parameter_calls_from_expression(&await_expression.argument)
@@ -14731,7 +14609,7 @@ impl TranslatorReturnCollector {
                         .and_then(|expression| self.object_binding_from_expression(expression));
                 }
                 let receiver = self.array_binding_from_expression(member.object());
-                match method.as_ref() {
+                match method {
                     "concat" => {
                         let arguments = call.arguments.iter().filter_map(|argument| {
                             argument.as_expression().and_then(|expression| {
@@ -14826,11 +14704,9 @@ impl TranslatorReturnCollector {
             Expression::ArrowFunctionExpression(arrow) => {
                 self.callback_summary_from_parts(&arrow.params, Some(&arrow.body), arrow.expression)
             }
-            Expression::FunctionExpression(function) => self.callback_summary_from_parts(
-                &function.params,
-                function.body.as_ref().map(|body| &**body),
-                false,
-            ),
+            Expression::FunctionExpression(function) => {
+                self.callback_summary_from_parts(&function.params, function.body.as_deref(), false)
+            }
             _ => None,
         }
     }
@@ -15492,6 +15368,34 @@ struct IndexBindingEnvironment {
 }
 
 impl SourceIndexCollector {
+    fn helper_summary_context(&self) -> HelperSummaryContext<'_> {
+        HelperSummaryContext {
+            helpers: &self.helpers,
+            finite_constants: &self.finite_constants,
+            finite_iterables: &self.finite_iterables,
+            finite_object_maps: &self.finite_object_maps,
+            finite_record_constants: &self.finite_record_constants,
+            finite_record_iterables: &self.finite_record_iterables,
+            finite_record_maps: &self.finite_record_maps,
+            enum_member_domains: &self.enum_member_domains,
+            source_context: Some(&self.source_context),
+        }
+    }
+
+    fn finite_record_return_context(&self) -> FiniteRecordReturnContext {
+        FiniteRecordReturnContext {
+            finite_constants: self.finite_constants.clone(),
+            finite_iterables: self.finite_iterables.clone(),
+            finite_object_maps: self.finite_object_maps.clone(),
+            finite_record_constants: self.finite_record_constants.clone(),
+            finite_record_iterables: self.finite_record_iterables.clone(),
+            finite_record_maps: self.finite_record_maps.clone(),
+            enum_member_domains: self.enum_member_domains.clone(),
+            react_use_memo_identifiers: self.react_use_memo_identifiers(),
+            react_namespaces: self.react_namespaces(),
+        }
+    }
+
     fn react_use_memo_identifiers(&self) -> BTreeSet<String> {
         self.imports
             .iter()
@@ -15508,10 +15412,14 @@ impl SourceIndexCollector {
             .iter()
             .filter(|(_, source)| source.as_str() == "react")
             .map(|(name, _)| name.clone())
-            .chain(self.imports.iter().filter_map(|(name, target)| {
-                (target.source == "react" && matches!(target.imported, ImportedName::Default))
-                    .then(|| name.clone())
-            }))
+            .chain(
+                self.imports
+                    .iter()
+                    .filter(|&(_, target)| {
+                        target.source == "react" && matches!(target.imported, ImportedName::Default)
+                    })
+                    .map(|(name, _)| name.clone()),
+            )
             .collect()
     }
 
@@ -15994,9 +15902,11 @@ impl SourceIndexCollector {
             let binding = collector.binding_from_expression(&statement.expression);
             let array_binding = collector.array_binding_from_expression(&statement.expression);
             let array_param_indexes = collector.array_params_from_expression(&statement.expression);
-            let forwards = (binding.is_none() && array_binding.is_none())
-                .then(|| collector.forwards_from_expression(&statement.expression))
-                .unwrap_or_default();
+            let forwards = if binding.is_none() && array_binding.is_none() {
+                collector.forwards_from_expression(&statement.expression)
+            } else {
+                Default::default()
+            };
             return TranslatorReturnSummary {
                 binding,
                 array_binding,
@@ -16254,18 +16164,9 @@ impl SourceIndexCollector {
             let Some(init) = &declarator.init else {
                 continue;
             };
-            if let Some(summary) = helper_summary_from_expression_with_context(
-                init,
-                &self.helpers,
-                &self.finite_constants,
-                &self.finite_iterables,
-                &self.finite_object_maps,
-                &self.finite_record_constants,
-                &self.finite_record_iterables,
-                &self.finite_record_maps,
-                &self.enum_member_domains,
-                Some(&self.source_context),
-            ) {
+            if let Some(summary) =
+                helper_summary_from_expression_with_context(init, self.helper_summary_context())
+            {
                 self.record_helper(name, summary);
             }
             if let Some(summary) = finite_return_summary_from_expression(init) {
@@ -16415,28 +16316,12 @@ impl SourceIndexCollector {
                         jsx_component_summary_from_body(
                             &parameter.pattern,
                             body,
-                            &self.helpers,
-                            &self.finite_constants,
-                            &self.finite_iterables,
-                            &self.finite_object_maps,
-                            &self.finite_record_constants,
-                            &self.finite_record_iterables,
-                            &self.finite_record_maps,
-                            &self.enum_member_domains,
-                            &self.source_context,
+                            self.helper_summary_context(),
                         )
                     });
                 if let Some(summary) = helper_summary_from_function_with_context(
                     function,
-                    &self.helpers,
-                    &self.finite_constants,
-                    &self.finite_iterables,
-                    &self.finite_object_maps,
-                    &self.finite_record_constants,
-                    &self.finite_record_iterables,
-                    &self.finite_record_maps,
-                    &self.enum_member_domains,
-                    Some(&self.source_context),
+                    self.helper_summary_context(),
                 ) {
                     self.default_summary = Some(summary);
                 }
@@ -16446,15 +16331,7 @@ impl SourceIndexCollector {
                 let default_record_return_summary =
                     finite_record_return_summary_from_function_with_context(
                         function,
-                        &self.finite_constants,
-                        &self.finite_iterables,
-                        &self.finite_object_maps,
-                        &self.finite_record_constants,
-                        &self.finite_record_iterables,
-                        &self.finite_record_maps,
-                        &self.enum_member_domains,
-                        self.react_use_memo_identifiers(),
-                        self.react_namespaces(),
+                        self.finite_record_return_context(),
                     );
                 self.default_record_return_summary = default_record_return_summary.clone();
                 let translator_return = function
@@ -16496,28 +16373,12 @@ impl SourceIndexCollector {
                     jsx_component_summary_from_body(
                         &parameter.pattern,
                         &arrow.body,
-                        &self.helpers,
-                        &self.finite_constants,
-                        &self.finite_iterables,
-                        &self.finite_object_maps,
-                        &self.finite_record_constants,
-                        &self.finite_record_iterables,
-                        &self.finite_record_maps,
-                        &self.enum_member_domains,
-                        &self.source_context,
+                        self.helper_summary_context(),
                     )
                 });
                 self.default_summary = Some(helper_summary_from_arrow_with_context(
                     arrow,
-                    &self.helpers,
-                    &self.finite_constants,
-                    &self.finite_iterables,
-                    &self.finite_object_maps,
-                    &self.finite_record_constants,
-                    &self.finite_record_iterables,
-                    &self.finite_record_maps,
-                    &self.enum_member_domains,
-                    Some(&self.source_context),
+                    self.helper_summary_context(),
                 ));
                 self.default_return_summary = finite_return_summary_from_arrow(arrow);
                 if let Some(summary) = finite_record_return_summary_from_arrow(arrow) {
@@ -16544,28 +16405,12 @@ impl SourceIndexCollector {
                         jsx_component_summary_from_body(
                             &parameter.pattern,
                             body,
-                            &self.helpers,
-                            &self.finite_constants,
-                            &self.finite_iterables,
-                            &self.finite_object_maps,
-                            &self.finite_record_constants,
-                            &self.finite_record_iterables,
-                            &self.finite_record_maps,
-                            &self.enum_member_domains,
-                            &self.source_context,
+                            self.helper_summary_context(),
                         )
                     });
                 self.default_summary = helper_summary_from_function_with_context(
                     function,
-                    &self.helpers,
-                    &self.finite_constants,
-                    &self.finite_iterables,
-                    &self.finite_object_maps,
-                    &self.finite_record_constants,
-                    &self.finite_record_iterables,
-                    &self.finite_record_maps,
-                    &self.enum_member_domains,
-                    Some(&self.source_context),
+                    self.helper_summary_context(),
                 );
                 self.default_return_summary = finite_return_summary_from_function(function);
                 if let Some(summary) = finite_record_return_summary_from_function(function) {
@@ -16670,10 +16515,10 @@ impl<'a> Visit<'a> for SourceIndexCollector {
         }
         self.scope_binding_names.pop();
         self.scope_depth = self.scope_depth.saturating_sub(1);
-        if self.scope_depth > 0 {
-            if let Some(environment) = self.binding_scopes.pop() {
-                self.restore_binding_environment(environment);
-            }
+        if self.scope_depth > 0
+            && let Some(environment) = self.binding_scopes.pop()
+        {
+            self.restore_binding_environment(environment);
         }
     }
 
@@ -16792,35 +16637,17 @@ impl<'a> Visit<'a> for SourceIndexCollector {
             }
             if let (Some(parameter), Some(body)) =
                 (function.params.items.first(), function.body.as_ref())
-            {
-                if let Some(summary) = jsx_component_summary_from_body(
+                && let Some(summary) = jsx_component_summary_from_body(
                     &parameter.pattern,
                     body,
-                    &self.helpers,
-                    &self.finite_constants,
-                    &self.finite_iterables,
-                    &self.finite_object_maps,
-                    &self.finite_record_constants,
-                    &self.finite_record_iterables,
-                    &self.finite_record_maps,
-                    &self.enum_member_domains,
-                    &self.source_context,
-                ) {
-                    self.jsx_components.insert(id.name.to_string(), summary);
-                }
+                    self.helper_summary_context(),
+                )
+            {
+                self.jsx_components.insert(id.name.to_string(), summary);
             }
-            if let Some(summary) = helper_summary_from_function_with_context(
-                function,
-                &self.helpers,
-                &self.finite_constants,
-                &self.finite_iterables,
-                &self.finite_object_maps,
-                &self.finite_record_constants,
-                &self.finite_record_iterables,
-                &self.finite_record_maps,
-                &self.enum_member_domains,
-                Some(&self.source_context),
-            ) {
+            if let Some(summary) =
+                helper_summary_from_function_with_context(function, self.helper_summary_context())
+            {
                 self.record_helper(id.name.as_str(), summary);
             }
             if let Some(summary) = finite_return_summary_from_function(function) {
@@ -16828,15 +16655,7 @@ impl<'a> Visit<'a> for SourceIndexCollector {
             }
             if let Some(summary) = finite_record_return_summary_from_function_with_context(
                 function,
-                &self.finite_constants,
-                &self.finite_iterables,
-                &self.finite_object_maps,
-                &self.finite_record_constants,
-                &self.finite_record_iterables,
-                &self.finite_record_maps,
-                &self.enum_member_domains,
-                self.react_use_memo_identifiers(),
-                self.react_namespaces(),
+                self.finite_record_return_context(),
             ) {
                 self.record_return_record_helper(id.name.as_str(), summary);
             }
@@ -16851,16 +16670,18 @@ impl<'a> Visit<'a> for SourceIndexCollector {
     }
 
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
-        let var_names = (declarator.kind == VariableDeclarationKind::Var)
-            .then(|| {
+        let var_names = if declarator.kind == VariableDeclarationKind::Var {
+            {
                 declarator
                     .id
                     .get_binding_identifiers()
                     .into_iter()
                     .map(|identifier| identifier.name.to_string())
                     .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            }
+        } else {
+            Default::default()
+        };
         self.pending_var_bindings.extend(var_names.iter().cloned());
         if self.scope_depth == 1
             || (declarator.kind == VariableDeclarationKind::Var && self.function_scope_depth == 0)
@@ -16897,183 +16718,155 @@ impl<'a> Visit<'a> for SourceIndexCollector {
                 _ => {}
             }
         }
-        if let Some(name) = binding_identifier_name(&declarator.id) {
-            if let Some(init) = &declarator.init {
-                if declarator.kind == VariableDeclarationKind::Const {
-                    record_enum_member_domains_from_expression(init, &mut self.enum_member_domains);
-                    if let Some(values) = finite_strings_from_expression(
-                        init,
-                        &self.finite_constants,
-                        &self.finite_object_maps,
-                        &self.enum_member_domains,
-                    ) {
-                        self.record_finite_constant(name, values);
-                    }
-                    if let Some(values) = finite_iterable_from_expression(
-                        init,
-                        &self.finite_constants,
-                        &self.finite_iterables,
-                        &self.finite_object_maps,
-                        &self.enum_member_domains,
-                    ) {
-                        self.record_finite_iterable(name, values);
-                    }
-                    if let Some(values) = finite_object_map_from_expression(
-                        init,
-                        &self.finite_constants,
-                        &self.finite_object_maps,
-                        &self.enum_member_domains,
-                    ) {
-                        self.finite_object_maps.insert(name.to_string(), values);
-                    }
-                    if let Some(values) =
-                        self.contextual_finite_record_iterable_from_expression(init)
-                    {
-                        self.record_finite_record_iterable(name, values);
-                    }
-                    if let Some(values) = finite_record_from_expression(
-                        init,
-                        &self.finite_constants,
-                        &self.finite_object_maps,
-                        &self.enum_member_domains,
-                        &self.finite_record_iterables,
-                        &self.finite_record_maps,
-                    ) {
-                        self.record_finite_record_constant(name, values);
-                    }
-                    if let Some(values) = finite_record_map_from_expression(
-                        init,
-                        &self.finite_constants,
-                        &self.finite_object_maps,
-                        &self.enum_member_domains,
-                        &self.finite_record_iterables,
-                        &self.finite_record_maps,
-                    ) {
-                        self.finite_record_maps.insert(name.to_string(), values);
-                    }
-                }
-                if let Some(summary) = helper_summary_from_expression_with_context(
+        if let Some(name) = binding_identifier_name(&declarator.id)
+            && let Some(init) = &declarator.init
+        {
+            if declarator.kind == VariableDeclarationKind::Const {
+                record_enum_member_domains_from_expression(init, &mut self.enum_member_domains);
+                if let Some(values) = finite_strings_from_expression(
                     init,
-                    &self.helpers,
+                    &self.finite_constants,
+                    &self.finite_object_maps,
+                    &self.enum_member_domains,
+                ) {
+                    self.record_finite_constant(name, values);
+                }
+                if let Some(values) = finite_iterable_from_expression(
+                    init,
                     &self.finite_constants,
                     &self.finite_iterables,
                     &self.finite_object_maps,
-                    &self.finite_record_constants,
+                    &self.enum_member_domains,
+                ) {
+                    self.record_finite_iterable(name, values);
+                }
+                if let Some(values) = finite_object_map_from_expression(
+                    init,
+                    &self.finite_constants,
+                    &self.finite_object_maps,
+                    &self.enum_member_domains,
+                ) {
+                    self.finite_object_maps.insert(name.to_string(), values);
+                }
+                if let Some(values) = self.contextual_finite_record_iterable_from_expression(init) {
+                    self.record_finite_record_iterable(name, values);
+                }
+                if let Some(values) = finite_record_from_expression(
+                    init,
+                    &self.finite_constants,
+                    &self.finite_object_maps,
+                    &self.enum_member_domains,
                     &self.finite_record_iterables,
                     &self.finite_record_maps,
-                    &self.enum_member_domains,
-                    Some(&self.source_context),
                 ) {
-                    self.record_helper(name, summary);
+                    self.record_finite_record_constant(name, values);
                 }
-                let jsx_summary = match init.get_inner_expression() {
-                    Expression::ArrowFunctionExpression(arrow) => {
-                        arrow.params.items.first().and_then(|parameter| {
-                            jsx_component_summary_from_body(
-                                &parameter.pattern,
-                                &arrow.body,
-                                &self.helpers,
-                                &self.finite_constants,
-                                &self.finite_iterables,
-                                &self.finite_object_maps,
-                                &self.finite_record_constants,
-                                &self.finite_record_iterables,
-                                &self.finite_record_maps,
-                                &self.enum_member_domains,
-                                &self.source_context,
-                            )
-                        })
-                    }
-                    Expression::FunctionExpression(function) => function
-                        .params
-                        .items
-                        .first()
-                        .zip(function.body.as_ref())
-                        .and_then(|(parameter, body)| {
-                            jsx_component_summary_from_body(
-                                &parameter.pattern,
-                                body,
-                                &self.helpers,
-                                &self.finite_constants,
-                                &self.finite_iterables,
-                                &self.finite_object_maps,
-                                &self.finite_record_constants,
-                                &self.finite_record_iterables,
-                                &self.finite_record_maps,
-                                &self.enum_member_domains,
-                                &self.source_context,
-                            )
-                        }),
-                    _ => None,
-                };
-                if let Some(summary) = jsx_summary {
-                    self.jsx_components.insert(name.to_string(), summary);
-                } else {
-                    let aliases = jsx_alias_targets_from_expression(init);
-                    if !aliases.is_empty() {
-                        self.jsx_aliases.insert(name.to_string(), aliases);
-                    }
+                if let Some(values) = finite_record_map_from_expression(
+                    init,
+                    &self.finite_constants,
+                    &self.finite_object_maps,
+                    &self.enum_member_domains,
+                    &self.finite_record_iterables,
+                    &self.finite_record_maps,
+                ) {
+                    self.finite_record_maps.insert(name.to_string(), values);
                 }
-                if let Some(summary) = finite_return_summary_from_expression(init) {
-                    self.record_return_helper(name, summary);
-                }
-                if let Some(summary) = finite_record_return_summary_from_expression(init) {
-                    self.record_return_record_helper(name, summary);
-                }
-                let translator_return = match init.get_inner_expression() {
-                    Expression::ArrowFunctionExpression(arrow) => {
-                        Some(self.translator_return_summary_from_arrow(arrow))
-                    }
-                    Expression::FunctionExpression(function) => {
-                        function.body.as_ref().map(|body| {
-                            self.translator_return_summary_from_body(body, &function.params)
-                        })
-                    }
-                    Expression::CallExpression(call)
-                        if self.call_is_react_wrapper(call, "useCallback") =>
-                    {
-                        call.arguments.first().and_then(|callback| match callback {
-                            Argument::ArrowFunctionExpression(arrow) => {
-                                Some(self.translator_return_summary_from_arrow(arrow))
-                            }
-                            Argument::FunctionExpression(function) => {
-                                function.body.as_ref().map(|body| {
-                                    self.translator_return_summary_from_body(body, &function.params)
-                                })
-                            }
-                            _ => callback.as_expression().and_then(|expression| {
-                                let forwards = translator_return_callable_forwards(expression);
-                                (!forwards.is_empty()).then_some(TranslatorReturnSummary {
-                                    forwards,
-                                    ..TranslatorReturnSummary::default()
-                                })
-                            }),
-                        })
-                    }
-                    _ => {
-                        let forwards = translator_return_callable_forwards(init);
-                        (!forwards.is_empty()).then_some(TranslatorReturnSummary {
-                            binding: None,
-                            array_binding: None,
-                            array_param_indexes: BTreeSet::new(),
-                            forwards,
-                        })
-                    }
-                };
-                if let Some(summary) = translator_return {
-                    self.record_translator_return_summary(name, summary);
-                }
-                let wrapper_return = match init.get_inner_expression() {
-                    Expression::ArrowFunctionExpression(arrow) => {
-                        self.arrow_wrapper_return_summary(arrow)
-                    }
-                    Expression::FunctionExpression(function) => {
-                        self.function_wrapper_return_summary(function)
-                    }
-                    _ => self.wrapper_callable_alias_summary(init),
-                };
-                self.record_wrapper_return_summary(name, wrapper_return);
             }
+            if let Some(summary) =
+                helper_summary_from_expression_with_context(init, self.helper_summary_context())
+            {
+                self.record_helper(name, summary);
+            }
+            let jsx_summary = match init.get_inner_expression() {
+                Expression::ArrowFunctionExpression(arrow) => {
+                    arrow.params.items.first().and_then(|parameter| {
+                        jsx_component_summary_from_body(
+                            &parameter.pattern,
+                            &arrow.body,
+                            self.helper_summary_context(),
+                        )
+                    })
+                }
+                Expression::FunctionExpression(function) => function
+                    .params
+                    .items
+                    .first()
+                    .zip(function.body.as_ref())
+                    .and_then(|(parameter, body)| {
+                        jsx_component_summary_from_body(
+                            &parameter.pattern,
+                            body,
+                            self.helper_summary_context(),
+                        )
+                    }),
+                _ => None,
+            };
+            if let Some(summary) = jsx_summary {
+                self.jsx_components.insert(name.to_string(), summary);
+            } else {
+                let aliases = jsx_alias_targets_from_expression(init);
+                if !aliases.is_empty() {
+                    self.jsx_aliases.insert(name.to_string(), aliases);
+                }
+            }
+            if let Some(summary) = finite_return_summary_from_expression(init) {
+                self.record_return_helper(name, summary);
+            }
+            if let Some(summary) = finite_record_return_summary_from_expression(init) {
+                self.record_return_record_helper(name, summary);
+            }
+            let translator_return = match init.get_inner_expression() {
+                Expression::ArrowFunctionExpression(arrow) => {
+                    Some(self.translator_return_summary_from_arrow(arrow))
+                }
+                Expression::FunctionExpression(function) => function
+                    .body
+                    .as_ref()
+                    .map(|body| self.translator_return_summary_from_body(body, &function.params)),
+                Expression::CallExpression(call)
+                    if self.call_is_react_wrapper(call, "useCallback") =>
+                {
+                    call.arguments.first().and_then(|callback| match callback {
+                        Argument::ArrowFunctionExpression(arrow) => {
+                            Some(self.translator_return_summary_from_arrow(arrow))
+                        }
+                        Argument::FunctionExpression(function) => {
+                            function.body.as_ref().map(|body| {
+                                self.translator_return_summary_from_body(body, &function.params)
+                            })
+                        }
+                        _ => callback.as_expression().and_then(|expression| {
+                            let forwards = translator_return_callable_forwards(expression);
+                            (!forwards.is_empty()).then_some(TranslatorReturnSummary {
+                                forwards,
+                                ..TranslatorReturnSummary::default()
+                            })
+                        }),
+                    })
+                }
+                _ => {
+                    let forwards = translator_return_callable_forwards(init);
+                    (!forwards.is_empty()).then_some(TranslatorReturnSummary {
+                        binding: None,
+                        array_binding: None,
+                        array_param_indexes: BTreeSet::new(),
+                        forwards,
+                    })
+                }
+            };
+            if let Some(summary) = translator_return {
+                self.record_translator_return_summary(name, summary);
+            }
+            let wrapper_return = match init.get_inner_expression() {
+                Expression::ArrowFunctionExpression(arrow) => {
+                    self.arrow_wrapper_return_summary(arrow)
+                }
+                Expression::FunctionExpression(function) => {
+                    self.function_wrapper_return_summary(function)
+                }
+                _ => self.wrapper_callable_alias_summary(init),
+            };
+            self.record_wrapper_return_summary(name, wrapper_return);
         }
         walk::walk_variable_declarator(self, declarator);
         for name in var_names {
@@ -17548,10 +17341,7 @@ impl SourceUsageCollector {
         let collector = self.local_wrapper_index_collector();
         Self::local_wrapper_resolution_from_summary(
             collector.function_wrapper_return_summary(function),
-            self.local_wrapper_definition_shadows(
-                &function.params,
-                function.body.as_ref().map(|body| &**body),
-            ),
+            self.local_wrapper_definition_shadows(&function.params, function.body.as_deref()),
         )
     }
 
@@ -18166,7 +17956,7 @@ impl SourceUsageCollector {
                 }
 
                 if matches!(
-                    method.as_ref(),
+                    method,
                     "and"
                         | "brand"
                         | "catch"
@@ -18276,7 +18066,7 @@ impl SourceUsageCollector {
         }
 
         if matches!(
-            method.as_ref(),
+            method,
             "and"
                 | "brand"
                 | "catch"
@@ -18414,17 +18204,15 @@ impl SourceUsageCollector {
                 }
                 if let Some(property_type) = type_literal_members.and_then(|members| {
                     type_literal_property_annotation(members, property_name.as_ref())
-                }) {
-                    if let Some(properties) = property_domains_from_ts_type(
-                        property_type,
-                        &self.type_property_domains,
-                        &self.type_domains,
-                        &self.enum_member_domains,
-                        &self.zod_schema_property_domains,
-                    ) {
-                        self.typed_object_property_domains
-                            .insert(binding_name.to_string(), properties);
-                    }
+                }) && let Some(properties) = property_domains_from_ts_type(
+                    property_type,
+                    &self.type_property_domains,
+                    &self.type_domains,
+                    &self.enum_member_domains,
+                    &self.zod_schema_property_domains,
+                ) {
+                    self.typed_object_property_domains
+                        .insert(binding_name.to_string(), properties);
                 }
             }
         }
@@ -18662,34 +18450,31 @@ impl SourceUsageCollector {
                         )
                     });
                 }
-                if let Some(member) = call.callee.get_member_expr() {
-                    if let Some(method) = member.static_property_name() {
-                        let records = self.finite_record_iterable_from_expression(member.object());
-                        if let Some(records) = records {
-                            return match method.as_ref() {
-                                "filter" => Some(records),
-                                "slice" => {
-                                    let start = call
-                                        .arguments
-                                        .first()
-                                        .and_then(argument_usize)
-                                        .unwrap_or(0);
-                                    let end = call
-                                        .arguments
-                                        .get(1)
-                                        .and_then(argument_usize)
-                                        .unwrap_or(records.len());
-                                    Some(
-                                        records
-                                            .into_iter()
-                                            .skip(start)
-                                            .take(end.saturating_sub(start))
-                                            .collect(),
-                                    )
-                                }
-                                _ => None,
-                            };
-                        }
+                if let Some(member) = call.callee.get_member_expr()
+                    && let Some(method) = member.static_property_name()
+                {
+                    let records = self.finite_record_iterable_from_expression(member.object());
+                    if let Some(records) = records {
+                        return match method {
+                            "filter" => Some(records),
+                            "slice" => {
+                                let start =
+                                    call.arguments.first().and_then(argument_usize).unwrap_or(0);
+                                let end = call
+                                    .arguments
+                                    .get(1)
+                                    .and_then(argument_usize)
+                                    .unwrap_or(records.len());
+                                Some(
+                                    records
+                                        .into_iter()
+                                        .skip(start)
+                                        .take(end.saturating_sub(start))
+                                        .collect(),
+                                )
+                            }
+                            _ => None,
+                        };
                     }
                 }
                 self.return_record_helper_for_callee(&call.callee)
@@ -18746,9 +18531,7 @@ impl SourceUsageCollector {
             return Some(identifier.name.as_str());
         }
         let member = expression.get_member_expr()?;
-        if !TRANSLATOR_METHODS
-            .contains(&member.static_property_name().as_deref().unwrap_or_default())
-        {
+        if !TRANSLATOR_METHODS.contains(&member.static_property_name().unwrap_or_default()) {
             return None;
         }
         member
@@ -19033,7 +18816,7 @@ impl SourceUsageCollector {
     fn wrapper_array_resolution_for_callee(
         &self,
         callee: &Expression<'_>,
-    ) -> Option<(BTreeSet<usize>, BTreeMap<usize, BTreeSet<usize>>)> {
+    ) -> Option<WrapperArrayResolution> {
         match callee.get_inner_expression() {
             Expression::ConditionalExpression(conditional) => {
                 return Self::merge_wrapper_array_resolutions(
@@ -19130,9 +18913,9 @@ impl SourceUsageCollector {
     }
 
     fn merge_wrapper_array_resolutions(
-        first: Option<(BTreeSet<usize>, BTreeMap<usize, BTreeSet<usize>>)>,
-        second: Option<(BTreeSet<usize>, BTreeMap<usize, BTreeSet<usize>>)>,
-    ) -> Option<(BTreeSet<usize>, BTreeMap<usize, BTreeSet<usize>>)> {
+        first: Option<WrapperArrayResolution>,
+        second: Option<WrapperArrayResolution>,
+    ) -> Option<WrapperArrayResolution> {
         match (first, second) {
             (Some((mut indexes, mut parameters)), Some((other_indexes, other_parameters))) => {
                 indexes.extend(other_indexes);
@@ -19980,7 +19763,7 @@ impl SourceUsageCollector {
         let member = expression.get_member_expr()?;
         let object = member.object().get_identifier_reference()?;
         let name = member.static_property_name()?;
-        let direct = match name.as_ref() {
+        let direct = match name {
             "useTranslations" if self.next_intl_namespaces.contains(object.name.as_str()) => {
                 Some(NextIntlFactory::UseTranslations)
             }
@@ -20300,12 +20083,17 @@ impl SourceUsageCollector {
                 candidates.push(binding.clone());
             }
             if let Some(bindings) = self.translator_object_bindings.get(name) {
-                candidates.extend(bindings.bindings.iter().filter_map(|(property, binding)| {
-                    property_names
-                        .as_ref()
-                        .is_none_or(|properties| properties.contains(property))
-                        .then(|| binding.clone())
-                }));
+                candidates.extend(
+                    bindings
+                        .bindings
+                        .iter()
+                        .filter(|&(property, _)| {
+                            property_names
+                                .as_ref()
+                                .is_none_or(|properties| properties.contains(property))
+                        })
+                        .map(|(_, binding)| binding.clone()),
+                );
                 if !bindings.unknown_paths.is_empty()
                     && !bindings.bindings.is_empty()
                     && property_names.as_ref().is_none_or(|properties| {
@@ -21073,7 +20861,7 @@ impl SourceUsageCollector {
                     return result;
                 }
                 let mut result = self.translator_map_entries_from_expression(member.object())?;
-                match method.as_ref() {
+                match method {
                     "slice" | "filter" | "toReversed" | "toSorted" => Some(result),
                     "concat" => {
                         for argument in &call.arguments {
@@ -21422,18 +21210,19 @@ impl SourceUsageCollector {
                 unknown_contents: !bindings.unknown_paths.is_empty(),
             });
         }
-        if matches!(method, "values" | "entries") && call.arguments.is_empty() {
-            if let Some(map) = self.translator_map_from_expression(member.object()) {
-                let bindings = map.bindings.into_values().map(Some).collect::<Vec<_>>();
-                if !bindings.is_empty() {
-                    return Some(TranslatorArgumentArray {
-                        bindings,
-                        safe_layout: false,
-                        set_like: false,
-                        optional: false,
-                        unknown_contents: !map.unknown_paths.is_empty() || method == "entries",
-                    });
-                }
+        if matches!(method, "values" | "entries")
+            && call.arguments.is_empty()
+            && let Some(map) = self.translator_map_from_expression(member.object())
+        {
+            let bindings = map.bindings.into_values().map(Some).collect::<Vec<_>>();
+            if !bindings.is_empty() {
+                return Some(TranslatorArgumentArray {
+                    bindings,
+                    safe_layout: false,
+                    set_like: false,
+                    optional: false,
+                    unknown_contents: !map.unknown_paths.is_empty() || method == "entries",
+                });
             }
         }
         if method == "from" && is_identifier_expression(member.object(), "Array") {
@@ -21454,7 +21243,7 @@ impl SourceUsageCollector {
             return Some(array);
         }
         let mut array = self.translator_argument_array_from_expression(member.object())?;
-        match method.as_ref() {
+        match method {
             "add" if call.arguments.len() == 1 && array.set_like => {
                 if let Some(binding) = call
                     .arguments
@@ -21674,7 +21463,7 @@ impl SourceUsageCollector {
         let member = call.callee.get_member_expr()?;
         let method = member.static_property_name()?;
         let array = self.translator_argument_array_from_expression(member.object())?;
-        let binding = match method.as_ref() {
+        let binding = match method {
             "shift" if array.safe_layout => array.bindings.first().cloned().flatten(),
             "pop" if array.safe_layout => array.bindings.last().cloned().flatten(),
             "shift" | "pop" | "at" | "find" | "findLast" => {
@@ -21754,7 +21543,7 @@ impl SourceUsageCollector {
                 let Some(method) = member.static_property_name() else {
                     return BTreeSet::new();
                 };
-                if ARRAY_RECEIVER_RETURNING_METHODS.contains(&method.as_ref())
+                if ARRAY_RECEIVER_RETURNING_METHODS.contains(&method)
                     || (method == "add"
                         && self
                             .translator_argument_array_from_expression(member.object())
@@ -21838,12 +21627,12 @@ impl SourceUsageCollector {
 
     fn invalidate_escaped_translator_argument_arrays(&mut self, call: &CallExpression<'_>) {
         let safe_apply_index = call.callee.get_member_expr().and_then(|member| {
-            (member.static_property_name().as_deref() == Some("apply")
+            (member.static_property_name() == Some("apply")
                 && self.helper_summary_for_callee(member.object()).is_some())
             .then_some(1)
         });
         let safe_array_from_index = call.callee.get_member_expr().and_then(|member| {
-            (member.static_property_name().as_deref() == Some("from")
+            (member.static_property_name() == Some("from")
                 && is_identifier_expression(member.object(), "Array"))
             .then_some(0)
         });
@@ -21873,10 +21662,10 @@ impl SourceUsageCollector {
             if let Some(summary) = file_index.return_helper_for_local(callee) {
                 return Some(summary);
             }
-            if let Some(target) = file_index.imports.get(callee) {
-                if let Some(project) = &self.project {
-                    return project.return_helper_for_import(&self.path, target);
-                }
+            if let Some(target) = file_index.imports.get(callee)
+                && let Some(project) = &self.project
+            {
+                return project.return_helper_for_import(&self.path, target);
             }
         }
         None
@@ -21891,10 +21680,10 @@ impl SourceUsageCollector {
             if let Some(summary) = file_index.return_record_helper_for_local(callee) {
                 return Some(summary);
             }
-            if let Some(target) = file_index.imports.get(callee) {
-                if let Some(project) = &self.project {
-                    return project.return_record_helper_for_import(&self.path, target);
-                }
+            if let Some(target) = file_index.imports.get(callee)
+                && let Some(project) = &self.project
+            {
+                return project.return_record_helper_for_import(&self.path, target);
             }
         }
         None
@@ -21919,10 +21708,10 @@ impl SourceUsageCollector {
                 }
                 return file_index.helper_for_local(callee);
             }
-            if let Some(target) = file_index.imports.get(callee) {
-                if let Some(project) = &self.project {
-                    return project.helper_for_import(&self.path, target);
-                }
+            if let Some(target) = file_index.imports.get(callee)
+                && let Some(project) = &self.project
+            {
+                return project.helper_for_import(&self.path, target);
             }
         }
         None
@@ -22217,7 +22006,7 @@ impl SourceUsageCollector {
             }
         }
         let member = call.callee.get_member_expr()?;
-        (member.static_property_name().as_deref() == Some("bind"))
+        (member.static_property_name() == Some("bind"))
             .then(|| self.translator_binding_from_expression(member.object()))
             .flatten()
     }
@@ -22228,7 +22017,7 @@ impl SourceUsageCollector {
     ) -> Option<(String, TranslatorBinding)> {
         let member = call.callee.get_member_expr()?;
         let method = member.static_property_name()?;
-        matches!(method.as_ref(), "call" | "apply" | "bind")
+        matches!(method, "call" | "apply" | "bind")
             .then(|| {
                 self.translator_binding_from_expression(member.object())
                     .map(|binding| (method.to_string(), binding))
@@ -22411,17 +22200,17 @@ impl SourceUsageCollector {
         match (&usage.keys, binding.dynamic_namespace) {
             (Some(keys), false) => {
                 for key in keys {
-                    self.record_used_key_for_binding(&binding, key);
+                    self.record_used_key_for_binding(binding, key);
                 }
             }
             (None, false) => {
                 if let Some(query) = &usage.query {
-                    self.record_dynamic_query_for_binding(&binding, query);
+                    self.record_dynamic_query_for_binding(binding, query);
                 } else {
-                    self.record_dynamic_key_for_binding(&binding, start, None);
+                    self.record_dynamic_key_for_binding(binding, start, None);
                 }
             }
-            _ => self.record_dynamic_key_for_binding(&binding, start, None),
+            _ => self.record_dynamic_key_for_binding(binding, start, None),
         }
     }
 
@@ -22808,10 +22597,9 @@ impl SourceUsageCollector {
             };
             if let Some(object_bindings) =
                 self.translator_object_bindings_from_expression(expression)
+                && let Some(binding) = object_bindings.aggregate_binding()
             {
-                if let Some(binding) = object_bindings.aggregate_binding() {
-                    bindings.push(binding);
-                }
+                bindings.push(binding);
             }
             if let Some(array) = self.translator_argument_array_from_expression(expression) {
                 bindings.extend(array.bindings.into_iter().flatten());
@@ -22900,10 +22688,10 @@ impl SourceUsageCollector {
         property: &str,
     ) -> Option<FiniteStrings> {
         let object = object.get_identifier_reference()?;
-        if let Some(records) = self.finite_record_constants.get(object.name.as_str()) {
-            if let Some(values) = finite_record_property_strings(records, property) {
-                return Some(values);
-            }
+        if let Some(records) = self.finite_record_constants.get(object.name.as_str())
+            && let Some(values) = finite_record_property_strings(records, property)
+        {
+            return Some(values);
         }
         self.typed_object_property_domains
             .get(object.name.as_str())?
@@ -22915,16 +22703,13 @@ impl SourceUsageCollector {
         if let Some(values) = self.finite_strings_from_typed_property_call(call) {
             return Some(values);
         }
-        if call.arguments.is_empty() {
-            if let Some(member) = call.callee.get_member_expr() {
-                if let Some(method) = member.static_property_name() {
-                    if let Some(values) = self.finite_strings_from_expression(member.object()) {
-                        if let Some(values) = transform_finite_strings(values, &method) {
-                            return Some(values);
-                        }
-                    }
-                }
-            }
+        if call.arguments.is_empty()
+            && let Some(member) = call.callee.get_member_expr()
+            && let Some(method) = member.static_property_name()
+            && let Some(values) = self.finite_strings_from_expression(member.object())
+            && let Some(values) = transform_finite_strings(values, method)
+        {
+            return Some(values);
         }
         self.return_helper_for_callee(&call.callee).or_else(|| {
             finite_strings_from_call(
@@ -23234,7 +23019,7 @@ impl SourceUsageCollector {
         let Some(method) = member.static_property_name() else {
             return false;
         };
-        if !matches!(method.as_ref(), "map" | "flatMap" | "forEach") {
+        if !matches!(method, "map" | "flatMap" | "forEach") {
             return false;
         }
         let Some(values) = self.finite_iterable_from_expression(member.object()) else {
@@ -23296,7 +23081,7 @@ impl SourceUsageCollector {
         let Some(method) = member.static_property_name() else {
             return false;
         };
-        if !matches!(method.as_ref(), "map" | "flatMap" | "forEach") {
+        if !matches!(method, "map" | "flatMap" | "forEach") {
             return false;
         }
         let Some(values) = self.finite_record_iterable_from_expression(member.object()) else {
@@ -24211,10 +23996,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     fn leave_scope(&mut self) {
         self.local_wrapper_scope_names.pop();
         self.scope_depth = self.scope_depth.saturating_sub(1);
-        if self.scope_depth > 0 {
-            if let Some(environment) = self.binding_scopes.pop() {
-                self.restore_binding_environment(environment);
-            }
+        if self.scope_depth > 0
+            && let Some(environment) = self.binding_scopes.pop()
+        {
+            self.restore_binding_environment(environment);
         }
     }
 
@@ -24283,37 +24068,36 @@ impl<'a> Visit<'a> for SourceUsageCollector {
 
     fn visit_import_declaration(&mut self, declaration: &ImportDeclaration<'a>) {
         let source = declaration.source.value.as_str();
-        if source == "next-intl"
+        if (source == "next-intl"
             || source == "next-intl/server"
             || source == "use-intl"
-            || source == "use-intl/core"
+            || source == "use-intl/core")
+            && let Some(specifiers) = &declaration.specifiers
         {
-            if let Some(specifiers) = &declaration.specifiers {
-                for specifier in specifiers {
-                    match specifier {
-                        ImportDeclarationSpecifier::ImportSpecifier(specifier) => {
-                            let imported = match &specifier.imported {
-                                ModuleExportName::IdentifierName(identifier) => {
-                                    identifier.name.as_str()
-                                }
-                                ModuleExportName::IdentifierReference(identifier) => {
-                                    identifier.name.as_str()
-                                }
-                                ModuleExportName::StringLiteral(literal) => literal.value.as_str(),
-                            };
-                            let local = specifier.local.name.as_str();
-                            self.record_import(source, imported, local);
-                        }
-                        ImportDeclarationSpecifier::ImportNamespaceSpecifier(specifier) => {
-                            let local = specifier.local.name.to_string();
-                            if source == "next-intl" || source == "use-intl" {
-                                self.next_intl_namespaces.insert(local);
-                            } else if source == "next-intl/server" {
-                                self.next_intl_server_namespaces.insert(local);
+            for specifier in specifiers {
+                match specifier {
+                    ImportDeclarationSpecifier::ImportSpecifier(specifier) => {
+                        let imported = match &specifier.imported {
+                            ModuleExportName::IdentifierName(identifier) => {
+                                identifier.name.as_str()
                             }
-                        }
-                        ImportDeclarationSpecifier::ImportDefaultSpecifier(_) => {}
+                            ModuleExportName::IdentifierReference(identifier) => {
+                                identifier.name.as_str()
+                            }
+                            ModuleExportName::StringLiteral(literal) => literal.value.as_str(),
+                        };
+                        let local = specifier.local.name.as_str();
+                        self.record_import(source, imported, local);
                     }
+                    ImportDeclarationSpecifier::ImportNamespaceSpecifier(specifier) => {
+                        let local = specifier.local.name.to_string();
+                        if source == "next-intl" || source == "use-intl" {
+                            self.next_intl_namespaces.insert(local);
+                        } else if source == "next-intl/server" {
+                            self.next_intl_server_namespaces.insert(local);
+                        }
+                    }
+                    ImportDeclarationSpecifier::ImportDefaultSpecifier(_) => {}
                 }
             }
         }
@@ -24343,10 +24127,8 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             .body
             .as_ref()
             .map(|body| function_var_bindings(body));
-        let enclosing_shadowed_bindings = self.local_wrapper_definition_shadows(
-            &function.params,
-            function.body.as_ref().map(|body| &**body),
-        );
+        let enclosing_shadowed_bindings =
+            self.local_wrapper_definition_shadows(&function.params, function.body.as_deref());
         self.pending_local_wrapper_resolutions = function.body.as_ref().map(|body| {
             self.hoisted_local_wrapper_resolutions(&body.statements, &enclosing_shadowed_bindings)
         });
@@ -24421,17 +24203,20 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     .map(|identifier| identifier.name.to_string())
                     .collect()
             } else {
-                (matches!(declarator.id, BindingPattern::ArrayPattern(_))
-                    && (direct_memo_wrapper || inherited_wrapper_value))
-                    .then(|| {
+                if matches!(declarator.id, BindingPattern::ArrayPattern(_))
+                    && (direct_memo_wrapper || inherited_wrapper_value)
+                {
+                    {
                         declarator
                             .id
                             .get_binding_identifiers()
                             .into_iter()
                             .map(|identifier| identifier.name.to_string())
                             .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
+                    }
+                } else {
+                    Default::default()
+                }
             };
         let mut callback_return_bindings = Vec::new();
         if let Some(Expression::CallExpression(call)) = declarator
@@ -24608,7 +24393,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             .as_ref()
             .and_then(|init| self.translator_object_bindings_from_expression(init));
         let translator_argument_array = (declarator.kind == VariableDeclarationKind::Const)
-            .then(|| declarator.init.as_ref())
+            .then_some(declarator.init.as_ref())
             .flatten()
             .and_then(|init| self.translator_argument_array_from_expression(init));
         let translator_argument_array_aliases = declarator
@@ -24728,12 +24513,11 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             self.translator_callback_returns
                 .insert(name.to_string(), binding);
         }
-        if declarator.kind == VariableDeclarationKind::Const {
-            if let Some(init) = &declarator.init {
-                if let Some(records) = self.finite_record_from_expression(init) {
-                    self.bind_pattern_finite_record_properties(&declarator.id, &records);
-                }
-            }
+        if declarator.kind == VariableDeclarationKind::Const
+            && let Some(init) = &declarator.init
+            && let Some(records) = self.finite_record_from_expression(init)
+        {
+            self.bind_pattern_finite_record_properties(&declarator.id, &records);
         }
 
         if let Some(init) = &declarator.init {
@@ -24962,7 +24746,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         {
             let sources = self.translator_argument_array_alias_sources(member.object());
             if ARRAY_CONTENT_WRITING_METHODS.contains(&method) {
-                let offset = match method.as_ref() {
+                let offset = match method {
                     "fill" => 0,
                     "splice" => 2,
                     "push" | "unshift" => 0,
@@ -25643,13 +25427,13 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             self.restore_binding_environment(environment);
             return;
         }
-        if let Some(values) = self.finite_record_iterable_from_expression(&statement.right) {
-            if let Some(binding) = self.for_of_binding_name(statement).map(str::to_string) {
-                self.with_finite_record_constant(&binding, values, |collector| {
-                    collector.visit_statement(&statement.body);
-                });
-                return;
-            }
+        if let Some(values) = self.finite_record_iterable_from_expression(&statement.right)
+            && let Some(binding) = self.for_of_binding_name(statement).map(str::to_string)
+        {
+            self.with_finite_record_constant(&binding, values, |collector| {
+                collector.visit_statement(&statement.body);
+            });
+            return;
         }
 
         let Some(values) = self.finite_iterable_from_expression(&statement.right) else {
