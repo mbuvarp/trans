@@ -388,6 +388,8 @@ struct SourceFileIndex {
     wrapper_return_helpers: BTreeSet<String>,
     wrapper_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     wrapper_array_return_indexes: BTreeMap<String, BTreeSet<usize>>,
+    wrapper_array_index_forwards:
+        BTreeMap<String, BTreeMap<usize, BTreeSet<TranslatorReturnForward>>>,
     translator_return_export_locals: BTreeMap<String, String>,
     named_exports: BTreeMap<String, HelperSummary>,
     named_jsx_exports: BTreeMap<String, JsxComponentSummary>,
@@ -412,6 +414,7 @@ struct SourceFileIndex {
     default_wrapper_return_export: bool,
     default_wrapper_return_forwards: BTreeSet<TranslatorReturnForward>,
     default_wrapper_array_return_indexes: BTreeSet<usize>,
+    default_wrapper_array_index_forwards: BTreeMap<usize, BTreeSet<TranslatorReturnForward>>,
     default_translator_return_forwards: BTreeSet<TranslatorReturnForward>,
 }
 
@@ -2636,8 +2639,49 @@ impl ProjectIndex {
             return None;
         }
         let file = self.files.get(path)?;
-        if let Some(indexes) = file.wrapper_array_return_indexes.get(name) {
-            return Some(indexes.clone());
+        let mut indexes = file
+            .wrapper_array_return_indexes
+            .get(name)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(candidates) = file.wrapper_array_index_forwards.get(name) {
+            for (index, forwards) in candidates {
+                let resolves = forwards.iter().any(|forward| match forward {
+                    TranslatorReturnForward::Local(callee)
+                    | TranslatorReturnForward::ForwardCall {
+                        namespace: None,
+                        name: callee,
+                        ..
+                    } => {
+                        self.wrapper_return_for_local_at_depth(path, callee, depth + 1)
+                            || file.imports.get(callee).is_some_and(|target| {
+                                self.wrapper_return_for_import_at_depth(path, target, depth + 1)
+                            })
+                    }
+                    TranslatorReturnForward::NamespaceMember { namespace, name }
+                    | TranslatorReturnForward::ForwardCall {
+                        namespace: Some(namespace),
+                        name,
+                        ..
+                    } => file.namespace_imports.get(namespace).is_some_and(|source| {
+                        self.wrapper_return_for_import_at_depth(
+                            path,
+                            &ImportTarget {
+                                source: source.clone(),
+                                imported: ImportedName::Named(name.clone()),
+                            },
+                            depth + 1,
+                        )
+                    }),
+                    TranslatorReturnForward::ParameterCall { .. } => false,
+                });
+                if resolves {
+                    indexes.insert(*index);
+                }
+            }
+        }
+        if !indexes.is_empty() {
+            return Some(indexes);
         }
         file.wrapper_return_forwards
             .get(name)?
@@ -2651,9 +2695,9 @@ impl ProjectIndex {
                 } => self
                     .wrapper_array_indexes_for_local_at_depth(path, callee, depth + 1)
                     .or_else(|| {
-                        file.imports
-                            .get(callee)
-                            .and_then(|target| self.wrapper_array_indexes_for_import(path, target))
+                        file.imports.get(callee).and_then(|target| {
+                            self.wrapper_array_indexes_for_import_at_depth(path, target, depth + 1)
+                        })
                     }),
                 _ => None,
             })
@@ -2664,6 +2708,18 @@ impl ProjectIndex {
         from: &Path,
         target: &ImportTarget,
     ) -> Option<BTreeSet<usize>> {
+        self.wrapper_array_indexes_for_import_at_depth(from, target, 0)
+    }
+
+    fn wrapper_array_indexes_for_import_at_depth(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+        depth: usize,
+    ) -> Option<BTreeSet<usize>> {
+        if depth > 16 {
+            return None;
+        }
         let path = self.resolve_module(from, &target.source)?;
         let file = self.files.get(&path)?;
         match &target.imported {
@@ -2672,24 +2728,58 @@ impl ProjectIndex {
                 .get(name)
                 .and_then(|local| self.wrapper_array_indexes_for_local(&path, local))
                 .or_else(|| {
-                    file.re_exports
-                        .get(name)
-                        .and_then(|target| self.wrapper_array_indexes_for_import(&path, target))
+                    file.re_exports.get(name).and_then(|target| {
+                        self.wrapper_array_indexes_for_import_at_depth(&path, target, depth + 1)
+                    })
                 })
                 .or_else(|| {
                     file.star_re_exports.iter().find_map(|source| {
-                        self.wrapper_array_indexes_for_import(
+                        self.wrapper_array_indexes_for_import_at_depth(
                             &path,
                             &ImportTarget {
                                 source: source.clone(),
                                 imported: ImportedName::Named(name.clone()),
                             },
+                            depth + 1,
                         )
                     })
                 }),
             ImportedName::Default => {
-                if !file.default_wrapper_array_return_indexes.is_empty() {
-                    Some(file.default_wrapper_array_return_indexes.clone())
+                let mut indexes = file.default_wrapper_array_return_indexes.clone();
+                for (index, forwards) in &file.default_wrapper_array_index_forwards {
+                    if forwards.iter().any(|forward| match forward {
+                        TranslatorReturnForward::Local(callee)
+                        | TranslatorReturnForward::ForwardCall {
+                            namespace: None,
+                            name: callee,
+                            ..
+                        } => {
+                            self.wrapper_return_for_local(&path, callee)
+                                || file.imports.get(callee).is_some_and(|target| {
+                                    self.wrapper_return_for_import(&path, target)
+                                })
+                        }
+                        TranslatorReturnForward::NamespaceMember { namespace, name }
+                        | TranslatorReturnForward::ForwardCall {
+                            namespace: Some(namespace),
+                            name,
+                            ..
+                        } => file.namespace_imports.get(namespace).is_some_and(|source| {
+                            self.wrapper_return_for_import(
+                                &path,
+                                &ImportTarget {
+                                    source: source.clone(),
+                                    imported: ImportedName::Named(name.clone()),
+                                },
+                            )
+                        }),
+                        TranslatorReturnForward::ParameterCall { .. } => false,
+                    }) {
+                        indexes.insert(*index);
+                    }
+                }
+                if !indexes.is_empty() {
+                    Some(indexes)
                 } else {
                     file.default_local_export
                         .as_ref()
@@ -6673,6 +6763,7 @@ struct ReactWrapperReturnCollector {
     direct: bool,
     forwards: BTreeSet<TranslatorReturnForward>,
     array_indexes: BTreeSet<usize>,
+    array_index_forwards: BTreeMap<usize, BTreeSet<TranslatorReturnForward>>,
 }
 
 impl ReactWrapperReturnCollector {
@@ -7212,6 +7303,22 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                     })
                     .collect::<Vec<_>>();
                 self.array_indexes.extend(indexes);
+                for (index, expression) in
+                    array
+                        .elements
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, element)| {
+                            element.as_expression().map(|expr| (index, expr))
+                        })
+                {
+                    if !self.array_indexes.contains(&index) {
+                        let forwards = self.forwards_from_expression(expression);
+                        if !forwards.is_empty() {
+                            self.array_index_forwards.insert(index, forwards);
+                        }
+                    }
+                }
             }
         }
     }
@@ -9734,6 +9841,7 @@ struct WrapperReturnSummary {
     direct: bool,
     forwards: BTreeSet<TranslatorReturnForward>,
     array_indexes: BTreeSet<usize>,
+    array_index_forwards: BTreeMap<usize, BTreeSet<TranslatorReturnForward>>,
 }
 
 #[derive(Default)]
@@ -10043,6 +10151,8 @@ struct SourceIndexCollector {
     wrapper_return_helpers: BTreeSet<String>,
     wrapper_return_forwards: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     wrapper_array_return_indexes: BTreeMap<String, BTreeSet<usize>>,
+    wrapper_array_index_forwards:
+        BTreeMap<String, BTreeMap<usize, BTreeSet<TranslatorReturnForward>>>,
     enum_member_domains: TypeDomains,
     translation_factories: BTreeSet<String>,
     next_intl_namespaces: BTreeSet<String>,
@@ -10062,6 +10172,7 @@ struct SourceIndexCollector {
     default_wrapper_return_summary: bool,
     default_wrapper_return_forwards: BTreeSet<TranslatorReturnForward>,
     default_wrapper_array_return_indexes: BTreeSet<usize>,
+    default_wrapper_array_index_forwards: BTreeMap<usize, BTreeSet<TranslatorReturnForward>>,
     binding_scopes: Vec<IndexBindingEnvironment>,
     scope_depth: usize,
 }
@@ -10192,6 +10303,7 @@ impl SourceIndexCollector {
             direct: false,
             forwards: BTreeSet::new(),
             array_indexes: BTreeSet::new(),
+            array_index_forwards: BTreeMap::new(),
         }
     }
 
@@ -10205,6 +10317,7 @@ impl SourceIndexCollector {
             direct: collector.direct,
             forwards: collector.forwards,
             array_indexes: collector.array_indexes,
+            array_index_forwards: collector.array_index_forwards,
         }
     }
 
@@ -10218,6 +10331,50 @@ impl SourceIndexCollector {
         {
             collector.direct = collector.expression_returns_wrapper(&statement.expression);
             collector.collect_forwards(&statement.expression);
+            if let Expression::CallExpression(call) = statement.expression.get_inner_expression()
+                && call.callee.get_member_expr().is_some_and(|member| {
+                    member.static_property_name() == Some("all")
+                        && member
+                            .object()
+                            .get_identifier_reference()
+                            .is_some_and(|id| id.name == "Promise")
+                })
+                && let Some(Expression::ArrayExpression(array)) = call
+                    .arguments
+                    .first()
+                    .and_then(Argument::as_expression)
+                    .map(Expression::get_inner_expression)
+            {
+                let indexes = array
+                    .elements
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, element)| {
+                        element.as_expression().and_then(|expression| {
+                            collector
+                                .expression_returns_wrapper(expression)
+                                .then_some(index)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                collector.array_indexes.extend(indexes);
+                for (index, expression) in
+                    array
+                        .elements
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, element)| {
+                            element.as_expression().map(|expr| (index, expr))
+                        })
+                {
+                    if !collector.array_indexes.contains(&index) {
+                        let forwards = collector.forwards_from_expression(expression);
+                        if !forwards.is_empty() {
+                            collector.array_index_forwards.insert(index, forwards);
+                        }
+                    }
+                }
+            }
         } else {
             collector.visit_function_body(&arrow.body);
         }
@@ -10225,6 +10382,7 @@ impl SourceIndexCollector {
             direct: collector.direct,
             forwards: collector.forwards,
             array_indexes: collector.array_indexes,
+            array_index_forwards: collector.array_index_forwards,
         }
     }
 
@@ -10294,6 +10452,10 @@ impl SourceIndexCollector {
         if !summary.array_indexes.is_empty() {
             self.wrapper_array_return_indexes
                 .insert(name.to_string(), summary.array_indexes);
+        }
+        if !summary.array_index_forwards.is_empty() {
+            self.wrapper_array_index_forwards
+                .insert(name.to_string(), summary.array_index_forwards);
         }
     }
 
@@ -10514,6 +10676,7 @@ impl SourceIndexCollector {
             wrapper_return_helpers: self.wrapper_return_helpers,
             wrapper_return_forwards: self.wrapper_return_forwards,
             wrapper_array_return_indexes: self.wrapper_array_return_indexes,
+            wrapper_array_index_forwards: self.wrapper_array_index_forwards,
             translator_return_export_locals,
             named_exports,
             named_jsx_exports,
@@ -10538,6 +10701,7 @@ impl SourceIndexCollector {
             default_wrapper_return_export,
             default_wrapper_return_forwards: self.default_wrapper_return_forwards,
             default_wrapper_array_return_indexes: self.default_wrapper_array_return_indexes,
+            default_wrapper_array_index_forwards: self.default_wrapper_array_index_forwards,
             default_translator_return_forwards: self.default_translator_return_forwards,
         }
     }
@@ -10774,6 +10938,8 @@ impl SourceIndexCollector {
                 self.default_wrapper_return_summary = wrapper_return.direct;
                 self.default_wrapper_return_forwards = wrapper_return.forwards.clone();
                 self.default_wrapper_array_return_indexes = wrapper_return.array_indexes.clone();
+                self.default_wrapper_array_index_forwards =
+                    wrapper_return.array_index_forwards.clone();
                 self.default_jsx_summary = function
                     .params
                     .items
@@ -10859,6 +11025,7 @@ impl SourceIndexCollector {
                 self.default_wrapper_return_summary = wrapper_return.direct;
                 self.default_wrapper_return_forwards = wrapper_return.forwards;
                 self.default_wrapper_array_return_indexes = wrapper_return.array_indexes;
+                self.default_wrapper_array_index_forwards = wrapper_return.array_index_forwards;
                 self.default_jsx_summary = arrow.params.items.first().and_then(|parameter| {
                     jsx_component_summary_from_body(
                         &parameter.pattern,
@@ -10901,6 +11068,7 @@ impl SourceIndexCollector {
                 self.default_wrapper_return_summary = wrapper_return.direct;
                 self.default_wrapper_return_forwards = wrapper_return.forwards;
                 self.default_wrapper_array_return_indexes = wrapper_return.array_indexes;
+                self.default_wrapper_array_index_forwards = wrapper_return.array_index_forwards;
                 self.default_jsx_summary = function
                     .params
                     .items
@@ -12727,10 +12895,21 @@ impl SourceUsageCollector {
             Expression::AwaitExpression(await_expression) => {
                 self.potential_wrapper_callable_paths_from_expression(&await_expression.argument)
             }
-            Expression::CallExpression(call) => self
-                .object_assign_wrapper_paths(call)
-                .map(|(paths, _)| paths)
-                .unwrap_or_default(),
+            Expression::CallExpression(call) => {
+                if call.callee.get_member_expr().is_some_and(|member| {
+                    member.static_property_name() == Some("entries")
+                        && self.expression_is_potential_wrapper_value(member.object())
+                }) {
+                    PotentialWrapperPaths {
+                        included: BTreeSet::from(["1".to_string()]),
+                        excluded: BTreeSet::new(),
+                    }
+                } else {
+                    self.object_assign_wrapper_paths(call)
+                        .map(|(paths, _)| paths)
+                        .unwrap_or_default()
+                }
+            }
             _ => PotentialWrapperPaths::default(),
         }
     }
@@ -18436,19 +18615,39 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             }
             return;
         }
+        let wrapper_entries = matches!(
+            statement.right.get_inner_expression(),
+            Expression::CallExpression(call)
+                if call.callee.get_member_expr().is_some_and(|member| {
+                    member.static_property_name() == Some("entries")
+                })
+        );
+        if self.expression_is_potential_wrapper_value(&statement.right)
+            && wrapper_entries
+            && let ForStatementLeft::VariableDeclaration(declaration) = &statement.left
+            && let Some(declarator) = declaration.declarations.first()
+            && matches!(declarator.id, BindingPattern::ArrayPattern(_))
+        {
+            let environment = self.binding_environment();
+            self.mask_binding_pattern(&declarator.id);
+            self.bind_pattern_potential_wrapper_paths(
+                &declarator.id,
+                &PotentialWrapperPaths {
+                    included: BTreeSet::from(["1".to_string()]),
+                    excluded: BTreeSet::new(),
+                },
+                &[],
+            );
+            self.visit_statement(&statement.body);
+            self.restore_binding_environment(environment);
+            return;
+        }
         if self.expression_is_potential_wrapper_value(&statement.right)
             && let Some(name) = self.for_of_binding_name(statement).map(str::to_string)
         {
             let environment = self.binding_environment();
             self.mask_binding_name(&name);
-            let entries = matches!(
-                statement.right.get_inner_expression(),
-                Expression::CallExpression(call)
-                    if call.callee.get_member_expr().is_some_and(|member| {
-                        member.static_property_name() == Some("entries")
-                    })
-            );
-            if entries {
+            if wrapper_entries {
                 self.potential_wrapper_callable_paths.insert(
                     name,
                     PotentialWrapperPaths {
