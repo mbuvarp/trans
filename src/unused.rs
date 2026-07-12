@@ -7982,10 +7982,13 @@ impl ReactWrapperReturnCollector {
             .entry(name.to_string())
             .or_default()
             .extend(provenance);
-        self.finite_bound_capture_edge_provenance
+        let target_edges = self
+            .finite_bound_capture_edge_provenance
             .entry(name.to_string())
-            .or_default()
-            .extend(edge_provenance);
+            .or_default();
+        for (binding, provenance) in edge_provenance {
+            target_edges.entry(binding).or_default().extend(provenance);
+        }
         self.finite_bound_resolved_capture_names
             .entry(name.to_string())
             .or_default()
@@ -10043,10 +10046,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
 
     fn visit_with_statement(&mut self, statement: &WithStatement<'a>) {
         self.visit_expression(&statement.object);
-        let captures = self
-            .finite_bound_capture_names_from_expression(&statement.object)
-            .unwrap_or_default();
-        self.record_escaped_finite_bound_captures(captures, BTreeSet::new());
+        self.record_escaped_finite_bound_expression(&statement.object);
         let provenance = self.finite_bound_argument_provenance(&statement.object);
         self.invalidate_finite_bound_argument_provenance(provenance);
         self.enter_scope(ScopeFlags::With, &statement.scope_id);
@@ -10090,7 +10090,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         }
         if disposes_iteration_values {
             iteration_provenance.extend(self.finite_bound_capture_provenance(&captures));
-            self.record_escaped_finite_bound_captures(captures.clone(), BTreeSet::new());
+            self.record_escaped_finite_bound_expression(&statement.right);
         }
         self.invalidate_finite_bound_argument_provenance(iteration_provenance);
         let alias_sources = Self::finite_bound_capture_alias_sources(&statement.right);
@@ -10221,22 +10221,16 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         if suppressed_span.is_some() {
             self.suppressed_member_read_spans.pop();
         }
-        let mut escaped_captures = self
-            .finite_bound_capture_names_from_expression(&call.callee)
-            .unwrap_or_default();
+        self.record_escaped_finite_bound_expression(&call.callee);
         for argument in &call.arguments {
             let argument = match argument {
                 Argument::SpreadElement(spread) => Some(&spread.argument),
                 _ => argument.as_expression(),
             };
             if let Some(argument) = argument {
-                escaped_captures.extend(
-                    self.finite_bound_capture_names_from_expression(argument)
-                        .unwrap_or_default(),
-                );
+                self.record_escaped_finite_bound_expression(argument);
             }
         }
-        self.record_escaped_finite_bound_captures(escaped_captures, BTreeSet::new());
         let mut invalidated_provenance = BTreeSet::new();
         if call.callee.get_member_expr().is_none() {
             invalidated_provenance.extend(self.finite_bound_argument_provenance(&call.callee));
@@ -10319,22 +10313,16 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
 
     fn visit_new_expression(&mut self, expression: &NewExpression<'a>) {
         walk::walk_new_expression(self, expression);
-        let mut escaped_captures = self
-            .finite_bound_capture_names_from_expression(&expression.callee)
-            .unwrap_or_default();
+        self.record_escaped_finite_bound_expression(&expression.callee);
         for argument in &expression.arguments {
             let argument = match argument {
                 Argument::SpreadElement(spread) => Some(&spread.argument),
                 _ => argument.as_expression(),
             };
             if let Some(argument) = argument {
-                escaped_captures.extend(
-                    self.finite_bound_capture_names_from_expression(argument)
-                        .unwrap_or_default(),
-                );
+                self.record_escaped_finite_bound_expression(argument);
             }
         }
-        self.record_escaped_finite_bound_captures(escaped_captures, BTreeSet::new());
         let mut provenance = self.finite_bound_argument_provenance(&expression.callee);
         provenance.extend(
             expression
@@ -10373,10 +10361,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
 
     fn visit_throw_statement(&mut self, statement: &ThrowStatement<'a>) {
         walk::walk_throw_statement(self, statement);
-        let captures = self
-            .finite_bound_capture_names_from_expression(&statement.argument)
-            .unwrap_or_default();
-        self.record_escaped_finite_bound_captures(captures, BTreeSet::new());
+        self.record_escaped_finite_bound_expression(&statement.argument);
         let provenance = self.finite_bound_argument_provenance(&statement.argument);
         self.invalidate_finite_bound_argument_provenance(provenance);
     }
@@ -10386,26 +10371,17 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         let Some(argument) = &expression.argument else {
             return;
         };
-        let captures = self
-            .finite_bound_capture_names_from_expression(argument)
-            .unwrap_or_default();
-        self.record_escaped_finite_bound_captures(captures, BTreeSet::new());
+        self.record_escaped_finite_bound_expression(argument);
         let provenance = self.finite_bound_argument_provenance(argument);
         self.invalidate_finite_bound_argument_provenance(provenance);
     }
 
     fn visit_tagged_template_expression(&mut self, expression: &TaggedTemplateExpression<'a>) {
         walk::walk_tagged_template_expression(self, expression);
-        let mut escaped_captures = self
-            .finite_bound_capture_names_from_expression(&expression.tag)
-            .unwrap_or_default();
+        self.record_escaped_finite_bound_expression(&expression.tag);
         for substitution in &expression.quasi.expressions {
-            escaped_captures.extend(
-                self.finite_bound_capture_names_from_expression(substitution)
-                    .unwrap_or_default(),
-            );
+            self.record_escaped_finite_bound_expression(substitution);
         }
-        self.record_escaped_finite_bound_captures(escaped_captures, BTreeSet::new());
         let mut provenance = self.finite_bound_argument_provenance(&expression.tag);
         for substitution in &expression.quasi.expressions {
             provenance.extend(self.finite_bound_argument_provenance(substitution));
@@ -10415,7 +10391,6 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
 
     fn visit_jsx_opening_element(&mut self, opening: &JSXOpeningElement<'a>) {
         walk::walk_jsx_opening_element(self, opening);
-        let mut captures = BTreeSet::new();
         let mut provenance = BTreeSet::new();
         for attribute in &opening.attributes {
             let expression = match attribute {
@@ -10431,19 +10406,15 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             };
             if let Some(expression) = expression {
                 provenance.extend(self.finite_bound_argument_provenance(expression));
-                captures.extend(
-                    self.finite_bound_capture_names_from_expression(expression)
-                        .unwrap_or_default(),
-                );
+                self.record_escaped_finite_bound_expression(expression);
             }
         }
         self.invalidate_finite_bound_argument_provenance(provenance);
-        self.record_escaped_finite_bound_captures(captures, BTreeSet::new());
     }
 
     fn visit_jsx_element(&mut self, element: &JSXElement<'a>) {
         walk::walk_jsx_element(self, element);
-        let mut captures = match &element.opening_element.name {
+        let captures = match &element.opening_element.name {
             JSXElementName::Identifier(identifier) => {
                 self.finite_bound_capture_names_for_identifier(identifier.name.as_str())
             }
@@ -10485,10 +10456,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             };
             if let Some(expression) = expression {
                 provenance.extend(self.finite_bound_argument_provenance(expression));
-                captures.extend(
-                    self.finite_bound_capture_names_from_expression(expression)
-                        .unwrap_or_default(),
-                );
+                self.record_escaped_finite_bound_expression(expression);
             }
         }
         self.invalidate_finite_bound_argument_provenance(provenance);
@@ -10541,10 +10509,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             declarator.kind,
             VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing
         ) {
-            let captures = self
-                .finite_bound_capture_names_from_expression(init)
-                .unwrap_or_default();
-            self.record_escaped_finite_bound_captures(captures, BTreeSet::new());
+            self.record_escaped_finite_bound_expression(init);
             let provenance = self.finite_bound_argument_provenance(init);
             if let Some(scope) = self.finite_bound_argument_scopes.last_mut() {
                 scope.disposal_provenance.extend(provenance.iter().copied());
@@ -11027,10 +10992,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
 
     fn visit_decorator(&mut self, decorator: &Decorator<'a>) {
         walk::walk_decorator(self, decorator);
-        let captures = self
-            .finite_bound_capture_names_from_expression(&decorator.expression)
-            .unwrap_or_default();
-        self.record_escaped_finite_bound_captures(captures, BTreeSet::new());
+        self.record_escaped_finite_bound_expression(&decorator.expression);
         let provenance = self.finite_bound_argument_provenance(&decorator.expression);
         self.invalidate_finite_bound_argument_provenance(provenance);
     }
@@ -28961,6 +28923,64 @@ mod tests {
                   external.callback = escaped;
                   const args = [draw];
                 }
+                const args = [draw];
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        assert!(
+            scan.dynamic_usages.is_empty(),
+            "dynamic usages: {:?}",
+            scan.dynamic_usages
+        );
+    }
+
+    #[test]
+    fn delayed_capture_passed_to_call_keeps_exact_binding_identity() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                let escaped;
+                {
+                  const args = [draw];
+                  escaped = () => { args[0] = runtimeFactory; };
+                }
+                consume(escaped);
+                const args = [draw];
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        assert!(
+            scan.dynamic_usages.is_empty(),
+            "dynamic usages: {:?}",
+            scan.dynamic_usages
+        );
+    }
+
+    #[test]
+    fn delayed_member_callable_escape_keeps_exact_binding_identity() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const holder = {};
+                {
+                  const args = [draw];
+                  holder.callback = () => { args[0] = runtimeFactory; };
+                }
+                external.callback = holder.callback;
                 const args = [draw];
                 return outer(inner.bind(null, ...args));
               }
