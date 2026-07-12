@@ -2844,6 +2844,67 @@ impl ProjectIndex {
                 }
             }
         }
+        if let Some(forwards) = file.wrapper_return_forwards.get(name) {
+            for forward in forwards {
+                let TranslatorReturnForward::ForwardCall {
+                    namespace,
+                    name: target_name,
+                    argument_targets,
+                    wrapper_arguments,
+                    ..
+                } = forward
+                else {
+                    continue;
+                };
+                let parameter_indexes = if let Some(namespace) = namespace {
+                    file.namespace_imports
+                        .get(namespace)
+                        .map(|source| {
+                            self.wrapper_array_parameter_indexes_for_import_at_depth(
+                                path,
+                                &ImportTarget {
+                                    source: source.clone(),
+                                    imported: ImportedName::Named(target_name.clone()),
+                                },
+                                depth + 1,
+                            )
+                        })
+                        .unwrap_or_default()
+                } else if let Some(target) = file.imports.get(target_name) {
+                    self.wrapper_array_parameter_indexes_for_import_at_depth(
+                        path,
+                        target,
+                        depth + 1,
+                    )
+                } else {
+                    self.wrapper_array_parameter_indexes_for_local_at_depth(
+                        path,
+                        target_name,
+                        depth + 1,
+                    )
+                };
+                for (index, params) in parameter_indexes {
+                    let concrete = params.into_iter().any(|param| {
+                        wrapper_arguments.contains(&param)
+                            || argument_targets.get(&param).is_some_and(|targets| {
+                                targets.iter().any(|target| {
+                                    self.wrapper_callable_target_resolution_at_depth(
+                                        path,
+                                        target,
+                                        depth + 1,
+                                    )
+                                    .is_some_and(|target| {
+                                        target.direct || !target.indexes.is_empty()
+                                    })
+                                })
+                            })
+                    });
+                    if concrete {
+                        indexes.insert(index);
+                    }
+                }
+            }
+        }
         if !indexes.is_empty() {
             return Some(indexes);
         }
@@ -7671,17 +7732,33 @@ impl ReactWrapperReturnCollector {
                 .entry(name.to_string())
                 .or_insert_with(|| self.finite_bound_resolved_capture_names.get(name).cloned());
         }
+        self.replace_finite_bound_capture_value(name, captures);
+    }
+
+    fn finite_bound_capture_value_state(
+        &self,
+        captures: &BTreeSet<String>,
+    ) -> (BTreeSet<usize>, BTreeSet<String>) {
+        let provenance = self.finite_bound_capture_provenance(captures);
+        let resolved_names = captures
+            .iter()
+            .filter(|capture| {
+                !self
+                    .finite_bound_capture_provenance(&BTreeSet::from([(*capture).clone()]))
+                    .is_empty()
+            })
+            .cloned()
+            .collect();
+        (provenance, resolved_names)
+    }
+
+    fn replace_finite_bound_capture_value(
+        &mut self,
+        name: &str,
+        captures: Option<BTreeSet<String>>,
+    ) {
         if let Some(captures) = captures {
-            let provenance = self.finite_bound_capture_provenance(&captures);
-            let resolved_names = captures
-                .iter()
-                .filter(|capture| {
-                    !self
-                        .finite_bound_capture_provenance(&BTreeSet::from([(*capture).clone()]))
-                        .is_empty()
-                })
-                .cloned()
-                .collect();
+            let (provenance, resolved_names) = self.finite_bound_capture_value_state(&captures);
             self.finite_bound_capture_callables
                 .insert(name.to_string(), captures);
             self.finite_bound_capture_provenance
@@ -7693,6 +7770,22 @@ impl ReactWrapperReturnCollector {
             self.finite_bound_capture_provenance.remove(name);
             self.finite_bound_resolved_capture_names.remove(name);
         }
+    }
+
+    fn merge_finite_bound_capture_value(&mut self, name: &str, captures: BTreeSet<String>) {
+        let (provenance, resolved_names) = self.finite_bound_capture_value_state(&captures);
+        self.finite_bound_capture_callables
+            .entry(name.to_string())
+            .or_default()
+            .extend(captures);
+        self.finite_bound_capture_provenance
+            .entry(name.to_string())
+            .or_default()
+            .extend(provenance);
+        self.finite_bound_resolved_capture_names
+            .entry(name.to_string())
+            .or_default()
+            .extend(resolved_names);
     }
 
     fn finite_bound_capture_names(expression: &Expression<'_>) -> Option<BTreeSet<String>> {
@@ -9518,6 +9611,8 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 (
                     name.clone(),
                     self.finite_bound_capture_callables.get(name).cloned(),
+                    self.finite_bound_capture_provenance.get(name).cloned(),
+                    self.finite_bound_resolved_capture_names.get(name).cloned(),
                 )
             })
             .collect::<Vec<_>>();
@@ -9525,23 +9620,34 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             for source in &alias_sources {
                 self.link_finite_bound_capture_aliases(name, source);
             }
-            if captures.is_empty() {
-                self.finite_bound_capture_callables.remove(name);
-            } else {
-                self.finite_bound_capture_callables
-                    .insert(name.clone(), captures.clone());
-            }
+            self.replace_finite_bound_capture_value(
+                name,
+                (!captures.is_empty()).then(|| captures.clone()),
+            );
         }
         walk::walk_for_of_statement(self, statement);
         if disposes_iteration_values {
             let provenance = self.finite_bound_capture_provenance(&captures);
             self.invalidate_finite_bound_argument_provenance(provenance);
         }
-        for (name, captures) in previous {
+        for (name, captures, provenance, resolved_names) in previous {
             if let Some(captures) = captures {
-                self.finite_bound_capture_callables.insert(name, captures);
+                self.finite_bound_capture_callables
+                    .insert(name.clone(), captures);
             } else {
                 self.finite_bound_capture_callables.remove(&name);
+            }
+            if let Some(provenance) = provenance {
+                self.finite_bound_capture_provenance
+                    .insert(name.clone(), provenance);
+            } else {
+                self.finite_bound_capture_provenance.remove(&name);
+            }
+            if let Some(resolved_names) = resolved_names {
+                self.finite_bound_resolved_capture_names
+                    .insert(name, resolved_names);
+            } else {
+                self.finite_bound_resolved_capture_names.remove(&name);
             }
         }
     }
@@ -9973,15 +10079,10 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             let captures = (!captures.is_empty()).then_some(captures);
             if self.conditional_control_flow_depth > 0 {
                 if let Some(captures) = captures {
-                    self.finite_bound_capture_callables
-                        .entry(name)
-                        .or_default()
-                        .extend(captures);
+                    self.merge_finite_bound_capture_value(&name, captures);
                 }
-            } else if let Some(captures) = captures {
-                self.finite_bound_capture_callables.insert(name, captures);
             } else {
-                self.finite_bound_capture_callables.remove(&name);
+                self.replace_finite_bound_capture_value(&name, captures);
             }
         }
         if matches!(
@@ -10019,12 +10120,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                     .extend(self.finite_bound_assignment_default_provenance(&expression.left));
                 provenance.retain(|id| !invalidated_source.contains(id));
                 for name in names {
-                    if let Some(captures) = &captures {
-                        self.finite_bound_capture_callables
-                            .insert(name.clone(), captures.clone());
-                    } else {
-                        self.finite_bound_capture_callables.remove(&name);
-                    }
+                    self.replace_finite_bound_capture_value(&name, captures.clone());
                     if self.escaped_finite_bound_capture_names.contains(&name) {
                         self.finite_bound_argument_arrays.remove(&name);
                     } else if let Some(entry) = Self::finite_bound_carrier_entry(&provenance) {
@@ -10036,10 +10132,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             } else {
                 if let Some(captures) = captures {
                     for name in &names {
-                        self.finite_bound_capture_callables
-                            .entry(name.clone())
-                            .or_default()
-                            .extend(captures.iter().cloned());
+                        self.merge_finite_bound_capture_value(name, captures.clone());
                     }
                 }
                 let provenance = names
@@ -10090,10 +10183,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 .cloned()
                 .unwrap_or_else(|| BTreeSet::from([root.to_string()]));
             for alias in aliases {
-                self.finite_bound_capture_callables
-                    .entry(alias)
-                    .or_default()
-                    .extend(captures.iter().cloned());
+                self.merge_finite_bound_capture_value(&alias, captures.clone());
             }
         }
         if expression.operator == AssignmentOperator::Assign
@@ -16671,16 +16761,25 @@ impl SourceUsageCollector {
     }
 
     fn expression_may_contain_wrapper_callable(&self, expression: &Expression<'_>) -> bool {
-        self.expression_is_wrapper_returning_callable(expression)
-            || matches!(
-                expression.get_inner_expression(),
-                Expression::ArrayExpression(array)
-                    if array.elements.iter().any(|element| {
-                        element.as_expression().is_some_and(|element| {
-                            self.expression_may_contain_wrapper_callable(element)
-                        })
-                    })
-            )
+        match expression.get_inner_expression() {
+            Expression::ConditionalExpression(conditional) => {
+                self.expression_may_contain_wrapper_callable(&conditional.consequent)
+                    || self.expression_may_contain_wrapper_callable(&conditional.alternate)
+            }
+            Expression::LogicalExpression(logical) => {
+                self.expression_may_contain_wrapper_callable(&logical.left)
+                    || self.expression_may_contain_wrapper_callable(&logical.right)
+            }
+            Expression::ArrayExpression(array) => {
+                array.elements.iter().any(|element| match element {
+                    ArrayExpressionElement::SpreadElement(_) => true,
+                    _ => element.as_expression().is_some_and(|element| {
+                        self.expression_may_contain_wrapper_callable(element)
+                    }),
+                })
+            }
+            _ => self.expression_is_wrapper_returning_callable(expression),
+        }
     }
 
     fn expression_is_wrapper_returning_callable(&self, expression: &Expression<'_>) -> bool {
@@ -26091,6 +26190,12 @@ mod tests {
               applied[0][0](applyKey);
               const [bound] = await forward.bind(null, [useBaseValues])();
               bound[0][0](bindKey);
+              const [conditional] = await forward(enabled ? [useBaseValues] : [draw]);
+              conditional[0][0](conditionalKey);
+              const [logical] = await forward(enabled && [useBaseValues]);
+              logical[0][0](logicalKey);
+              const [spread] = await forward([...runtimeFactories]);
+              spread[0][0](spreadKey);
             }
             "#,
         );
@@ -26099,7 +26204,7 @@ mod tests {
             .iter()
             .map(|usage| usage.line)
             .collect::<BTreeSet<_>>();
-        for line in [9, 11, 13] {
+        for line in [9, 11, 13, 15, 17, 19] {
             assert!(
                 lines.contains(&line),
                 "missing line {line}; dynamic lines: {lines:?}"
@@ -26148,6 +26253,43 @@ mod tests {
             .map(|usage| usage.line)
             .collect::<BTreeSet<_>>();
         assert!(lines.contains(&6), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn imported_fixed_callable_targets_preserve_concrete_wrapper_indexes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper = dir.path().join("helper.ts");
+        let main = dir.path().join("main.ts");
+        fs::write(
+            &helper,
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function inner(factory) { return Promise.all([factory(), draw]); }
+            async function outer(factory) { return Promise.all([factory(), draw]); }
+            export async function forward() {
+              return outer(inner.bind(null, useBaseValues));
+            }
+            "#,
+        )
+        .expect("write helper");
+        fs::write(
+            &main,
+            r#"
+            import {forward} from './helper';
+            const [result] = await forward();
+            result[0][0](runtimeKey);
+            "#,
+        )
+        .expect("write main");
+
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
     }
 
     #[test]
@@ -27441,6 +27583,38 @@ mod tests {
               async function forward() {
                 const args = [draw];
                 const change = () => { args[0] = runtimeFactory; };
+                {
+                  const args = [draw];
+                  external.callback = change;
+                  consume(args);
+                }
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn reassigned_callable_refreshes_capture_provenance_across_shadowing() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const previous = [draw];
+                const args = [draw];
+                let change = () => { previous[0] = runtimeFactory; };
+                change = () => { args[0] = runtimeFactory; };
                 {
                   const args = [draw];
                   external.callback = change;
