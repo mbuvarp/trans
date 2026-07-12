@@ -8433,6 +8433,17 @@ impl ReactWrapperReturnCollector {
         }
     }
 
+    fn finite_bound_capture_live_alias_sources(expression: &Expression<'_>) -> BTreeSet<String> {
+        if matches!(
+            expression.get_inner_expression(),
+            Expression::ObjectExpression(_)
+        ) {
+            BTreeSet::new()
+        } else {
+            Self::finite_bound_capture_alias_sources(expression)
+        }
+    }
+
     fn finite_bound_capture_provenance(&self, names: &BTreeSet<String>) -> BTreeSet<usize> {
         fn collect(
             collector: &ReactWrapperReturnCollector,
@@ -8688,6 +8699,28 @@ impl ReactWrapperReturnCollector {
             .retain(|(candidate, _), _| candidate != binding);
     }
 
+    fn clear_finite_bound_capture_member_path(
+        &mut self,
+        binding: &FiniteBoundCaptureBinding,
+        path: &str,
+    ) {
+        let prefix = (!path.is_empty()).then(|| format!("{path}."));
+        let keep = |candidate_binding: &FiniteBoundCaptureBinding, candidate_path: &str| {
+            candidate_binding != binding
+                || (!path.is_empty()
+                    && candidate_path != path
+                    && prefix
+                        .as_ref()
+                        .is_none_or(|prefix| !candidate_path.starts_with(prefix)))
+        };
+        self.finite_bound_capture_member_dependencies.retain(
+            |(candidate_binding, candidate_path), _| keep(candidate_binding, candidate_path),
+        );
+        self.finite_bound_capture_member_provenance.retain(
+            |(candidate_binding, candidate_path), _| keep(candidate_binding, candidate_path),
+        );
+    }
+
     fn refresh_finite_bound_capture_member_binding(
         &mut self,
         name: &str,
@@ -8772,6 +8805,7 @@ impl ReactWrapperReturnCollector {
                 }
                 ObjectPropertyKind::SpreadProperty(spread) => {
                     let Some(source) = spread.argument.get_identifier_reference() else {
+                        self.clear_finite_bound_capture_member_path(binding, prefix);
                         continue;
                     };
                     let source_binding = self.finite_bound_capture_binding(source.name.as_str());
@@ -8780,6 +8814,16 @@ impl ReactWrapperReturnCollector {
                         .get(&source_binding)
                         .cloned()
                         .unwrap_or_else(|| BTreeSet::from([source_binding.clone()]));
+                    let source_has_unknown_members = !aliases.iter().any(|alias| {
+                        self.finite_bound_capture_binding_is_current(alias)
+                            && self.structured_values.contains(&alias.0)
+                    }) || aliases.iter().any(|alias| {
+                        self.finite_bound_capture_binding_is_current(alias)
+                            && self.structured_unknown_values.contains(&alias.0)
+                    });
+                    if source_has_unknown_members {
+                        self.clear_finite_bound_capture_member_path(binding, prefix);
+                    }
                     let paths = self
                         .finite_bound_capture_member_dependencies
                         .keys()
@@ -8907,6 +8951,7 @@ impl ReactWrapperReturnCollector {
                     .entry(callable.clone())
                     .or_default()
                     .insert((name.to_string(), binding_scope_id));
+                self.refresh_finite_bound_capture_members_for_callable(&callable);
                 self.invalidate_escaped_finite_bound_capture(&callable);
                 self.refresh_finite_bound_capture_dependents(&callable, false);
             }
@@ -10878,7 +10923,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         }
         if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
             let name = identifier.name.to_string();
-            let alias_source_bindings = Self::finite_bound_capture_alias_sources(init)
+            let alias_source_bindings = Self::finite_bound_capture_live_alias_sources(init)
                 .into_iter()
                 .map(|source| self.finite_bound_capture_binding(&source))
                 .collect::<Vec<_>>();
@@ -10965,7 +11010,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         let identifier_alias_assignment = if expression.operator == AssignmentOperator::Assign {
             if let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &expression.left {
                 let name = identifier.name.to_string();
-                let sources = Self::finite_bound_capture_alias_sources(&expression.right)
+                let sources = Self::finite_bound_capture_live_alias_sources(&expression.right)
                     .into_iter()
                     .map(|source| self.finite_bound_capture_binding(&source))
                     .collect::<Vec<_>>();
@@ -29512,6 +29557,62 @@ mod tests {
     }
 
     #[test]
+    fn member_property_summaries_refresh_after_transitive_forward_declaration() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const callback = () => { args[0] = runtimeFactory; };
+                const holder = { invoke: () => callback() };
+                const args = [draw];
+                external.callback = holder.invoke;
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn unknown_later_object_spreads_clear_stale_member_summaries() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const args = [draw];
+                const runtimeObject = condition
+                  ? { safe: () => { args[0] = runtimeFactory; } }
+                  : {};
+                const holder = { safe: ordinary, ...runtimeObject };
+                external.callback = holder.safe;
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
     fn object_spreads_copy_member_summaries_through_aliases() {
         let scan = scan(
             r#"
@@ -29539,6 +29640,34 @@ mod tests {
             "dynamic usages: {:?}",
             scan.dynamic_usages
         );
+    }
+
+    #[test]
+    fn object_spread_copies_do_not_follow_later_source_writes() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const args = [draw];
+                const source = { safe: () => { args[0] = runtimeFactory; } };
+                const copy = {...source};
+                source.safe = ordinary;
+                external.callback = copy.safe;
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
     }
 
     #[test]
