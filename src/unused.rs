@@ -17,16 +17,17 @@ use oxc_ast::ast::{
     ImportDeclaration, ImportDeclarationSpecifier, JSXAttributeItem, JSXAttributeName,
     JSXAttributeValue, JSXChild, JSXElement, JSXElementName, JSXExpression,
     JSXMemberExpressionObject, JSXOpeningElement, ModuleExportName, ObjectAssignmentTarget,
-    ObjectExpression, ObjectPropertyKind, PropertyKind, ReturnStatement, Statement,
-    StaticMemberExpression, SwitchStatement, TSInterfaceDeclaration, TSLiteral, TSSignature,
-    TSType, TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator, TSTypeQueryExprName,
-    TemplateLiteral, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    ObjectExpression, ObjectPropertyKind, PropertyKind, ReturnStatement, SimpleAssignmentTarget,
+    Statement, StaticMemberExpression, SwitchStatement, TSInterfaceDeclaration, TSLiteral,
+    TSSignature, TSType, TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator,
+    TSTypeQueryExprName, TemplateLiteral, UnaryExpression, UpdateExpression, VariableDeclaration,
+    VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::{
-    operator::{AssignmentOperator, LogicalOperator},
+    operator::{AssignmentOperator, LogicalOperator, UnaryOperator},
     scope::{ScopeFlags, ScopeId},
 };
 use serde::{Deserialize, Serialize};
@@ -504,9 +505,15 @@ struct BoundArgumentEvidence {
     params: BTreeSet<usize>,
 }
 
+#[derive(Clone)]
+struct FiniteBoundArgumentEntry {
+    values: Vec<BoundArgumentEvidence>,
+    provenance: usize,
+}
+
 #[derive(Default)]
 struct FiniteBoundArgumentScope {
-    previous: BTreeMap<String, Option<Vec<BoundArgumentEvidence>>>,
+    previous: BTreeMap<String, Option<FiniteBoundArgumentEntry>>,
 }
 
 #[derive(Debug, Clone)]
@@ -7286,8 +7293,10 @@ struct ReactWrapperReturnCollector {
     array_index_values: BTreeMap<String, BTreeSet<usize>>,
     array_index_forward_values:
         BTreeMap<String, BTreeMap<usize, BTreeSet<TranslatorReturnForward>>>,
-    finite_bound_argument_arrays: BTreeMap<String, Vec<BoundArgumentEvidence>>,
+    finite_bound_argument_arrays: BTreeMap<String, FiniteBoundArgumentEntry>,
     finite_bound_argument_scopes: Vec<FiniteBoundArgumentScope>,
+    invalidated_finite_bound_argument_provenance: BTreeSet<usize>,
+    next_finite_bound_argument_provenance: usize,
 }
 
 struct InlineWrapperReturnVisitor<'collector> {
@@ -7313,7 +7322,7 @@ impl ReactWrapperReturnCollector {
     fn set_finite_bound_argument_declaration(
         &mut self,
         name: &str,
-        value: Option<Vec<BoundArgumentEvidence>>,
+        value: Option<FiniteBoundArgumentEntry>,
     ) {
         if let Some(scope) = self.finite_bound_argument_scopes.last_mut() {
             scope
@@ -7329,8 +7338,32 @@ impl ReactWrapperReturnCollector {
         }
     }
 
-    fn invalidate_finite_bound_arguments(&mut self) {
-        self.finite_bound_argument_arrays.clear();
+    fn finite_bound_argument_entry(
+        &mut self,
+        expression: &Expression<'_>,
+    ) -> Option<FiniteBoundArgumentEntry> {
+        let values = self.finite_bound_arguments(expression)?;
+        let provenance = expression
+            .get_inner_expression()
+            .get_identifier_reference()
+            .and_then(|identifier| {
+                self.finite_bound_argument_arrays
+                    .get(identifier.name.as_str())
+                    .map(|entry| entry.provenance)
+            })
+            .unwrap_or_else(|| {
+                let provenance = self.next_finite_bound_argument_provenance;
+                self.next_finite_bound_argument_provenance += 1;
+                provenance
+            });
+        Some(FiniteBoundArgumentEntry { values, provenance })
+    }
+
+    fn invalidate_finite_bound_argument_provenance(&mut self, provenance: BTreeSet<usize>) {
+        self.invalidated_finite_bound_argument_provenance
+            .extend(provenance.iter().copied());
+        self.finite_bound_argument_arrays
+            .retain(|_, entry| !provenance.contains(&entry.provenance));
     }
 
     fn argument_param_combinations(
@@ -7586,7 +7619,7 @@ impl ReactWrapperReturnCollector {
             Expression::Identifier(identifier) => self
                 .finite_bound_argument_arrays
                 .get(identifier.name.as_str())
-                .cloned(),
+                .map(|entry| entry.values.clone()),
             Expression::ArrayExpression(array) => {
                 let mut values = Vec::new();
                 for element in &array.elements {
@@ -7629,6 +7662,48 @@ impl ReactWrapperReturnCollector {
                 Some(left)
             }
             _ => None,
+        }
+    }
+
+    fn finite_bound_argument_provenance(&self, expression: &Expression<'_>) -> BTreeSet<usize> {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => self
+                .finite_bound_argument_arrays
+                .get(identifier.name.as_str())
+                .map(|entry| BTreeSet::from([entry.provenance]))
+                .unwrap_or_default(),
+            Expression::ConditionalExpression(conditional) => {
+                let mut provenance = self.finite_bound_argument_provenance(&conditional.consequent);
+                provenance.extend(self.finite_bound_argument_provenance(&conditional.alternate));
+                provenance
+            }
+            Expression::LogicalExpression(logical) => {
+                let mut provenance = self.finite_bound_argument_provenance(&logical.left);
+                provenance.extend(self.finite_bound_argument_provenance(&logical.right));
+                provenance
+            }
+            Expression::AwaitExpression(await_expression) => {
+                self.finite_bound_argument_provenance(&await_expression.argument)
+            }
+            Expression::ArrayExpression(array) => array
+                .elements
+                .iter()
+                .filter_map(ArrayExpressionElement::as_expression)
+                .flat_map(|expression| self.finite_bound_argument_provenance(expression))
+                .collect(),
+            Expression::ObjectExpression(object) => object
+                .properties
+                .iter()
+                .flat_map(|property| match property {
+                    ObjectPropertyKind::ObjectProperty(property) => {
+                        self.finite_bound_argument_provenance(&property.value)
+                    }
+                    ObjectPropertyKind::SpreadProperty(spread) => {
+                        self.finite_bound_argument_provenance(&spread.argument)
+                    }
+                })
+                .collect(),
+            _ => BTreeSet::new(),
         }
     }
 
@@ -8267,7 +8342,12 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         if let Some(scope) = self.finite_bound_argument_scopes.pop() {
             for (name, previous) in scope.previous {
                 if let Some(previous) = previous {
-                    self.finite_bound_argument_arrays.insert(name, previous);
+                    if !self
+                        .invalidated_finite_bound_argument_provenance
+                        .contains(&previous.provenance)
+                    {
+                        self.finite_bound_argument_arrays.insert(name, previous);
+                    }
                 } else {
                     self.finite_bound_argument_arrays.remove(&name);
                 }
@@ -8283,31 +8363,58 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        let mut invalidates_finite_arguments =
-            call.callee.get_member_expr().is_some_and(|member| {
-                member
-                    .object()
-                    .get_identifier_reference()
-                    .is_some_and(|identifier| {
-                        self.finite_bound_argument_arrays
-                            .contains_key(identifier.name.as_str())
-                    })
-                    && member
-                        .static_property_name()
-                        .is_some_and(|method| ARRAY_MUTATING_METHODS.contains(&method))
+        let mut invalidated_provenance = BTreeSet::new();
+        if let Some(member) = call.callee.get_member_expr()
+            && let Some(identifier) = member.object().get_identifier_reference()
+            && let Some(entry) = self
+                .finite_bound_argument_arrays
+                .get(identifier.name.as_str())
+        {
+            let known_nonmutating = member.static_property_name().is_some_and(|method| {
+                matches!(
+                    method,
+                    "at" | "concat"
+                        | "entries"
+                        | "every"
+                        | "filter"
+                        | "find"
+                        | "findIndex"
+                        | "findLast"
+                        | "findLastIndex"
+                        | "flat"
+                        | "flatMap"
+                        | "includes"
+                        | "indexOf"
+                        | "join"
+                        | "keys"
+                        | "lastIndexOf"
+                        | "map"
+                        | "reduce"
+                        | "reduceRight"
+                        | "slice"
+                        | "some"
+                        | "toLocaleString"
+                        | "toReversed"
+                        | "toSorted"
+                        | "toSpliced"
+                        | "toString"
+                        | "values"
+                        | "with"
+                )
             });
-        invalidates_finite_arguments |= call.arguments.iter().any(|argument| {
-            !matches!(argument, Argument::SpreadElement(_))
-                && argument
-                    .as_expression()
-                    .and_then(Expression::get_identifier_reference)
-                    .is_some_and(|identifier| {
-                        self.finite_bound_argument_arrays
-                            .contains_key(identifier.name.as_str())
-                    })
-        });
-        if invalidates_finite_arguments {
-            self.invalidate_finite_bound_arguments();
+            if !known_nonmutating {
+                invalidated_provenance.insert(entry.provenance);
+            }
+        }
+        for argument in &call.arguments {
+            if !matches!(argument, Argument::SpreadElement(_))
+                && let Some(argument) = argument.as_expression()
+            {
+                invalidated_provenance.extend(self.finite_bound_argument_provenance(argument));
+            }
+        }
+        if !invalidated_provenance.is_empty() {
+            self.invalidate_finite_bound_argument_provenance(invalidated_provenance);
         }
         if let Some(member) = call.callee.get_member_expr()
             && member.static_property_name() == Some("assign")
@@ -8408,7 +8515,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         }
         if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
             let name = identifier.name.to_string();
-            let arguments = self.finite_bound_arguments(init);
+            let arguments = self.finite_bound_argument_entry(init);
             self.set_finite_bound_argument_declaration(&name, arguments);
             if !array_indexes.is_empty() {
                 self.array_index_values
@@ -8422,20 +8529,24 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
     }
 
     fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
-        let mutates_finite_arguments = assignment_target_static_member_path(&expression.left)
+        let mutated_provenance = assignment_target_static_member_path(&expression.left)
             .map(|(root, _)| root)
             .or_else(|| {
                 assignment_target_unknown_container_path(&expression.left).map(|(root, _)| root)
             })
-            .is_some_and(|root| self.finite_bound_argument_arrays.contains_key(root));
-        if mutates_finite_arguments {
-            self.invalidate_finite_bound_arguments();
+            .and_then(|root| {
+                self.finite_bound_argument_arrays
+                    .get(root)
+                    .map(|entry| entry.provenance)
+            });
+        if let Some(provenance) = mutated_provenance {
+            self.invalidate_finite_bound_argument_provenance(BTreeSet::from([provenance]));
         }
         if expression.operator == AssignmentOperator::Assign
             && let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &expression.left
         {
             let name = identifier.name.to_string();
-            if let Some(arguments) = self.finite_bound_arguments(&expression.right) {
+            if let Some(arguments) = self.finite_bound_argument_entry(&expression.right) {
                 self.finite_bound_argument_arrays
                     .insert(name.clone(), arguments);
             } else {
@@ -8537,6 +8648,35 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 self.structured_unknown_values.insert(root);
             }
         }
+    }
+
+    fn visit_unary_expression(&mut self, expression: &UnaryExpression<'a>) {
+        if expression.operator == UnaryOperator::Delete
+            && let Some(member) = expression.argument.get_member_expr()
+            && let Some(identifier) = member.object().get_identifier_reference()
+            && let Some(entry) = self
+                .finite_bound_argument_arrays
+                .get(identifier.name.as_str())
+        {
+            self.invalidate_finite_bound_argument_provenance(BTreeSet::from([entry.provenance]));
+        }
+        walk::walk_unary_expression(self, expression);
+    }
+
+    fn visit_update_expression(&mut self, expression: &UpdateExpression<'a>) {
+        let object = match &expression.argument {
+            SimpleAssignmentTarget::StaticMemberExpression(member) => Some(&member.object),
+            SimpleAssignmentTarget::ComputedMemberExpression(member) => Some(&member.object),
+            _ => None,
+        };
+        if let Some(identifier) = object.and_then(|object| object.get_identifier_reference())
+            && let Some(entry) = self
+                .finite_bound_argument_arrays
+                .get(identifier.name.as_str())
+        {
+            self.invalidate_finite_bound_argument_provenance(BTreeSet::from([entry.provenance]));
+        }
+        walk::walk_update_expression(self, expression);
     }
 
     fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
@@ -11414,6 +11554,8 @@ impl SourceIndexCollector {
             array_index_forward_values: BTreeMap::new(),
             finite_bound_argument_arrays: BTreeMap::new(),
             finite_bound_argument_scopes: Vec::new(),
+            invalidated_finite_bound_argument_provenance: BTreeSet::new(),
+            next_finite_bound_argument_provenance: 0,
         }
     }
 
@@ -24823,6 +24965,94 @@ mod tests {
             .map(|usage| usage.line)
             .collect::<BTreeSet<_>>();
         for line in [4, 6, 8] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalidated_finite_bound_aliases_are_not_restored_after_shadowing() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const args = [draw];
+                const alias = args;
+                {
+                  const args = [draw];
+                  mutate(alias);
+                  consume(args);
+                }
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn indirect_finite_bound_mutations_and_escapes_become_dynamic() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [conditional] = await conditionalForward();
+              conditional[0][0](conditionalKey);
+              const [object] = await objectForward();
+              object[0][0](objectKey);
+              const [method] = await methodForward();
+              method[0][0](methodKey);
+              const [deleted] = await deleteForward();
+              deleted[0][0](deleteKey);
+              const [updated] = await updateForward();
+              updated[0][0](updateKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function conditionalForward() {
+                const args = [draw];
+                mutate(enabled ? args : other);
+                return outer(inner.bind(null, ...args));
+              }
+              async function objectForward() {
+                const args = [draw];
+                mutate({args});
+                return outer(inner.bind(null, ...args));
+              }
+              async function methodForward() {
+                const args = [draw];
+                args.customMutate();
+                return outer(inner.bind(null, ...args));
+              }
+              async function deleteForward() {
+                const args = [draw];
+                delete args[0];
+                return outer(inner.bind(null, ...args));
+              }
+              async function updateForward() {
+                const args = [draw];
+                args.length++;
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [4, 6, 8, 10, 12] {
             assert!(
                 lines.contains(&line),
                 "missing line {line}; dynamic lines: {lines:?}"
