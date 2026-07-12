@@ -2623,11 +2623,40 @@ impl ProjectIndex {
     }
 
     fn wrapper_array_indexes_for_local(&self, path: &Path, name: &str) -> Option<BTreeSet<usize>> {
-        self.files
-            .get(path)?
-            .wrapper_array_return_indexes
-            .get(name)
-            .cloned()
+        self.wrapper_array_indexes_for_local_at_depth(path, name, 0)
+    }
+
+    fn wrapper_array_indexes_for_local_at_depth(
+        &self,
+        path: &Path,
+        name: &str,
+        depth: usize,
+    ) -> Option<BTreeSet<usize>> {
+        if depth > 16 {
+            return None;
+        }
+        let file = self.files.get(path)?;
+        if let Some(indexes) = file.wrapper_array_return_indexes.get(name) {
+            return Some(indexes.clone());
+        }
+        file.wrapper_return_forwards
+            .get(name)?
+            .iter()
+            .find_map(|forward| match forward {
+                TranslatorReturnForward::Local(callee)
+                | TranslatorReturnForward::ForwardCall {
+                    namespace: None,
+                    name: callee,
+                    ..
+                } => self
+                    .wrapper_array_indexes_for_local_at_depth(path, callee, depth + 1)
+                    .or_else(|| {
+                        file.imports
+                            .get(callee)
+                            .and_then(|target| self.wrapper_array_indexes_for_import(path, target))
+                    }),
+                _ => None,
+            })
     }
 
     fn wrapper_array_indexes_for_import(
@@ -2641,8 +2670,23 @@ impl ProjectIndex {
             ImportedName::Named(name) => file
                 .translator_return_export_locals
                 .get(name)
-                .and_then(|local| file.wrapper_array_return_indexes.get(local))
-                .cloned(),
+                .and_then(|local| self.wrapper_array_indexes_for_local(&path, local))
+                .or_else(|| {
+                    file.re_exports
+                        .get(name)
+                        .and_then(|target| self.wrapper_array_indexes_for_import(&path, target))
+                })
+                .or_else(|| {
+                    file.star_re_exports.iter().find_map(|source| {
+                        self.wrapper_array_indexes_for_import(
+                            &path,
+                            &ImportTarget {
+                                source: source.clone(),
+                                imported: ImportedName::Named(name.clone()),
+                            },
+                        )
+                    })
+                }),
             ImportedName::Default => {
                 if !file.default_wrapper_array_return_indexes.is_empty() {
                     Some(file.default_wrapper_array_return_indexes.clone())
@@ -6618,12 +6662,14 @@ struct ReactWrapperReturnCollector {
     state_identifiers: BTreeSet<String>,
     namespaces: BTreeSet<String>,
     transparent_namespaces: BTreeSet<String>,
+    known_wrapper_helpers: BTreeSet<String>,
     wrapper_values: BTreeSet<String>,
     forward_values: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     structured_values: BTreeSet<String>,
     wrapper_member_values: BTreeSet<(String, String)>,
     forward_member_values: BTreeMap<(String, String), BTreeSet<TranslatorReturnForward>>,
     structured_unknown_values: BTreeSet<String>,
+    structured_resolved_values: BTreeSet<(String, String)>,
     direct: bool,
     forwards: BTreeSet<TranslatorReturnForward>,
     array_indexes: BTreeSet<usize>,
@@ -6682,6 +6728,8 @@ impl ReactWrapperReturnCollector {
                             format!("{prefix}.{name}")
                         };
                         let path_prefix = format!("{path}.");
+                        self.structured_resolved_values
+                            .insert((root.to_string(), path.clone()));
                         self.wrapper_member_values
                             .retain(|(candidate_root, candidate)| {
                                 candidate_root != root
@@ -6733,6 +6781,34 @@ impl ReactWrapperReturnCollector {
                             .filter(|((candidate, _), _)| candidate == source)
                             .map(|((_, path), forwards)| (path.clone(), forwards.clone()))
                             .collect::<Vec<_>>();
+                        let resolved = self
+                            .structured_resolved_values
+                            .iter()
+                            .filter(|(candidate, _)| candidate == source)
+                            .map(|(_, path)| path.clone())
+                            .collect::<Vec<_>>();
+                        for source_path in resolved {
+                            let path = if prefix.is_empty() {
+                                source_path
+                            } else {
+                                format!("{prefix}.{source_path}")
+                            };
+                            let path_prefix = format!("{path}.");
+                            self.wrapper_member_values
+                                .retain(|(candidate_root, candidate)| {
+                                    candidate_root != root
+                                        || (candidate != &path
+                                            && !candidate.starts_with(&path_prefix))
+                                });
+                            self.forward_member_values
+                                .retain(|(candidate_root, candidate), _| {
+                                    candidate_root != root
+                                        || (candidate != &path
+                                            && !candidate.starts_with(&path_prefix))
+                                });
+                            self.structured_resolved_values
+                                .insert((root.to_string(), path));
+                        }
                         for source_path in wrappers {
                             let path = if prefix.is_empty() {
                                 source_path
@@ -6824,6 +6900,13 @@ impl ReactWrapperReturnCollector {
             }
             Expression::CallExpression(call) => {
                 self.call_is_wrapper(call, "useMemo")
+                    || call
+                        .callee
+                        .get_identifier_reference()
+                        .is_some_and(|identifier| {
+                            self.known_wrapper_helpers
+                                .contains(identifier.name.as_str())
+                        })
                     || (self.call_is_transparent_wrapper_container(call)
                         && self
                             .transparent_wrapper_arguments(call)
@@ -7100,7 +7183,11 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         if let Some(argument) = &statement.argument {
             self.direct |= self.expression_returns_wrapper(argument);
             self.collect_forwards(argument);
-            if let Expression::CallExpression(call) = argument.get_inner_expression()
+            let returned = match argument.get_inner_expression() {
+                Expression::AwaitExpression(await_expression) => &await_expression.argument,
+                _ => argument,
+            };
+            if let Expression::CallExpression(call) = returned.get_inner_expression()
                 && call.callee.get_member_expr().is_some_and(|member| {
                     member.static_property_name() == Some("all")
                         && member
@@ -7120,9 +7207,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                     .enumerate()
                     .filter_map(|(index, element)| {
                         element.as_expression().and_then(|expression| {
-                            (self.expression_returns_wrapper(expression)
-                                || !self.forwards_from_expression(expression).is_empty())
-                            .then_some(index)
+                            self.expression_returns_wrapper(expression).then_some(index)
                         })
                     })
                     .collect::<Vec<_>>();
@@ -10096,12 +10181,14 @@ impl SourceIndexCollector {
             state_identifiers,
             namespaces,
             transparent_namespaces,
+            known_wrapper_helpers: self.wrapper_return_helpers.clone(),
             wrapper_values: BTreeSet::new(),
             forward_values: BTreeMap::new(),
             structured_values: BTreeSet::new(),
             wrapper_member_values: BTreeSet::new(),
             forward_member_values: BTreeMap::new(),
             structured_unknown_values: BTreeSet::new(),
+            structured_resolved_values: BTreeSet::new(),
             direct: false,
             forwards: BTreeSet::new(),
             array_indexes: BTreeSet::new(),
@@ -11265,23 +11352,39 @@ impl SourceUsageCollector {
         {
             return false;
         }
-        let Some(Argument::ArrowFunctionExpression(arrow)) = call.arguments.first() else {
+        let Some(callback) = call.arguments.first() else {
             return false;
         };
-        let Some(name) = arrow
-            .params
-            .items
-            .first()
-            .and_then(|param| binding_identifier_name(&param.pattern))
-            .map(str::to_string)
-        else {
+        let (name, body) = match callback {
+            Argument::ArrowFunctionExpression(arrow) => (
+                arrow
+                    .params
+                    .items
+                    .first()
+                    .and_then(|param| binding_identifier_name(&param.pattern)),
+                Some(&arrow.body),
+            ),
+            Argument::FunctionExpression(function) => (
+                function
+                    .params
+                    .items
+                    .first()
+                    .and_then(|param| binding_identifier_name(&param.pattern)),
+                function.body.as_ref(),
+            ),
+            _ => return false,
+        };
+        let Some(name) = name.map(str::to_string) else {
+            return false;
+        };
+        let Some(body) = body else {
             return false;
         };
         let environment = self.binding_environment();
         self.mask_binding_name(&name);
         self.potential_wrapper_values.insert(name.clone());
         self.potential_wrapper_callables.insert(name);
-        self.visit_function_body(&arrow.body);
+        self.visit_function_body(body);
         self.restore_binding_environment(environment);
         true
     }
@@ -18338,8 +18441,25 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         {
             let environment = self.binding_environment();
             self.mask_binding_name(&name);
-            self.potential_wrapper_values.insert(name.clone());
-            self.potential_wrapper_callables.insert(name);
+            let entries = matches!(
+                statement.right.get_inner_expression(),
+                Expression::CallExpression(call)
+                    if call.callee.get_member_expr().is_some_and(|member| {
+                        member.static_property_name() == Some("entries")
+                    })
+            );
+            if entries {
+                self.potential_wrapper_callable_paths.insert(
+                    name,
+                    PotentialWrapperPaths {
+                        included: BTreeSet::from(["1".to_string()]),
+                        excluded: BTreeSet::new(),
+                    },
+                );
+            } else {
+                self.potential_wrapper_values.insert(name.clone());
+                self.potential_wrapper_callables.insert(name);
+            }
             self.visit_statement(&statement.body);
             self.restore_binding_environment(environment);
             return;
