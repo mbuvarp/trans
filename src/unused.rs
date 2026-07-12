@@ -15,15 +15,15 @@ use oxc_ast::ast::{
     ConditionalExpression, Declaration, ExportAllDeclaration, ExportDefaultDeclaration,
     ExportDefaultDeclarationKind, ExportNamedDeclaration, Expression, ForOfStatement,
     ForStatementLeft, Function, FunctionBody, FunctionType, IdentifierReference, ImportDeclaration,
-    ImportDeclarationSpecifier, JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild,
-    JSXElement, JSXElementName, JSXExpression, JSXMemberExpressionObject, JSXOpeningElement,
-    MemberExpression, ModuleExportName, NewExpression, ObjectAssignmentTarget, ObjectExpression,
-    ObjectPropertyKind, PropertyKey, PropertyKind, ReturnStatement, SimpleAssignmentTarget,
-    SpreadElement, Statement, StaticMemberExpression, SwitchStatement, TSInterfaceDeclaration,
-    TSLiteral, TSSignature, TSType, TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator,
-    TSTypeQueryExprName, TaggedTemplateExpression, TemplateLiteral, ThrowStatement,
-    UnaryExpression, UpdateExpression, VariableDeclaration, VariableDeclarationKind,
-    VariableDeclarator, YieldExpression,
+    ImportDeclarationSpecifier, ImportExpression, JSXAttributeItem, JSXAttributeName,
+    JSXAttributeValue, JSXChild, JSXElement, JSXElementName, JSXExpression,
+    JSXMemberExpressionObject, JSXOpeningElement, MemberExpression, ModuleExportName,
+    NewExpression, ObjectAssignmentTarget, ObjectExpression, ObjectPropertyKind, PropertyKey,
+    PropertyKind, ReturnStatement, SimpleAssignmentTarget, SpreadElement, Statement,
+    StaticMemberExpression, SwitchStatement, TSInterfaceDeclaration, TSLiteral, TSSignature,
+    TSType, TSTypeAliasDeclaration, TSTypeName, TSTypeOperatorOperator, TSTypeQueryExprName,
+    TaggedTemplateExpression, TemplateLiteral, ThrowStatement, UnaryExpression, UpdateExpression,
+    VariableDeclaration, VariableDeclarationKind, VariableDeclarator, YieldExpression,
 };
 use oxc_ast::ast_kind::AstKind;
 use oxc_ast_visit::{Visit, walk};
@@ -519,6 +519,7 @@ struct FiniteBoundArgumentEntry {
 struct FiniteBoundArgumentScope {
     previous: BTreeMap<String, Option<FiniteBoundArgumentEntry>>,
     previous_capture_callables: BTreeMap<String, Option<BTreeSet<String>>>,
+    disposal_provenance: BTreeSet<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -9110,6 +9111,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
 
     fn leave_scope(&mut self) {
         if let Some(scope) = self.finite_bound_argument_scopes.pop() {
+            self.invalidate_finite_bound_argument_provenance(scope.disposal_provenance);
             for (name, previous) in scope.previous {
                 if let Some(previous) = previous {
                     if self
@@ -9159,10 +9161,22 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         let captures = self
             .finite_bound_capture_names_from_expression(&statement.right)
             .unwrap_or_default();
+        let mut iteration_provenance = BTreeSet::new();
         if !self.finite_bound_expression_is_known_array(&statement.right) {
-            let provenance = self.finite_bound_argument_provenance(&statement.right);
-            self.invalidate_finite_bound_argument_provenance(provenance);
+            iteration_provenance.extend(self.finite_bound_argument_provenance(&statement.right));
         }
+        if statement.r#await {
+            iteration_provenance.extend(self.finite_bound_capture_provenance(&captures));
+        }
+        self.invalidate_finite_bound_argument_provenance(iteration_provenance);
+        let disposes_iteration_values = matches!(
+            &statement.left,
+            ForStatementLeft::VariableDeclaration(declaration)
+                if matches!(
+                    declaration.kind,
+                    VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing
+                )
+        );
         let alias_sources = Self::finite_bound_capture_alias_sources(&statement.right);
         let previous = names
             .iter()
@@ -9185,6 +9199,10 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             }
         }
         walk::walk_for_of_statement(self, statement);
+        if disposes_iteration_values {
+            let provenance = self.finite_bound_capture_provenance(&captures);
+            self.invalidate_finite_bound_argument_provenance(provenance);
+        }
         for (name, captures) in previous {
             if let Some(captures) = captures {
                 self.finite_bound_capture_callables.insert(name, captures);
@@ -9345,6 +9363,15 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         }
     }
 
+    fn visit_import_expression(&mut self, expression: &ImportExpression<'a>) {
+        walk::walk_import_expression(self, expression);
+        let mut provenance = self.finite_bound_argument_provenance(&expression.source);
+        if let Some(options) = &expression.options {
+            provenance.extend(self.finite_bound_argument_provenance(options));
+        }
+        self.invalidate_finite_bound_argument_provenance(provenance);
+    }
+
     fn visit_throw_statement(&mut self, statement: &ThrowStatement<'a>) {
         walk::walk_throw_statement(self, statement);
         let captures = self
@@ -9463,6 +9490,15 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             return;
         };
         walk::walk_variable_declarator(self, declarator);
+        if matches!(
+            declarator.kind,
+            VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing
+        ) {
+            let provenance = self.finite_bound_argument_provenance(init);
+            if let Some(scope) = self.finite_bound_argument_scopes.last_mut() {
+                scope.disposal_provenance.extend(provenance);
+            }
+        }
         let wrapper = self.expression_returns_wrapper(init);
         let forwards = self.forwards_from_expression(init);
         let (array_indexes, array_index_forwards) = self.array_summary_from_expression(init);
@@ -27760,6 +27796,128 @@ mod tests {
                 escaped();
                 return outer(inner.bind(null, ...args));
                 function change() { args[0] = runtimeFactory; }
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [4, 6, 8] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn for_await_invalidates_thenable_elements_but_not_plain_exact_arrays() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [thenable] = await thenableForward();
+              thenable[0][0](thenableKey);
+              const [plain] = await plainForward();
+              plain[0][0](plainKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function thenableForward() {
+                const args = [draw];
+                const value = { then(resolve) { args[0] = runtimeFactory; resolve(); } };
+                for await (const ignored of [value]) {}
+                return outer(inner.bind(null, ...args));
+              }
+              async function plainForward() {
+                const args = [draw];
+                for await (const ignored of args) {}
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&6), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn dynamic_import_coercion_invalidates_captured_finite_bound_arrays() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [source] = await sourceForward();
+              source[0][0](sourceKey);
+              const [options] = await optionsForward();
+              options[0][0](optionsKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function sourceForward() {
+                const args = [draw];
+                const source = { toString() { args[0] = runtimeFactory; return './messages'; } };
+                import(source);
+                return outer(inner.bind(null, ...args));
+              }
+              async function optionsForward() {
+                const args = [draw];
+                const options = { get with() { args[0] = runtimeFactory; return {}; } };
+                import('./messages', options);
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [4, 6] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn using_disposal_invalidates_captured_finite_bound_arrays_at_scope_exit() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [sync] = await syncForward();
+              sync[0][0](syncKey);
+              const [asyncValue] = await asyncForward();
+              asyncValue[0][0](asyncKey);
+              const [iterated] = await iterationForward();
+              iterated[0][0](iterationKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function syncForward() {
+                const args = [draw];
+                {
+                  using resource = { [Symbol.dispose]() { args[0] = runtimeFactory; } };
+                }
+                return outer(inner.bind(null, ...args));
+              }
+              async function asyncForward() {
+                const args = [draw];
+                {
+                  await using resource = { async [Symbol.asyncDispose]() { args[0] = runtimeFactory; } };
+                }
+                return outer(inner.bind(null, ...args));
+              }
+              async function iterationForward() {
+                const args = [draw];
+                const resource = { [Symbol.dispose]() { args[0] = runtimeFactory; } };
+                for (using value of [resource]) {}
+                return outer(inner.bind(null, ...args));
               }
             }
             "#,
