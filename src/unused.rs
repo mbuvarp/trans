@@ -2845,65 +2845,7 @@ impl ProjectIndex {
             }
         }
         if let Some(forwards) = file.wrapper_return_forwards.get(name) {
-            for forward in forwards {
-                let TranslatorReturnForward::ForwardCall {
-                    namespace,
-                    name: target_name,
-                    argument_targets,
-                    wrapper_arguments,
-                    ..
-                } = forward
-                else {
-                    continue;
-                };
-                let parameter_indexes = if let Some(namespace) = namespace {
-                    file.namespace_imports
-                        .get(namespace)
-                        .map(|source| {
-                            self.wrapper_array_parameter_indexes_for_import_at_depth(
-                                path,
-                                &ImportTarget {
-                                    source: source.clone(),
-                                    imported: ImportedName::Named(target_name.clone()),
-                                },
-                                depth + 1,
-                            )
-                        })
-                        .unwrap_or_default()
-                } else if let Some(target) = file.imports.get(target_name) {
-                    self.wrapper_array_parameter_indexes_for_import_at_depth(
-                        path,
-                        target,
-                        depth + 1,
-                    )
-                } else {
-                    self.wrapper_array_parameter_indexes_for_local_at_depth(
-                        path,
-                        target_name,
-                        depth + 1,
-                    )
-                };
-                for (index, params) in parameter_indexes {
-                    let concrete = params.into_iter().any(|param| {
-                        wrapper_arguments.contains(&param)
-                            || argument_targets.get(&param).is_some_and(|targets| {
-                                targets.iter().any(|target| {
-                                    self.wrapper_callable_target_resolution_at_depth(
-                                        path,
-                                        target,
-                                        depth + 1,
-                                    )
-                                    .is_some_and(|target| {
-                                        target.direct || !target.indexes.is_empty()
-                                    })
-                                })
-                            })
-                    });
-                    if concrete {
-                        indexes.insert(index);
-                    }
-                }
-            }
+            indexes.extend(self.wrapper_concrete_indexes_from_forwards(path, forwards, depth));
         }
         if !indexes.is_empty() {
             return Some(indexes);
@@ -2926,6 +2868,72 @@ impl ProjectIndex {
                     }),
                 _ => None,
             })
+    }
+
+    fn wrapper_concrete_indexes_from_forwards(
+        &self,
+        path: &Path,
+        forwards: &BTreeSet<TranslatorReturnForward>,
+        depth: usize,
+    ) -> BTreeSet<usize> {
+        let Some(file) = self.files.get(path) else {
+            return BTreeSet::new();
+        };
+        let mut indexes = BTreeSet::new();
+        for forward in forwards {
+            let TranslatorReturnForward::ForwardCall {
+                namespace,
+                name: target_name,
+                argument_targets,
+                wrapper_arguments,
+                ..
+            } = forward
+            else {
+                continue;
+            };
+            let parameter_indexes = if let Some(namespace) = namespace {
+                file.namespace_imports
+                    .get(namespace)
+                    .map(|source| {
+                        self.wrapper_array_parameter_indexes_for_import_at_depth(
+                            path,
+                            &ImportTarget {
+                                source: source.clone(),
+                                imported: ImportedName::Named(target_name.clone()),
+                            },
+                            depth + 1,
+                        )
+                    })
+                    .unwrap_or_default()
+            } else if let Some(target) = file.imports.get(target_name) {
+                self.wrapper_array_parameter_indexes_for_import_at_depth(path, target, depth + 1)
+            } else {
+                self.wrapper_array_parameter_indexes_for_local_at_depth(
+                    path,
+                    target_name,
+                    depth + 1,
+                )
+            };
+            for (index, params) in parameter_indexes {
+                let concrete = params.into_iter().any(|param| {
+                    wrapper_arguments.contains(&param)
+                        || argument_targets.get(&param).is_some_and(|targets| {
+                            targets.iter().any(|target| {
+                                self.wrapper_callable_target_resolution_at_depth(
+                                    path,
+                                    target,
+                                    depth + 1,
+                                )
+                                .is_some_and(|target| target.direct || !target.indexes.is_empty())
+                            })
+                        })
+                });
+                if concrete {
+                    indexes.insert(index);
+                }
+            }
+        }
+        indexes
     }
 
     fn wrapper_array_indexes_for_import(
@@ -3010,6 +3018,11 @@ impl ProjectIndex {
                         indexes.insert(*index);
                     }
                 }
+                indexes.extend(self.wrapper_concrete_indexes_from_forwards(
+                    &path,
+                    &file.default_wrapper_return_forwards,
+                    depth + 1,
+                ));
                 if !indexes.is_empty() {
                     Some(indexes)
                 } else {
@@ -3119,6 +3132,20 @@ impl ProjectIndex {
         let Some(forwards) = file.wrapper_return_forwards.get(name) else {
             return indexes;
         };
+        self.extend_wrapper_parameter_indexes_from_forwards(path, forwards, depth, &mut indexes);
+        indexes
+    }
+
+    fn extend_wrapper_parameter_indexes_from_forwards(
+        &self,
+        path: &Path,
+        forwards: &BTreeSet<TranslatorReturnForward>,
+        depth: usize,
+        indexes: &mut BTreeMap<usize, BTreeSet<usize>>,
+    ) {
+        let Some(file) = self.files.get(path) else {
+            return;
+        };
         for forward in forwards {
             let (resolved, argument_params) = match forward {
                 TranslatorReturnForward::Local(callee) => {
@@ -3226,7 +3253,6 @@ impl ProjectIndex {
                 }
             }
         }
-        indexes
     }
 
     fn wrapper_callable_target_resolution_at_depth(
@@ -3426,7 +3452,7 @@ impl ProjectIndex {
                         depth + 1,
                     );
                 }
-                let indexes = file
+                let mut indexes = file
                     .default_wrapper_array_index_forwards
                     .iter()
                     .filter_map(|(index, candidates)| {
@@ -3442,6 +3468,12 @@ impl ProjectIndex {
                         (!params.is_empty()).then_some((*index, params))
                     })
                     .collect::<BTreeMap<_, _>>();
+                self.extend_wrapper_parameter_indexes_from_forwards(
+                    &path,
+                    &file.default_wrapper_return_forwards,
+                    depth + 1,
+                    &mut indexes,
+                );
                 if !indexes.is_empty() {
                     return indexes;
                 }
@@ -7718,6 +7750,8 @@ impl ReactWrapperReturnCollector {
         name: &str,
         captures: Option<BTreeSet<String>>,
     ) {
+        let replaces_existing_callable = self.finite_bound_capture_callables.contains_key(name);
+        let defines_callable = captures.is_some();
         if let Some(scope) = self.finite_bound_argument_scopes.last_mut() {
             scope
                 .previous_capture_callables
@@ -7733,6 +7767,9 @@ impl ReactWrapperReturnCollector {
                 .or_insert_with(|| self.finite_bound_resolved_capture_names.get(name).cloned());
         }
         self.replace_finite_bound_capture_value(name, captures);
+        if defines_callable && !replaces_existing_callable {
+            self.refresh_finite_bound_capture_dependents(name, true);
+        }
     }
 
     fn finite_bound_capture_value_state(
@@ -7786,6 +7823,54 @@ impl ReactWrapperReturnCollector {
             .entry(name.to_string())
             .or_default()
             .extend(resolved_names);
+        self.refresh_finite_bound_capture_dependents(name, false);
+    }
+
+    fn replace_finite_bound_capture_value_and_refresh(
+        &mut self,
+        name: &str,
+        captures: Option<BTreeSet<String>>,
+    ) {
+        self.replace_finite_bound_capture_value(name, captures);
+        self.refresh_finite_bound_capture_dependents(name, false);
+    }
+
+    fn refresh_finite_bound_capture_dependents(
+        &mut self,
+        changed_name: &str,
+        unresolved_only: bool,
+    ) {
+        let mut pending = vec![(changed_name.to_string(), unresolved_only)];
+        let mut visited = BTreeSet::from([changed_name.to_string()]);
+        while let Some((changed, unresolved_only)) = pending.pop() {
+            let dependents = self
+                .finite_bound_capture_callables
+                .iter()
+                .filter_map(|(name, captures)| {
+                    (captures.contains(&changed)
+                        && (!unresolved_only
+                            || self
+                                .finite_bound_resolved_capture_names
+                                .get(name)
+                                .is_none_or(|resolved| !resolved.contains(&changed))))
+                    .then_some(name.clone())
+                })
+                .collect::<Vec<_>>();
+            for dependent in dependents {
+                let Some(captures) = self.finite_bound_capture_callables.get(&dependent).cloned()
+                else {
+                    continue;
+                };
+                let (provenance, resolved_names) = self.finite_bound_capture_value_state(&captures);
+                self.finite_bound_capture_provenance
+                    .insert(dependent.clone(), provenance);
+                self.finite_bound_resolved_capture_names
+                    .insert(dependent.clone(), resolved_names);
+                if visited.insert(dependent.clone()) {
+                    pending.push((dependent, false));
+                }
+            }
+        }
     }
 
     fn finite_bound_capture_names(expression: &Expression<'_>) -> Option<BTreeSet<String>> {
@@ -8146,9 +8231,10 @@ impl ReactWrapperReturnCollector {
                     .or_default()
                     .extend(provenance.iter().copied());
                 self.finite_bound_resolved_capture_names
-                    .entry(callable)
+                    .entry(callable.clone())
                     .or_default()
                     .insert(name.to_string());
+                self.refresh_finite_bound_capture_dependents(&callable, false);
             }
         } else {
             self.finite_bound_argument_arrays.remove(name);
@@ -9605,6 +9691,8 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         }
         self.invalidate_finite_bound_argument_provenance(iteration_provenance);
         let alias_sources = Self::finite_bound_capture_alias_sources(&statement.right);
+        let assigns_existing_bindings =
+            !matches!(statement.left, ForStatementLeft::VariableDeclaration(_));
         let previous = names
             .iter()
             .map(|name| {
@@ -9620,34 +9708,40 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             for source in &alias_sources {
                 self.link_finite_bound_capture_aliases(name, source);
             }
-            self.replace_finite_bound_capture_value(
-                name,
-                (!captures.is_empty()).then(|| captures.clone()),
-            );
+            let captures = (!captures.is_empty()).then(|| captures.clone());
+            if assigns_existing_bindings {
+                if let Some(captures) = captures {
+                    self.merge_finite_bound_capture_value(name, captures);
+                }
+            } else {
+                self.replace_finite_bound_capture_value(name, captures);
+            }
         }
         walk::walk_for_of_statement(self, statement);
         if disposes_iteration_values {
             let provenance = self.finite_bound_capture_provenance(&captures);
             self.invalidate_finite_bound_argument_provenance(provenance);
         }
-        for (name, captures, provenance, resolved_names) in previous {
-            if let Some(captures) = captures {
-                self.finite_bound_capture_callables
-                    .insert(name.clone(), captures);
-            } else {
-                self.finite_bound_capture_callables.remove(&name);
-            }
-            if let Some(provenance) = provenance {
-                self.finite_bound_capture_provenance
-                    .insert(name.clone(), provenance);
-            } else {
-                self.finite_bound_capture_provenance.remove(&name);
-            }
-            if let Some(resolved_names) = resolved_names {
-                self.finite_bound_resolved_capture_names
-                    .insert(name, resolved_names);
-            } else {
-                self.finite_bound_resolved_capture_names.remove(&name);
+        if !assigns_existing_bindings {
+            for (name, captures, provenance, resolved_names) in previous {
+                if let Some(captures) = captures {
+                    self.finite_bound_capture_callables
+                        .insert(name.clone(), captures);
+                } else {
+                    self.finite_bound_capture_callables.remove(&name);
+                }
+                if let Some(provenance) = provenance {
+                    self.finite_bound_capture_provenance
+                        .insert(name.clone(), provenance);
+                } else {
+                    self.finite_bound_capture_provenance.remove(&name);
+                }
+                if let Some(resolved_names) = resolved_names {
+                    self.finite_bound_resolved_capture_names
+                        .insert(name, resolved_names);
+                } else {
+                    self.finite_bound_resolved_capture_names.remove(&name);
+                }
             }
         }
     }
@@ -10082,7 +10176,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                     self.merge_finite_bound_capture_value(&name, captures);
                 }
             } else {
-                self.replace_finite_bound_capture_value(&name, captures);
+                self.replace_finite_bound_capture_value_and_refresh(&name, captures);
             }
         }
         if matches!(
@@ -10120,7 +10214,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                     .extend(self.finite_bound_assignment_default_provenance(&expression.left));
                 provenance.retain(|id| !invalidated_source.contains(id));
                 for name in names {
-                    self.replace_finite_bound_capture_value(&name, captures.clone());
+                    self.replace_finite_bound_capture_value_and_refresh(&name, captures.clone());
                     if self.escaped_finite_bound_capture_names.contains(&name) {
                         self.finite_bound_argument_arrays.remove(&name);
                     } else if let Some(entry) = Self::finite_bound_carrier_entry(&provenance) {
@@ -16769,6 +16863,13 @@ impl SourceUsageCollector {
             Expression::LogicalExpression(logical) => {
                 self.expression_may_contain_wrapper_callable(&logical.left)
                     || self.expression_may_contain_wrapper_callable(&logical.right)
+            }
+            Expression::SequenceExpression(sequence) => sequence
+                .expressions
+                .last()
+                .is_some_and(|expression| self.expression_may_contain_wrapper_callable(expression)),
+            Expression::AssignmentExpression(assignment) => {
+                self.expression_may_contain_wrapper_callable(&assignment.right)
             }
             Expression::ArrayExpression(array) => {
                 array.elements.iter().any(|element| match element {
@@ -26194,6 +26295,11 @@ mod tests {
               conditional[0][0](conditionalKey);
               const [logical] = await forward(enabled && [useBaseValues]);
               logical[0][0](logicalKey);
+              const [sequenced] = await forward((observe(), [useBaseValues]));
+              sequenced[0][0](sequenceKey);
+              let override;
+              const [assigned] = await forward(override = [useBaseValues]);
+              assigned[0][0](assignmentKey);
               const [spread] = await forward([...runtimeFactories]);
               spread[0][0](spreadKey);
             }
@@ -26204,7 +26310,7 @@ mod tests {
             .iter()
             .map(|usage| usage.line)
             .collect::<BTreeSet<_>>();
-        for line in [9, 11, 13, 15, 17, 19] {
+        for line in [9, 11, 13, 15, 17, 19, 22, 24] {
             assert!(
                 lines.contains(&line),
                 "missing line {line}; dynamic lines: {lines:?}"
@@ -26290,6 +26396,61 @@ mod tests {
             .map(|usage| usage.line)
             .collect::<BTreeSet<_>>();
         assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn default_exports_preserve_callable_targets_and_parameter_overrides() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parameterized = dir.path().join("parameterized.ts");
+        let fixed = dir.path().join("fixed.ts");
+        let main = dir.path().join("main.ts");
+        fs::write(
+            &parameterized,
+            r#"
+            async function inner(factory) { return Promise.all([factory(), draw]); }
+            async function outer(factory) { return Promise.all([factory(), draw]); }
+            export default async function (args = [draw]) {
+              return outer(inner.bind(null, ...args));
+            }
+            "#,
+        )
+        .expect("write parameterized helper");
+        fs::write(
+            &fixed,
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function inner(factory) { return Promise.all([factory(), draw]); }
+            async function outer(factory) { return Promise.all([factory(), draw]); }
+            export default async function () {
+              return outer(inner.bind(null, useBaseValues));
+            }
+            "#,
+        )
+        .expect("write fixed helper");
+        fs::write(
+            &main,
+            r#"
+            import {useMemo} from 'react';
+            import parameterized from './parameterized';
+            import fixed from './fixed';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            const [parameterizedResult] = await parameterized([useBaseValues]);
+            parameterizedResult[0][0](parameterizedKey);
+            const [fixedResult] = await fixed();
+            fixedResult[0][0](fixedKey);
+            "#,
+        )
+        .expect("write main");
+
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&7), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&9), "dynamic lines: {lines:?}");
     }
 
     #[test]
@@ -27615,6 +27776,39 @@ mod tests {
                 const args = [draw];
                 let change = () => { previous[0] = runtimeFactory; };
                 change = () => { args[0] = runtimeFactory; };
+                {
+                  const args = [draw];
+                  external.callback = change;
+                  consume(args);
+                }
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn transitive_callable_reassignment_refreshes_dependent_capture_provenance() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const previous = [draw];
+                const args = [draw];
+                let callback = () => { previous[0] = runtimeFactory; };
+                const change = () => callback();
+                callback = () => { args[0] = runtimeFactory; };
                 {
                   const args = [draw];
                   external.callback = change;
