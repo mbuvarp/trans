@@ -497,6 +497,13 @@ impl WrapperCallableTarget {
     }
 }
 
+#[derive(Clone, Default)]
+struct BoundArgumentEvidence {
+    targets: BTreeSet<WrapperCallableTarget>,
+    wrapper: bool,
+    params: BTreeSet<usize>,
+}
+
 #[derive(Debug, Clone)]
 enum ImportedName {
     Named(String),
@@ -4050,6 +4057,7 @@ struct LocalWrapperResolution {
     direct: bool,
     indexes: BTreeSet<usize>,
     parameters: BTreeMap<usize, BTreeSet<usize>>,
+    captured_parameters: BTreeMap<usize, BTreeSet<usize>>,
     forwards: BTreeSet<TranslatorReturnForward>,
     definition_shadowed_bindings: BTreeSet<String>,
 }
@@ -7273,6 +7281,7 @@ struct ReactWrapperReturnCollector {
     array_index_values: BTreeMap<String, BTreeSet<usize>>,
     array_index_forward_values:
         BTreeMap<String, BTreeMap<usize, BTreeSet<TranslatorReturnForward>>>,
+    finite_bound_argument_arrays: BTreeMap<String, Vec<BoundArgumentEvidence>>,
 }
 
 struct InlineWrapperReturnVisitor<'collector> {
@@ -7395,55 +7404,35 @@ impl ReactWrapperReturnCollector {
                         .expect("bind member checked")
                         .object(),
                 );
-                let mut fixed_arguments = Vec::<Option<&Expression<'_>>>::new();
-                let mut unknown_arguments = Vec::<&Expression<'_>>::new();
+                let mut fixed_arguments = Vec::<BoundArgumentEvidence>::new();
+                let mut unknown_arguments = Vec::<BoundArgumentEvidence>::new();
                 let mut unknown_position = None;
                 for argument in call.arguments.iter().skip(1) {
                     match argument {
                         Argument::SpreadElement(spread) => {
-                            if let Expression::ArrayExpression(array) =
-                                spread.argument.get_inner_expression()
-                            {
-                                for element in &array.elements {
-                                    match element {
-                                        ArrayExpressionElement::SpreadElement(spread) => {
-                                            if unknown_position.is_none() {
-                                                unknown_position = Some(fixed_arguments.len());
-                                            }
-                                            unknown_arguments.push(&spread.argument);
-                                        }
-                                        ArrayExpressionElement::Elision(_) => {
-                                            if unknown_position.is_none() {
-                                                fixed_arguments.push(None);
-                                            }
-                                        }
-                                        _ => {
-                                            let argument = element.as_expression();
-                                            if unknown_position.is_some() {
-                                                if let Some(argument) = argument {
-                                                    unknown_arguments.push(argument);
-                                                }
-                                            } else {
-                                                fixed_arguments.push(argument);
-                                            }
-                                        }
-                                    }
+                            if let Some(arguments) = self.finite_bound_arguments(&spread.argument) {
+                                if unknown_position.is_some() {
+                                    unknown_arguments.extend(arguments);
+                                } else {
+                                    fixed_arguments.extend(arguments);
                                 }
                             } else {
                                 if unknown_position.is_none() {
                                     unknown_position = Some(fixed_arguments.len());
                                 }
-                                unknown_arguments.push(&spread.argument);
+                                unknown_arguments
+                                    .push(self.bound_argument_evidence(&spread.argument));
                             }
                         }
                         _ => {
-                            let argument = argument.as_expression();
+                            let evidence = argument
+                                .as_expression()
+                                .map(|argument| self.bound_argument_evidence(argument))
+                                .unwrap_or_default();
                             if unknown_position.is_some() {
-                                if let Some(argument) = argument {
-                                    unknown_arguments.push(argument);
-                                }
+                                unknown_arguments.push(evidence);
                             } else {
-                                fixed_arguments.push(argument);
+                                fixed_arguments.push(evidence);
                             }
                         }
                     }
@@ -7453,52 +7442,31 @@ impl ReactWrapperReturnCollector {
                     .iter()
                     .enumerate()
                     .filter_map(|(index, argument)| {
-                        let targets = self.wrapper_callable_targets(argument.as_ref()?);
-                        (!targets.is_empty()).then_some((index, targets))
+                        (!argument.targets.is_empty()).then_some((index, argument.targets.clone()))
                     })
                     .collect::<BTreeMap<_, _>>();
                 let fixed_wrapper_arguments = fixed_arguments
                     .iter()
                     .enumerate()
-                    .filter_map(|(index, argument)| {
-                        argument
-                            .is_some_and(|argument| {
-                                self.inline_expression_returns_wrapper(argument)
-                            })
-                            .then_some(index)
-                    })
+                    .filter_map(|(index, argument)| argument.wrapper.then_some(index))
                     .collect::<BTreeSet<_>>();
-                let parameter_origins = |argument: &Expression<'_>| {
-                    self.forwards_from_expression(argument)
-                        .into_iter()
-                        .filter_map(|forward| match forward {
-                            TranslatorReturnForward::ParameterCall { param_index, .. } => {
-                                Some(param_index)
-                            }
-                            _ => None,
-                        })
-                        .collect::<BTreeSet<_>>()
-                };
                 let fixed_argument_params = fixed_arguments
                     .iter()
                     .enumerate()
                     .filter_map(|(index, argument)| {
-                        let params = parameter_origins(argument.as_ref()?);
-                        (!params.is_empty()).then_some((index, params))
+                        (!argument.params.is_empty()).then_some((index, argument.params.clone()))
                     })
                     .collect::<BTreeMap<_, _>>();
                 let unknown_targets = unknown_arguments
                     .iter()
-                    .flat_map(|argument| self.wrapper_callable_targets(argument))
+                    .flat_map(|argument| argument.targets.iter().cloned())
                     .collect::<BTreeSet<_>>();
                 let unknown_params = unknown_arguments
                     .iter()
-                    .flat_map(|argument| parameter_origins(argument))
+                    .flat_map(|argument| argument.params.iter().copied())
                     .collect::<BTreeSet<_>>();
                 let unknown_may_wrap = unknown_position.is_some()
-                    || unknown_arguments
-                        .iter()
-                        .any(|argument| self.inline_expression_returns_wrapper(argument));
+                    || unknown_arguments.iter().any(|argument| argument.wrapper);
                 targets = targets
                     .into_iter()
                     .map(|mut target| {
@@ -7563,6 +7531,75 @@ impl ReactWrapperReturnCollector {
                 })
                 .into_iter()
                 .collect(),
+        }
+    }
+
+    fn bound_argument_evidence(&self, expression: &Expression<'_>) -> BoundArgumentEvidence {
+        BoundArgumentEvidence {
+            targets: self.wrapper_callable_targets(expression),
+            wrapper: self.inline_expression_returns_wrapper(expression),
+            params: self
+                .forwards_from_expression(expression)
+                .into_iter()
+                .filter_map(|forward| match forward {
+                    TranslatorReturnForward::ParameterCall { param_index, .. } => Some(param_index),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    fn finite_bound_arguments(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<Vec<BoundArgumentEvidence>> {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => self
+                .finite_bound_argument_arrays
+                .get(identifier.name.as_str())
+                .cloned(),
+            Expression::ArrayExpression(array) => {
+                let mut values = Vec::new();
+                for element in &array.elements {
+                    match element {
+                        ArrayExpressionElement::SpreadElement(spread) => {
+                            values.extend(self.finite_bound_arguments(&spread.argument)?);
+                        }
+                        ArrayExpressionElement::Elision(_) => {
+                            values.push(BoundArgumentEvidence::default());
+                        }
+                        _ => values.push(self.bound_argument_evidence(element.as_expression()?)),
+                    }
+                }
+                Some(values)
+            }
+            Expression::ConditionalExpression(conditional) => {
+                let mut consequent = self.finite_bound_arguments(&conditional.consequent)?;
+                let alternate = self.finite_bound_arguments(&conditional.alternate)?;
+                if consequent.len() != alternate.len() {
+                    return None;
+                }
+                for (target, other) in consequent.iter_mut().zip(alternate) {
+                    target.targets.extend(other.targets);
+                    target.wrapper |= other.wrapper;
+                    target.params.extend(other.params);
+                }
+                Some(consequent)
+            }
+            Expression::LogicalExpression(logical) => {
+                let mut left = self.finite_bound_arguments(&logical.left)?;
+                let right = self.finite_bound_arguments(&logical.right)?;
+                if left.len() != right.len() {
+                    return None;
+                }
+                for (target, other) in left.iter_mut().zip(right) {
+                    target.targets.extend(other.targets);
+                    target.wrapper |= other.wrapper;
+                    target.params.extend(other.params);
+                }
+                Some(left)
+            }
+            _ => None,
         }
     }
 
@@ -8292,6 +8329,12 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         }
         if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
             let name = identifier.name.to_string();
+            if let Some(arguments) = self.finite_bound_arguments(init) {
+                self.finite_bound_argument_arrays
+                    .insert(name.clone(), arguments);
+            } else {
+                self.finite_bound_argument_arrays.remove(&name);
+            }
             if !array_indexes.is_empty() {
                 self.array_index_values
                     .insert(name.clone(), array_indexes.clone());
@@ -8308,6 +8351,12 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             && let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &expression.left
         {
             let name = identifier.name.to_string();
+            if let Some(arguments) = self.finite_bound_arguments(&expression.right) {
+                self.finite_bound_argument_arrays
+                    .insert(name.clone(), arguments);
+            } else {
+                self.finite_bound_argument_arrays.remove(&name);
+            }
             let (array_indexes, array_index_forwards) =
                 self.array_summary_from_expression(&expression.right);
             if self.expression_returns_wrapper(&expression.right) {
@@ -11279,6 +11328,7 @@ impl SourceIndexCollector {
             array_index_forwards: BTreeMap::new(),
             array_index_values: BTreeMap::new(),
             array_index_forward_values: BTreeMap::new(),
+            finite_bound_argument_arrays: BTreeMap::new(),
         }
     }
 
@@ -13151,6 +13201,7 @@ impl SourceUsageCollector {
                     (!parameters.is_empty()).then_some((index, parameters))
                 })
                 .collect(),
+            captured_parameters: BTreeMap::new(),
             forwards: summary.forwards,
             definition_shadowed_bindings,
         }
@@ -13307,7 +13358,11 @@ impl SourceUsageCollector {
                                     concrete_wrapper |= target_resolution.direct
                                         || !target_resolution.indexes.is_empty();
                                     forwarded_wrapper_params.extend(
-                                        target_resolution.parameters.values().flatten().copied(),
+                                        target_resolution
+                                            .captured_parameters
+                                            .values()
+                                            .flatten()
+                                            .copied(),
                                     );
                                 }
                             }
@@ -13348,44 +13403,53 @@ impl SourceUsageCollector {
             return Some(resolution);
         }
         let mut remaining = BTreeMap::<usize, BTreeSet<usize>>::new();
+        let mut captured = BTreeMap::<usize, BTreeSet<usize>>::new();
         for (index, params) in std::mem::take(&mut resolution.parameters) {
             let mut wrapper_argument = false;
             for param in params {
                 if param < target.bound_argument_count {
                     wrapper_argument |= target.bound_wrapper_arguments.contains(&param);
                     if let Some(params) = target.bound_argument_params.get(&param) {
-                        remaining
+                        captured
                             .entry(index)
                             .or_default()
                             .extend(params.iter().copied());
                     }
                     if let Some(targets) = target.bound_argument_targets.get(&param) {
                         wrapper_argument |= targets.iter().any(|target| {
-                            self.resolved_wrapper_callable_target_at_depth(
+                            let Some(target) = self.resolved_wrapper_callable_target_at_depth(
                                 target,
                                 definition_shadowed_bindings,
                                 visited,
-                            )
-                            .is_some_and(|resolution| {
-                                resolution.direct || !resolution.indexes.is_empty()
-                            })
+                            ) else {
+                                return false;
+                            };
+                            captured
+                                .entry(index)
+                                .or_default()
+                                .extend(target.captured_parameters.values().flatten().copied());
+                            target.direct || !target.indexes.is_empty()
                         });
                     }
                 } else if target.bound_unknown_from.is_some_and(|from| param >= from) {
                     wrapper_argument |= target.bound_unknown_may_wrap;
-                    remaining
+                    captured
                         .entry(index)
                         .or_default()
                         .extend(target.bound_unknown_params.iter().copied());
                     wrapper_argument |= target.bound_unknown_targets.iter().any(|target| {
-                        self.resolved_wrapper_callable_target_at_depth(
+                        let Some(target) = self.resolved_wrapper_callable_target_at_depth(
                             target,
                             definition_shadowed_bindings,
                             visited,
-                        )
-                        .is_some_and(|resolution| {
-                            resolution.direct || !resolution.indexes.is_empty()
-                        })
+                        ) else {
+                            return false;
+                        };
+                        captured
+                            .entry(index)
+                            .or_default()
+                            .extend(target.captured_parameters.values().flatten().copied());
+                        target.direct || !target.indexes.is_empty()
                     });
                 } else {
                     remaining
@@ -13399,6 +13463,10 @@ impl SourceUsageCollector {
             }
         }
         resolution.parameters = remaining;
+        for (index, params) in resolution.captured_parameters {
+            captured.entry(index).or_default().extend(params);
+        }
+        resolution.captured_parameters = captured;
         Some(resolution)
     }
 
@@ -13463,6 +13531,7 @@ impl SourceUsageCollector {
                 direct,
                 indexes,
                 parameters,
+                captured_parameters: BTreeMap::new(),
                 forwards: BTreeSet::new(),
                 definition_shadowed_bindings: BTreeSet::new(),
             },
@@ -24512,6 +24581,26 @@ mod tests {
     }
 
     #[test]
+    fn unbound_callable_parameters_do_not_capture_forwarder_arguments() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function scope() {
+              const [ordinary] = await forward(useBaseValues);
+              ordinary[0][0](ordinaryKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward(ignored) {
+                return outer(inner.bind(null));
+              }
+            }
+            "#,
+        );
+        assert!(!scan.dynamic_usages.iter().any(|usage| usage.line == 6));
+    }
+
+    #[test]
     fn finite_bound_spreads_preserve_their_exact_wrapper_contents() {
         let scan = scan(
             r#"
@@ -24540,6 +24629,41 @@ mod tests {
         assert!(!lines.contains(&6), "dynamic lines: {lines:?}");
         assert!(!lines.contains(&8), "dynamic lines: {lines:?}");
         assert!(lines.contains(&10), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn finite_bound_spread_aliases_and_alternatives_remain_exact() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function scope() {
+              const [ordinary] = await ordinaryForward();
+              ordinary[0][0](ordinaryKey);
+              const [values] = await wrapperForward();
+              values[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function ordinaryForward() {
+                const args = [draw];
+                return outer(inner.bind(null, ...args));
+              }
+              async function wrapperForward() {
+                const primary = [useBaseValues];
+                const fallback = [useBaseValues];
+                const args = enabled ? primary : fallback;
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(!lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&8), "dynamic lines: {lines:?}");
     }
 
     #[test]
