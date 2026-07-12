@@ -23,6 +23,7 @@ use oxc_ast::ast::{
     TSTypeQueryExprName, TemplateLiteral, UnaryExpression, UpdateExpression, VariableDeclaration,
     VariableDeclarationKind, VariableDeclarator,
 };
+use oxc_ast::ast_kind::AstKind;
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
@@ -508,7 +509,7 @@ struct BoundArgumentEvidence {
 #[derive(Clone)]
 struct FiniteBoundArgumentEntry {
     values: Vec<BoundArgumentEvidence>,
-    provenance: usize,
+    provenance: BTreeSet<usize>,
 }
 
 #[derive(Default)]
@@ -7297,6 +7298,7 @@ struct ReactWrapperReturnCollector {
     finite_bound_argument_scopes: Vec<FiniteBoundArgumentScope>,
     invalidated_finite_bound_argument_provenance: BTreeSet<usize>,
     next_finite_bound_argument_provenance: usize,
+    conditional_control_flow_depth: usize,
 }
 
 struct InlineWrapperReturnVisitor<'collector> {
@@ -7343,19 +7345,12 @@ impl ReactWrapperReturnCollector {
         expression: &Expression<'_>,
     ) -> Option<FiniteBoundArgumentEntry> {
         let values = self.finite_bound_arguments(expression)?;
-        let provenance = expression
-            .get_inner_expression()
-            .get_identifier_reference()
-            .and_then(|identifier| {
-                self.finite_bound_argument_arrays
-                    .get(identifier.name.as_str())
-                    .map(|entry| entry.provenance)
-            })
-            .unwrap_or_else(|| {
-                let provenance = self.next_finite_bound_argument_provenance;
-                self.next_finite_bound_argument_provenance += 1;
-                provenance
-            });
+        let mut provenance = self.finite_bound_argument_provenance(expression);
+        if provenance.is_empty() {
+            let id = self.next_finite_bound_argument_provenance;
+            self.next_finite_bound_argument_provenance += 1;
+            provenance.insert(id);
+        }
         Some(FiniteBoundArgumentEntry { values, provenance })
     }
 
@@ -7363,7 +7358,7 @@ impl ReactWrapperReturnCollector {
         self.invalidated_finite_bound_argument_provenance
             .extend(provenance.iter().copied());
         self.finite_bound_argument_arrays
-            .retain(|_, entry| !provenance.contains(&entry.provenance));
+            .retain(|_, entry| entry.provenance.is_disjoint(&provenance));
     }
 
     fn argument_param_combinations(
@@ -7670,7 +7665,7 @@ impl ReactWrapperReturnCollector {
             Expression::Identifier(identifier) => self
                 .finite_bound_argument_arrays
                 .get(identifier.name.as_str())
-                .map(|entry| BTreeSet::from([entry.provenance]))
+                .map(|entry| entry.provenance.clone())
                 .unwrap_or_default(),
             Expression::ConditionalExpression(conditional) => {
                 let mut provenance = self.finite_bound_argument_provenance(&conditional.consequent);
@@ -8333,6 +8328,42 @@ impl ReactWrapperReturnCollector {
 }
 
 impl<'a> Visit<'a> for ReactWrapperReturnCollector {
+    fn enter_node(&mut self, kind: AstKind<'a>) {
+        if matches!(
+            kind,
+            AstKind::LogicalExpression(_)
+                | AstKind::ConditionalExpression(_)
+                | AstKind::IfStatement(_)
+                | AstKind::DoWhileStatement(_)
+                | AstKind::WhileStatement(_)
+                | AstKind::ForStatement(_)
+                | AstKind::ForInStatement(_)
+                | AstKind::ForOfStatement(_)
+                | AstKind::SwitchStatement(_)
+                | AstKind::TryStatement(_)
+        ) {
+            self.conditional_control_flow_depth += 1;
+        }
+    }
+
+    fn leave_node(&mut self, kind: AstKind<'a>) {
+        if matches!(
+            kind,
+            AstKind::LogicalExpression(_)
+                | AstKind::ConditionalExpression(_)
+                | AstKind::IfStatement(_)
+                | AstKind::DoWhileStatement(_)
+                | AstKind::WhileStatement(_)
+                | AstKind::ForStatement(_)
+                | AstKind::ForInStatement(_)
+                | AstKind::ForOfStatement(_)
+                | AstKind::SwitchStatement(_)
+                | AstKind::TryStatement(_)
+        ) {
+            self.conditional_control_flow_depth -= 1;
+        }
+    }
+
     fn enter_scope(&mut self, _flags: ScopeFlags, _scope_id: &Cell<Option<ScopeId>>) {
         self.finite_bound_argument_scopes
             .push(FiniteBoundArgumentScope::default());
@@ -8342,9 +8373,9 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         if let Some(scope) = self.finite_bound_argument_scopes.pop() {
             for (name, previous) in scope.previous {
                 if let Some(previous) = previous {
-                    if !self
+                    if self
                         .invalidated_finite_bound_argument_provenance
-                        .contains(&previous.provenance)
+                        .is_disjoint(&previous.provenance)
                     {
                         self.finite_bound_argument_arrays.insert(name, previous);
                     }
@@ -8375,27 +8406,15 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                     method,
                     "at" | "concat"
                         | "entries"
-                        | "every"
-                        | "filter"
-                        | "find"
-                        | "findIndex"
-                        | "findLast"
-                        | "findLastIndex"
                         | "flat"
-                        | "flatMap"
                         | "includes"
                         | "indexOf"
                         | "join"
                         | "keys"
                         | "lastIndexOf"
-                        | "map"
-                        | "reduce"
-                        | "reduceRight"
                         | "slice"
-                        | "some"
                         | "toLocaleString"
                         | "toReversed"
-                        | "toSorted"
                         | "toSpliced"
                         | "toString"
                         | "values"
@@ -8403,7 +8422,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 )
             });
             if !known_nonmutating {
-                invalidated_provenance.insert(entry.provenance);
+                invalidated_provenance.extend(entry.provenance.iter().copied());
             }
         }
         for argument in &call.arguments {
@@ -8529,6 +8548,20 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
     }
 
     fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
+        let uncertain_identifier_provenance = match &expression.left {
+            AssignmentTarget::AssignmentTargetIdentifier(identifier)
+                if expression.operator != AssignmentOperator::Assign
+                    || self.conditional_control_flow_depth > 0 =>
+            {
+                self.finite_bound_argument_arrays
+                    .get(identifier.name.as_str())
+                    .map(|entry| entry.provenance.clone())
+            }
+            _ => None,
+        };
+        if let Some(provenance) = uncertain_identifier_provenance {
+            self.invalidate_finite_bound_argument_provenance(provenance);
+        }
         let mutated_provenance = assignment_target_static_member_path(&expression.left)
             .map(|(root, _)| root)
             .or_else(|| {
@@ -8537,12 +8570,13 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             .and_then(|root| {
                 self.finite_bound_argument_arrays
                     .get(root)
-                    .map(|entry| entry.provenance)
+                    .map(|entry| entry.provenance.clone())
             });
         if let Some(provenance) = mutated_provenance {
-            self.invalidate_finite_bound_argument_provenance(BTreeSet::from([provenance]));
+            self.invalidate_finite_bound_argument_provenance(provenance);
         }
         if expression.operator == AssignmentOperator::Assign
+            && self.conditional_control_flow_depth == 0
             && let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &expression.left
         {
             let name = identifier.name.to_string();
@@ -8658,7 +8692,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 .finite_bound_argument_arrays
                 .get(identifier.name.as_str())
         {
-            self.invalidate_finite_bound_argument_provenance(BTreeSet::from([entry.provenance]));
+            self.invalidate_finite_bound_argument_provenance(entry.provenance.clone());
         }
         walk::walk_unary_expression(self, expression);
     }
@@ -8674,7 +8708,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 .finite_bound_argument_arrays
                 .get(identifier.name.as_str())
         {
-            self.invalidate_finite_bound_argument_provenance(BTreeSet::from([entry.provenance]));
+            self.invalidate_finite_bound_argument_provenance(entry.provenance.clone());
         }
         walk::walk_update_expression(self, expression);
     }
@@ -11556,6 +11590,7 @@ impl SourceIndexCollector {
             finite_bound_argument_scopes: Vec::new(),
             invalidated_finite_bound_argument_provenance: BTreeSet::new(),
             next_finite_bound_argument_provenance: 0,
+            conditional_control_flow_depth: 0,
         }
     }
 
@@ -25053,6 +25088,137 @@ mod tests {
             .map(|usage| usage.line)
             .collect::<BTreeSet<_>>();
         for line in [4, 6, 8, 10, 12] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_finite_bound_aliases_share_source_provenance() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [aliasMutated] = await aliasMutatedForward();
+              aliasMutated[0][0](aliasMutatedKey);
+              const [sourceMutated] = await sourceMutatedForward();
+              sourceMutated[0][0](sourceMutatedKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function aliasMutatedForward() {
+                const first = [draw];
+                const second = [draw];
+                const alias = enabled ? first : second;
+                mutate(alias);
+                return outer(inner.bind(null, ...first));
+              }
+              async function sourceMutatedForward() {
+                const first = [draw];
+                const second = [draw];
+                const alias = enabled ? first : second;
+                mutate(first);
+                return outer(inner.bind(null, ...alias));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [4, 6] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_array_methods_invalidate_finite_bound_evidence() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [mapped] = await mapForward();
+              mapped[0][0](mapKey);
+              const [sorted] = await sortedForward();
+              sorted[0][0](sortedKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function mapForward() {
+                const args = [draw];
+                args.map((value, index, source) => source[index] = runtimeFactory);
+                return outer(inner.bind(null, ...args));
+              }
+              async function sortedForward() {
+                const args = [draw];
+                args.toSorted(() => { args[0] = runtimeFactory; return 0; });
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [4, 6] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_assignments_invalidate_finite_bound_evidence() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function scope() {
+              const [ifValue] = await ifForward();
+              ifValue[0][0](ifKey);
+              const [switchValue] = await switchForward();
+              switchValue[0][0](switchKey);
+              const [loopValue] = await loopForward();
+              loopValue[0][0](loopKey);
+              const [logicalValue] = await logicalForward();
+              logicalValue[0][0](logicalKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function ifForward() {
+                let args = [useBaseValues];
+                if (enabled) args = [draw];
+                return outer(inner.bind(null, ...args));
+              }
+              async function switchForward() {
+                let args = [useBaseValues];
+                switch (kind) { case 'ordinary': args = [draw]; }
+                return outer(inner.bind(null, ...args));
+              }
+              async function loopForward() {
+                let args = [useBaseValues];
+                for (const item of items) args = [draw];
+                return outer(inner.bind(null, ...args));
+              }
+              async function logicalForward() {
+                let args = [useBaseValues];
+                enabled && (args = [draw]);
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [6, 8, 10, 12] {
             assert!(
                 lines.contains(&line),
                 "missing line {line}; dynamic lines: {lines:?}"
