@@ -519,6 +519,7 @@ struct FiniteBoundArgumentEntry {
 
 #[derive(Default)]
 struct FiniteBoundArgumentScope {
+    capture_scope_id: usize,
     previous: BTreeMap<String, Option<FiniteBoundArgumentEntry>>,
     previous_capture_callables: BTreeMap<String, Option<BTreeSet<String>>>,
     previous_capture_provenance: BTreeMap<String, Option<BTreeSet<usize>>>,
@@ -7624,6 +7625,7 @@ struct ReactWrapperReturnCollector {
         BTreeMap<String, BTreeMap<usize, BTreeSet<TranslatorReturnForward>>>,
     finite_bound_argument_arrays: BTreeMap<String, FiniteBoundArgumentEntry>,
     finite_bound_argument_scopes: Vec<FiniteBoundArgumentScope>,
+    next_finite_bound_capture_scope_id: usize,
     invalidated_finite_bound_argument_provenance: BTreeSet<usize>,
     next_finite_bound_argument_provenance: usize,
     conditional_control_flow_depth: usize,
@@ -7764,6 +7766,29 @@ impl ReactWrapperReturnCollector {
         self.finite_bound_argument_scopes.len().min(1)
     }
 
+    fn finite_bound_current_capture_scope_id(&self) -> usize {
+        self.finite_bound_argument_scopes
+            .last()
+            .map_or(0, |scope| scope.capture_scope_id)
+    }
+
+    fn finite_bound_active_capture_scope_ids(&self) -> BTreeSet<usize> {
+        let mut scope_ids = self
+            .finite_bound_argument_scopes
+            .iter()
+            .map(|scope| scope.capture_scope_id)
+            .collect::<BTreeSet<_>>();
+        scope_ids.insert(0);
+        scope_ids
+    }
+
+    fn finite_bound_capture_scope_id_at_depth(&self, depth: usize) -> usize {
+        depth
+            .checked_sub(1)
+            .and_then(|scope_index| self.finite_bound_argument_scopes.get(scope_index))
+            .map_or(0, |scope| scope.capture_scope_id)
+    }
+
     fn set_finite_bound_capture_declaration_at_depth(
         &mut self,
         name: &str,
@@ -7805,8 +7830,9 @@ impl ReactWrapperReturnCollector {
                 .entry(name.to_string())
                 .or_insert_with(|| self.finite_bound_capture_value_depths.get(name).cloned());
         }
+        let binding_scope_id = self.finite_bound_capture_scope_id_at_depth(binding_depth);
         self.finite_bound_capture_binding_depths
-            .insert(name.to_string(), binding_depth);
+            .insert(name.to_string(), binding_scope_id);
         self.replace_finite_bound_capture_value(name, captures);
         if defines_callable && !replaces_existing_callable {
             self.refresh_finite_bound_capture_dependents(name, true);
@@ -7861,7 +7887,7 @@ impl ReactWrapperReturnCollector {
                 .insert(name.to_string(), dependency_depths);
             self.finite_bound_capture_value_depths.insert(
                 name.to_string(),
-                BTreeSet::from([self.finite_bound_argument_scopes.len()]),
+                self.finite_bound_active_capture_scope_ids(),
             );
         } else {
             self.finite_bound_capture_callables.remove(name);
@@ -7894,11 +7920,30 @@ impl ReactWrapperReturnCollector {
         for (capture, depths) in dependency_depths {
             target.entry(capture).or_default().extend(depths);
         }
+        let value_scope_ids = self.finite_bound_active_capture_scope_ids();
         self.finite_bound_capture_value_depths
             .entry(name.to_string())
             .or_default()
-            .insert(self.finite_bound_argument_scopes.len());
+            .extend(value_scope_ids);
         self.refresh_finite_bound_capture_dependents(name, false);
+    }
+
+    fn finite_bound_callable_captures_binding(
+        &self,
+        callable: &str,
+        capture: &str,
+        binding_scope_id: usize,
+    ) -> bool {
+        let dependency_scope_ids = self
+            .finite_bound_capture_dependency_depths
+            .get(callable)
+            .and_then(|dependencies| dependencies.get(capture));
+        dependency_scope_ids.is_some_and(|scope_ids| scope_ids.contains(&binding_scope_id))
+            || (dependency_scope_ids.is_none()
+                && self
+                    .finite_bound_capture_value_depths
+                    .get(callable)
+                    .is_some_and(|scope_ids| scope_ids.contains(&binding_scope_id)))
     }
 
     fn replace_finite_bound_capture_value_and_refresh(
@@ -7926,17 +7971,8 @@ impl ReactWrapperReturnCollector {
                 .finite_bound_capture_callables
                 .iter()
                 .filter_map(|(name, captures)| {
-                    let dependency_depths = self
-                        .finite_bound_capture_dependency_depths
-                        .get(name)
-                        .and_then(|dependencies| dependencies.get(&changed));
-                    let captures_binding = dependency_depths
-                        .is_some_and(|depths| depths.contains(&changed_depth))
-                        || (dependency_depths.is_none()
-                            && self
-                                .finite_bound_capture_value_depths
-                                .get(name)
-                                .is_some_and(|depths| depths.contains(&changed_depth)));
+                    let captures_binding =
+                        self.finite_bound_callable_captures_binding(name, &changed, changed_depth);
                     (captures.contains(&changed)
                         && captures_binding
                         && (!unresolved_only
@@ -8309,13 +8345,27 @@ impl ReactWrapperReturnCollector {
         name: &str,
         value: Option<FiniteBoundArgumentEntry>,
     ) {
-        if let Some(scope) = self.finite_bound_argument_scopes.last_mut() {
+        let binding_depth = self.finite_bound_argument_scopes.len();
+        self.set_finite_bound_argument_declaration_at_depth(name, value, binding_depth);
+    }
+
+    fn set_finite_bound_argument_declaration_at_depth(
+        &mut self,
+        name: &str,
+        value: Option<FiniteBoundArgumentEntry>,
+        binding_depth: usize,
+    ) {
+        if let Some(scope) = binding_depth
+            .checked_sub(1)
+            .and_then(|scope_index| self.finite_bound_argument_scopes.get_mut(scope_index))
+        {
             scope
                 .previous
                 .entry(name.to_string())
                 .or_insert_with(|| self.finite_bound_argument_arrays.get(name).cloned());
         }
         if let Some(value) = value {
+            let binding_scope_id = self.finite_bound_capture_scope_id_at_depth(binding_depth);
             let provenance = value.provenance.clone();
             self.finite_bound_argument_arrays
                 .insert(name.to_string(), value);
@@ -8324,6 +8374,11 @@ impl ReactWrapperReturnCollector {
                 .iter()
                 .filter_map(|(callable, captures)| {
                     (captures.contains(name)
+                        && self.finite_bound_callable_captures_binding(
+                            callable,
+                            name,
+                            binding_scope_id,
+                        )
                         && self
                             .finite_bound_resolved_capture_names
                             .get(callable)
@@ -9692,8 +9747,13 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
     }
 
     fn enter_scope(&mut self, _flags: ScopeFlags, _scope_id: &Cell<Option<ScopeId>>) {
+        let capture_scope_id = self.next_finite_bound_capture_scope_id;
+        self.next_finite_bound_capture_scope_id += 1;
         self.finite_bound_argument_scopes
-            .push(FiniteBoundArgumentScope::default());
+            .push(FiniteBoundArgumentScope {
+                capture_scope_id,
+                ..FiniteBoundArgumentScope::default()
+            });
     }
 
     fn leave_scope(&mut self) {
@@ -9851,17 +9911,19 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             let captures = (!captures.is_empty()).then(|| captures.clone());
             if var_binding {
                 let binding_depth = self.finite_bound_var_binding_depth();
+                let binding_scope_id = self.finite_bound_capture_scope_id_at_depth(binding_depth);
                 self.finite_bound_capture_binding_depths
                     .entry(name.clone())
-                    .or_insert(binding_depth);
+                    .or_insert(binding_scope_id);
             }
             if assigns_existing_bindings {
                 if let Some(captures) = captures {
                     self.merge_finite_bound_capture_value(name, captures);
                 }
             } else {
+                let binding_scope_id = self.finite_bound_current_capture_scope_id();
                 self.finite_bound_capture_binding_depths
-                    .insert(name.clone(), self.finite_bound_argument_scopes.len());
+                    .insert(name.clone(), binding_scope_id);
                 self.replace_finite_bound_capture_value(name, captures);
             }
         }
@@ -10222,9 +10284,24 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         };
         let Some(init) = &declarator.init else {
             for identifier in declarator.id.get_binding_identifiers() {
-                self.set_finite_bound_argument_declaration(identifier.name.as_str(), None);
+                let name = identifier.name.as_str();
+                let binding_scope_id =
+                    self.finite_bound_capture_scope_id_at_depth(capture_binding_depth);
+                if declarator.kind == VariableDeclarationKind::Var
+                    && self
+                        .finite_bound_capture_binding_depths
+                        .get(name)
+                        .is_some_and(|current| *current == binding_scope_id)
+                {
+                    continue;
+                }
+                self.set_finite_bound_argument_declaration_at_depth(
+                    name,
+                    None,
+                    capture_binding_depth,
+                );
                 self.set_finite_bound_capture_declaration_at_depth(
-                    identifier.name.as_str(),
+                    name,
                     None,
                     capture_binding_depth,
                 );
@@ -10302,7 +10379,11 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             } else {
                 self.finite_bound_argument_entry(init)
             };
-            self.set_finite_bound_argument_declaration(&name, arguments);
+            self.set_finite_bound_argument_declaration_at_depth(
+                &name,
+                arguments,
+                capture_binding_depth,
+            );
             if !array_indexes.is_empty() {
                 self.array_index_values
                     .insert(name.clone(), array_indexes.clone());
@@ -10336,7 +10417,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                     captures.clone(),
                     capture_binding_depth,
                 );
-                self.set_finite_bound_argument_declaration(
+                self.set_finite_bound_argument_declaration_at_depth(
                     identifier.name.as_str(),
                     if self
                         .escaped_finite_bound_capture_names
@@ -10346,6 +10427,7 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                     } else {
                         Self::finite_bound_carrier_entry(&provenance)
                     },
+                    capture_binding_depth,
                 );
             }
         }
@@ -13601,6 +13683,7 @@ impl SourceIndexCollector {
             array_index_forward_values: BTreeMap::new(),
             finite_bound_argument_arrays: BTreeMap::new(),
             finite_bound_argument_scopes: Vec::new(),
+            next_finite_bound_capture_scope_id: 1,
             invalidated_finite_bound_argument_provenance: BTreeSet::new(),
             next_finite_bound_argument_provenance: 0,
             conditional_control_flow_depth: 0,
@@ -28231,6 +28314,113 @@ mod tests {
                 {
                   const args = [draw];
                   external.callback = escaped;
+                  consume(args);
+                }
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn sibling_scope_bindings_do_not_resolve_forward_captures() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const wrong = [draw];
+                const args = [draw];
+                let escaped;
+                {
+                  escaped = () => callback();
+                }
+                {
+                  const callback = () => { wrong[0] = runtimeFactory; };
+                  consume(callback);
+                }
+                const callback = () => { args[0] = runtimeFactory; };
+                {
+                  const args = [draw];
+                  external.callback = escaped;
+                  consume(args);
+                }
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn shadowed_finite_array_does_not_resolve_forward_callable_capture() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const args = [draw];
+                let escaped = () => callback();
+                {
+                  const callback = [draw];
+                  consume(callback);
+                }
+                const callback = () => { args[0] = runtimeFactory; };
+                {
+                  const args = [draw];
+                  external.callback = escaped;
+                  consume(args);
+                }
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn uninitialized_var_redeclaration_preserves_existing_callable_capture() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const args = [draw];
+                var callback = () => { args[0] = runtimeFactory; };
+                {
+                  var callback;
+                }
+                {
+                  const args = [draw];
+                  external.callback = callback;
                   consume(args);
                 }
                 return outer(inner.bind(null, ...args));
