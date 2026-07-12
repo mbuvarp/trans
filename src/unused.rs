@@ -504,6 +504,11 @@ struct BoundArgumentEvidence {
     params: BTreeSet<usize>,
 }
 
+#[derive(Default)]
+struct FiniteBoundArgumentScope {
+    previous: BTreeMap<String, Option<Vec<BoundArgumentEvidence>>>,
+}
+
 #[derive(Debug, Clone)]
 enum ImportedName {
     Named(String),
@@ -7282,6 +7287,7 @@ struct ReactWrapperReturnCollector {
     array_index_forward_values:
         BTreeMap<String, BTreeMap<usize, BTreeSet<TranslatorReturnForward>>>,
     finite_bound_argument_arrays: BTreeMap<String, Vec<BoundArgumentEvidence>>,
+    finite_bound_argument_scopes: Vec<FiniteBoundArgumentScope>,
 }
 
 struct InlineWrapperReturnVisitor<'collector> {
@@ -7304,6 +7310,29 @@ impl<'a> Visit<'a> for InlineWrapperReturnVisitor<'_> {
 }
 
 impl ReactWrapperReturnCollector {
+    fn set_finite_bound_argument_declaration(
+        &mut self,
+        name: &str,
+        value: Option<Vec<BoundArgumentEvidence>>,
+    ) {
+        if let Some(scope) = self.finite_bound_argument_scopes.last_mut() {
+            scope
+                .previous
+                .entry(name.to_string())
+                .or_insert_with(|| self.finite_bound_argument_arrays.get(name).cloned());
+        }
+        if let Some(value) = value {
+            self.finite_bound_argument_arrays
+                .insert(name.to_string(), value);
+        } else {
+            self.finite_bound_argument_arrays.remove(name);
+        }
+    }
+
+    fn invalidate_finite_bound_arguments(&mut self) {
+        self.finite_bound_argument_arrays.clear();
+    }
+
     fn argument_param_combinations(
         &self,
         call: &CallExpression<'_>,
@@ -8229,7 +8258,57 @@ impl ReactWrapperReturnCollector {
 }
 
 impl<'a> Visit<'a> for ReactWrapperReturnCollector {
+    fn enter_scope(&mut self, _flags: ScopeFlags, _scope_id: &Cell<Option<ScopeId>>) {
+        self.finite_bound_argument_scopes
+            .push(FiniteBoundArgumentScope::default());
+    }
+
+    fn leave_scope(&mut self) {
+        if let Some(scope) = self.finite_bound_argument_scopes.pop() {
+            for (name, previous) in scope.previous {
+                if let Some(previous) = previous {
+                    self.finite_bound_argument_arrays.insert(name, previous);
+                } else {
+                    self.finite_bound_argument_arrays.remove(&name);
+                }
+            }
+        }
+    }
+
+    fn visit_catch_parameter(&mut self, parameter: &CatchParameter<'a>) {
+        for identifier in parameter.pattern.get_binding_identifiers() {
+            self.set_finite_bound_argument_declaration(identifier.name.as_str(), None);
+        }
+        walk::walk_catch_parameter(self, parameter);
+    }
+
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        let mut invalidates_finite_arguments =
+            call.callee.get_member_expr().is_some_and(|member| {
+                member
+                    .object()
+                    .get_identifier_reference()
+                    .is_some_and(|identifier| {
+                        self.finite_bound_argument_arrays
+                            .contains_key(identifier.name.as_str())
+                    })
+                    && member
+                        .static_property_name()
+                        .is_some_and(|method| ARRAY_MUTATING_METHODS.contains(&method))
+            });
+        invalidates_finite_arguments |= call.arguments.iter().any(|argument| {
+            !matches!(argument, Argument::SpreadElement(_))
+                && argument
+                    .as_expression()
+                    .and_then(Expression::get_identifier_reference)
+                    .is_some_and(|identifier| {
+                        self.finite_bound_argument_arrays
+                            .contains_key(identifier.name.as_str())
+                    })
+        });
+        if invalidates_finite_arguments {
+            self.invalidate_finite_bound_arguments();
+        }
         if let Some(member) = call.callee.get_member_expr()
             && member.static_property_name() == Some("assign")
             && member
@@ -8329,12 +8408,8 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         }
         if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
             let name = identifier.name.to_string();
-            if let Some(arguments) = self.finite_bound_arguments(init) {
-                self.finite_bound_argument_arrays
-                    .insert(name.clone(), arguments);
-            } else {
-                self.finite_bound_argument_arrays.remove(&name);
-            }
+            let arguments = self.finite_bound_arguments(init);
+            self.set_finite_bound_argument_declaration(&name, arguments);
             if !array_indexes.is_empty() {
                 self.array_index_values
                     .insert(name.clone(), array_indexes.clone());
@@ -8347,6 +8422,15 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
     }
 
     fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
+        let mutates_finite_arguments = assignment_target_static_member_path(&expression.left)
+            .map(|(root, _)| root)
+            .or_else(|| {
+                assignment_target_unknown_container_path(&expression.left).map(|(root, _)| root)
+            })
+            .is_some_and(|root| self.finite_bound_argument_arrays.contains_key(root));
+        if mutates_finite_arguments {
+            self.invalidate_finite_bound_arguments();
+        }
         if expression.operator == AssignmentOperator::Assign
             && let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &expression.left
         {
@@ -11329,6 +11413,7 @@ impl SourceIndexCollector {
             array_index_values: BTreeMap::new(),
             array_index_forward_values: BTreeMap::new(),
             finite_bound_argument_arrays: BTreeMap::new(),
+            finite_bound_argument_scopes: Vec::new(),
         }
     }
 
@@ -24664,6 +24749,85 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(!lines.contains(&6), "dynamic lines: {lines:?}");
         assert!(lines.contains(&8), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn finite_bound_spread_aliases_restore_across_block_scopes() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function scope() {
+              const [values] = await wrapperForward();
+              values[0][0](runtimeKey);
+              const [ordinary] = await ordinaryForward();
+              ordinary[0][0](ordinaryKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function wrapperForward() {
+                const args = [useBaseValues];
+                { const args = [draw]; consume(args); }
+                return outer(inner.bind(null, ...args));
+              }
+              async function ordinaryForward() {
+                const args = [draw];
+                { const args = [useBaseValues]; consume(args); }
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&8), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn finite_bound_spread_evidence_invalidates_on_mutation_and_escape() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [assigned] = await assignedForward();
+              assigned[0][0](assignedKey);
+              const [pushed] = await pushedForward();
+              pushed[0][0](pushedKey);
+              const [escaped] = await escapedForward();
+              escaped[0][0](escapedKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function assignedForward() {
+                const args = [draw];
+                args[0] = runtimeFactory;
+                return outer(inner.bind(null, ...args));
+              }
+              async function pushedForward() {
+                const args = [draw];
+                args.push(runtimeFactory);
+                return outer(inner.bind(null, ...args));
+              }
+              async function escapedForward() {
+                const args = [draw];
+                mutate(args);
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        for line in [4, 6, 8] {
+            assert!(
+                lines.contains(&line),
+                "missing line {line}; dynamic lines: {lines:?}"
+            );
+        }
     }
 
     #[test]
