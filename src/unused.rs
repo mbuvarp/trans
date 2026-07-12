@@ -2925,6 +2925,49 @@ impl ProjectIndex {
                 (!params.is_empty()).then_some((*index, params))
             })
             .collect::<BTreeMap<_, _>>();
+        if let Some(bound_calls) = file.wrapper_bound_calls.get(name) {
+            for bound in bound_calls {
+                let resolved = if let Some(namespace) = &bound.namespace {
+                    file.namespace_imports
+                        .get(namespace)
+                        .map(|source| {
+                            self.wrapper_array_parameter_indexes_for_import_at_depth(
+                                path,
+                                &ImportTarget {
+                                    source: source.clone(),
+                                    imported: ImportedName::Named(bound.name.clone()),
+                                },
+                                depth + 1,
+                            )
+                        })
+                        .unwrap_or_default()
+                } else if let Some(target) = file.imports.get(&bound.name) {
+                    self.wrapper_array_parameter_indexes_for_import_at_depth(
+                        path,
+                        target,
+                        depth + 1,
+                    )
+                } else {
+                    self.wrapper_array_parameter_indexes_for_local_at_depth(
+                        path,
+                        &bound.name,
+                        depth + 1,
+                    )
+                };
+                for (index, params) in resolved {
+                    for param in params
+                        .into_iter()
+                        .filter(|param| *param >= bound.arguments.len())
+                    {
+                        indexes
+                            .entry(index)
+                            .or_default()
+                            .insert(param - bound.arguments.len());
+                    }
+                }
+            }
+            return indexes;
+        }
         let Some(forwards) = file.wrapper_return_forwards.get(name) else {
             return indexes;
         };
@@ -10649,6 +10692,7 @@ struct SourceIndexCollector {
     scope_binding_names: Vec<BTreeSet<String>>,
     function_scope_depth: usize,
     scope_is_function: Vec<bool>,
+    pending_var_bindings: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -10929,10 +10973,12 @@ impl SourceIndexCollector {
         for (index, forwards) in summary.array_index_forwards {
             target.entry(index).or_default().extend(forwards);
         }
-        self.wrapper_bound_calls
-            .entry(name.to_string())
-            .or_default()
-            .extend(summary.bound_calls);
+        if !summary.bound_calls.is_empty() {
+            self.wrapper_bound_calls
+                .entry(name.to_string())
+                .or_default()
+                .extend(summary.bound_calls);
+        }
     }
 
     fn wrapper_callable_alias_summary(&self, expression: &Expression<'_>) -> WrapperReturnSummary {
@@ -11740,7 +11786,19 @@ impl SourceIndexCollector {
                     &self.finite_record_maps,
                 );
             }
-            _ => {}
+            _ => {
+                if let Some(expression) = declaration.declaration.as_expression()
+                    && matches!(
+                        expression.get_inner_expression(),
+                        Expression::CallExpression(_)
+                    )
+                {
+                    let name = "\0trans-default-wrapper";
+                    let summary = self.wrapper_callable_alias_summary(expression);
+                    self.record_wrapper_return_summary(name, summary);
+                    self.default_local = Some(name.to_string());
+                }
+            }
         }
     }
 }
@@ -11759,7 +11817,16 @@ impl<'a> Visit<'a> for SourceIndexCollector {
         if self.scope_depth == 1 {
             self.module_bindings.insert(identifier.name.to_string());
         }
-        if let Some(bindings) = self.scope_binding_names.last_mut() {
+        if self.pending_var_bindings.contains(identifier.name.as_str()) {
+            let owner = self
+                .scope_is_function
+                .iter()
+                .rposition(|is_function| *is_function)
+                .unwrap_or(0);
+            if let Some(bindings) = self.scope_binding_names.get_mut(owner) {
+                bindings.insert(identifier.name.to_string());
+            }
+        } else if let Some(bindings) = self.scope_binding_names.last_mut() {
             bindings.insert(identifier.name.to_string());
         }
         if matches!(identifier.name.as_str(), "Object" | "Promise") {
@@ -11948,6 +12015,17 @@ impl<'a> Visit<'a> for SourceIndexCollector {
     }
 
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        let var_names = (declarator.kind == VariableDeclarationKind::Var)
+            .then(|| {
+                declarator
+                    .id
+                    .get_binding_identifiers()
+                    .into_iter()
+                    .map(|identifier| identifier.name.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.pending_var_bindings.extend(var_names.iter().cloned());
         if self.scope_depth == 1
             || (declarator.kind == VariableDeclarationKind::Var && self.function_scope_depth == 0)
         {
@@ -12155,6 +12233,9 @@ impl<'a> Visit<'a> for SourceIndexCollector {
             }
         }
         walk::walk_variable_declarator(self, declarator);
+        for name in var_names {
+            self.pending_var_bindings.remove(&name);
+        }
     }
 
     fn visit_export_named_declaration(&mut self, declaration: &ExportNamedDeclaration<'a>) {
@@ -22722,6 +22803,79 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(lines.contains(&5), "dynamic lines: {lines:?}");
         assert!(!lines.contains(&6), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn partially_bound_helpers_shift_call_time_parameters() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            function forward(unused, factory) { return aggregate(factory); }
+            const bound = forward.bind(null, null);
+            const [values, cleanup] = await bound(useBaseValues);
+            values[0](runtimeKey);
+            cleanup('layer');
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&8), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&9), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn top_level_block_var_assignments_update_module_aliases() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            if (enabled) { var alias; alias = aggregate; }
+            const [values] = await alias(useBaseValues);
+            values[0](runtimeKey);
+            "#,
+        );
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 7));
+    }
+
+    #[test]
+    fn direct_default_bound_exports_preserve_indexes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper = dir.path().join("helper.ts");
+        let main = dir.path().join("main.ts");
+        fs::write(
+            &helper,
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            export default aggregate.bind(null, useBaseValues);
+        "#,
+        )
+        .expect("write helper");
+        fs::write(
+            &main,
+            r#"
+            import load from './helper';
+            const [values, cleanup] = await load();
+            values[0](runtimeKey);
+            cleanup('layer');
+        "#,
+        )
+        .expect("write main");
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&5), "dynamic lines: {lines:?}");
     }
 
     #[test]
