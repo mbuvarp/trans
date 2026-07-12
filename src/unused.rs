@@ -7645,6 +7645,8 @@ struct ReactWrapperReturnCollector {
         BTreeMap<FiniteBoundCaptureBinding, BTreeSet<FiniteBoundCaptureBinding>>,
     finite_bound_capture_member_dependencies:
         BTreeMap<(FiniteBoundCaptureBinding, String), BTreeMap<String, BTreeSet<usize>>>,
+    finite_bound_capture_member_provenance:
+        BTreeMap<(FiniteBoundCaptureBinding, String), BTreeSet<usize>>,
     escaped_finite_bound_capture_bindings: BTreeSet<FiniteBoundCaptureBinding>,
     unresolved_escaped_finite_bound_capture_candidates: Vec<BTreeSet<FiniteBoundCaptureBinding>>,
     suppressed_member_read_spans: Vec<(u32, u32)>,
@@ -8191,17 +8193,15 @@ impl ReactWrapperReturnCollector {
                             .get(&(binding, path.join(".")))
                     })
                     .map(|dependencies| dependencies.keys().cloned().collect::<BTreeSet<_>>());
-                member_captures
-                    .filter(|captures| !captures.is_empty())
-                    .or_else(|| match expression.get_inner_expression() {
-                        Expression::StaticMemberExpression(member) => {
-                            self.finite_bound_capture_names_from_expression(&member.object)
-                        }
-                        Expression::ComputedMemberExpression(member) => {
-                            self.finite_bound_capture_names_from_expression(&member.object)
-                        }
-                        _ => None,
-                    })
+                member_captures.or_else(|| match expression.get_inner_expression() {
+                    Expression::StaticMemberExpression(member) => {
+                        self.finite_bound_capture_names_from_expression(&member.object)
+                    }
+                    Expression::ComputedMemberExpression(member) => {
+                        self.finite_bound_capture_names_from_expression(&member.object)
+                    }
+                    _ => None,
+                })
             }
             Expression::ArrayExpression(array) => {
                 let captures = array
@@ -8585,6 +8585,134 @@ impl ReactWrapperReturnCollector {
             })
             .collect();
         self.record_escaped_finite_bound_captures(names, exact_bindings);
+    }
+
+    fn finite_bound_capture_dependencies(
+        &self,
+        captures: &BTreeSet<String>,
+    ) -> BTreeMap<String, BTreeSet<usize>> {
+        captures
+            .iter()
+            .filter_map(|capture| {
+                self.finite_bound_capture_binding_depths
+                    .get(capture)
+                    .copied()
+                    .map(|scope_id| (capture.clone(), BTreeSet::from([scope_id])))
+            })
+            .collect()
+    }
+
+    fn update_finite_bound_capture_member_dependencies(
+        &mut self,
+        binding: FiniteBoundCaptureBinding,
+        path: String,
+        dependencies: BTreeMap<String, BTreeSet<usize>>,
+        provenance: BTreeSet<usize>,
+        merge: bool,
+    ) {
+        if !merge {
+            let prefix = format!("{path}.");
+            self.finite_bound_capture_member_dependencies.retain(
+                |(candidate_binding, candidate_path), _| {
+                    candidate_binding != &binding
+                        || (candidate_path != &path && !candidate_path.starts_with(&prefix))
+                },
+            );
+            self.finite_bound_capture_member_provenance.retain(
+                |(candidate_binding, candidate_path), _| {
+                    candidate_binding != &binding
+                        || (candidate_path != &path && !candidate_path.starts_with(&prefix))
+                },
+            );
+        }
+        let target = self
+            .finite_bound_capture_member_dependencies
+            .entry((binding.clone(), path.clone()))
+            .or_default();
+        for (capture, scope_ids) in dependencies {
+            target.entry(capture).or_default().extend(scope_ids);
+        }
+        self.finite_bound_capture_member_provenance
+            .entry((binding, path))
+            .or_default()
+            .extend(provenance);
+    }
+
+    fn seed_finite_bound_capture_object_dependencies(
+        &mut self,
+        binding: &FiniteBoundCaptureBinding,
+        object: &ObjectExpression<'_>,
+        prefix: &str,
+    ) {
+        for property in &object.properties {
+            match property {
+                ObjectPropertyKind::ObjectProperty(property)
+                    if !property.computed
+                        && property.kind == PropertyKind::Init
+                        && !property.method =>
+                {
+                    let Some(name) = property.key.static_name() else {
+                        continue;
+                    };
+                    let path = if prefix.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{prefix}.{name}")
+                    };
+                    let captures = self
+                        .finite_bound_capture_names_from_expression(&property.value)
+                        .unwrap_or_default();
+                    let dependencies = self.finite_bound_capture_dependencies(&captures);
+                    let provenance = self.finite_bound_argument_provenance(&property.value);
+                    self.update_finite_bound_capture_member_dependencies(
+                        binding.clone(),
+                        path.clone(),
+                        dependencies,
+                        provenance,
+                        false,
+                    );
+                    if let Expression::ObjectExpression(nested) =
+                        property.value.get_inner_expression()
+                    {
+                        self.seed_finite_bound_capture_object_dependencies(binding, nested, &path);
+                    }
+                }
+                ObjectPropertyKind::SpreadProperty(spread) => {
+                    let Some(source) = spread.argument.get_identifier_reference() else {
+                        continue;
+                    };
+                    let source_binding = self.finite_bound_capture_binding(source.name.as_str());
+                    let copied = self
+                        .finite_bound_capture_member_dependencies
+                        .iter()
+                        .filter(|((candidate, _), _)| candidate == &source_binding)
+                        .map(|((_, path), dependencies)| {
+                            let provenance = self
+                                .finite_bound_capture_member_provenance
+                                .get(&(source_binding.clone(), path.clone()))
+                                .cloned()
+                                .unwrap_or_default();
+                            (path.clone(), dependencies.clone(), provenance)
+                        })
+                        .collect::<Vec<_>>();
+                    for (path, dependencies, provenance) in copied {
+                        let path = if prefix.is_empty() {
+                            path
+                        } else {
+                            format!("{prefix}.{path}")
+                        };
+                        self.update_finite_bound_capture_member_dependencies(
+                            binding.clone(),
+                            path,
+                            dependencies,
+                            provenance,
+                            false,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn record_escaped_finite_bound_captures(
@@ -9191,11 +9319,24 @@ impl ReactWrapperReturnCollector {
                 provenance.extend(self.finite_bound_argument_provenance(&logical.right));
                 provenance
             }
-            Expression::StaticMemberExpression(member) => {
-                self.finite_bound_argument_provenance(&member.object)
-            }
-            Expression::ComputedMemberExpression(member) => {
-                self.finite_bound_argument_provenance(&member.object)
+            Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_) => {
+                let mut path = Vec::new();
+                let member_provenance = expression_static_member_path(expression, &mut path)
+                    .and_then(|root| {
+                        let binding = self.finite_bound_capture_binding(root);
+                        self.finite_bound_capture_member_provenance
+                            .get(&(binding, path.join(".")))
+                    })
+                    .cloned();
+                member_provenance.unwrap_or_else(|| match expression.get_inner_expression() {
+                    Expression::StaticMemberExpression(member) => {
+                        self.finite_bound_argument_provenance(&member.object)
+                    }
+                    Expression::ComputedMemberExpression(member) => {
+                        self.finite_bound_argument_provenance(&member.object)
+                    }
+                    _ => BTreeSet::new(),
+                })
             }
             Expression::PrivateFieldExpression(member) => {
                 self.finite_bound_argument_provenance(&member.object)
@@ -10653,6 +10794,9 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 capture_binding_depth,
             );
             let left = self.finite_bound_capture_binding(&name);
+            if let Expression::ObjectExpression(object) = init.get_inner_expression() {
+                self.seed_finite_bound_capture_object_dependencies(&left, object, "");
+            }
             self.clear_finite_bound_capture_binding_aliases(&left);
             for source in alias_source_bindings {
                 self.link_finite_bound_capture_binding_aliases(left.clone(), source);
@@ -10851,12 +10995,15 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         }
         if expression.operator == AssignmentOperator::Assign
             && let Some(root) = assignment_target_member_object_name(&expression.left)
-            && let Some(captures) =
-                self.finite_bound_capture_names_from_expression(&expression.right)
         {
-            let provenance = self.finite_bound_argument_provenance(&expression.right);
-            self.invalidate_finite_bound_argument_provenance(provenance);
-            self.record_escaped_finite_bound_expression(&expression.right);
+            let captures = self
+                .finite_bound_capture_names_from_expression(&expression.right)
+                .unwrap_or_default();
+            let member_provenance = self.finite_bound_argument_provenance(&expression.right);
+            if !captures.is_empty() {
+                self.invalidate_finite_bound_argument_provenance(member_provenance.clone());
+                self.record_escaped_finite_bound_expression(&expression.right);
+            }
             let root_binding = self.finite_bound_capture_binding(root);
             let aliases = self
                 .finite_bound_capture_aliases
@@ -10865,22 +11012,21 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
                 .unwrap_or_else(|| BTreeSet::from([root_binding]));
             let static_path = assignment_target_static_member_path(&expression.left)
                 .map(|(_, path)| path.join("."));
-            let dependencies = captures
-                .iter()
-                .filter_map(|capture| {
-                    self.finite_bound_capture_binding_depths
-                        .get(capture)
-                        .copied()
-                        .map(|scope_id| (capture.clone(), BTreeSet::from([scope_id])))
-                })
-                .collect::<BTreeMap<_, _>>();
+            let dependencies = self.finite_bound_capture_dependencies(&captures);
             for alias in aliases {
                 if self.finite_bound_capture_binding_is_current(&alias) {
                     if let Some(path) = &static_path {
-                        self.finite_bound_capture_member_dependencies
-                            .insert((alias.clone(), path.clone()), dependencies.clone());
+                        self.update_finite_bound_capture_member_dependencies(
+                            alias.clone(),
+                            path.clone(),
+                            dependencies.clone(),
+                            member_provenance.clone(),
+                            self.conditional_control_flow_depth > 0,
+                        );
                     }
-                    self.merge_finite_bound_capture_value(&alias.0, captures.clone());
+                    if !captures.is_empty() {
+                        self.merge_finite_bound_capture_value(&alias.0, captures.clone());
+                    }
                 }
             }
         }
@@ -11062,6 +11208,37 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             || self.finite_bound_expression_is_known_array(expression.object())
         {
             return;
+        }
+        let mut path = Vec::new();
+        let root = match expression {
+            MemberExpression::StaticMemberExpression(member) => {
+                let root = expression_static_member_path(&member.object, &mut path);
+                path.push(member.property.name.to_string());
+                root
+            }
+            MemberExpression::ComputedMemberExpression(member) => {
+                let root = expression_static_member_path(&member.object, &mut path);
+                if let Expression::StringLiteral(property) =
+                    member.expression.get_inner_expression()
+                {
+                    path.push(property.value.to_string());
+                    root
+                } else {
+                    None
+                }
+            }
+            MemberExpression::PrivateFieldExpression(_) => None,
+        };
+        if let Some(root) = root {
+            let binding = self.finite_bound_capture_binding(root);
+            if let Some(provenance) = self
+                .finite_bound_capture_member_provenance
+                .get(&(binding, path.join(".")))
+                .cloned()
+            {
+                self.invalidate_finite_bound_argument_provenance(provenance);
+                return;
+            }
         }
         let provenance = self.finite_bound_argument_provenance(expression.object());
         self.invalidate_finite_bound_argument_provenance(provenance);
@@ -14029,6 +14206,7 @@ impl SourceIndexCollector {
             finite_bound_capture_value_depths: BTreeMap::new(),
             finite_bound_capture_aliases: BTreeMap::new(),
             finite_bound_capture_member_dependencies: BTreeMap::new(),
+            finite_bound_capture_member_provenance: BTreeMap::new(),
             escaped_finite_bound_capture_bindings: BTreeSet::new(),
             unresolved_escaped_finite_bound_capture_candidates: Vec::new(),
             suppressed_member_read_spans: Vec::new(),
@@ -29112,6 +29290,34 @@ mod tests {
                 const rendered = <Component />;
                 consume(rendered);
                 const args = [draw];
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        assert!(
+            scan.dynamic_usages.is_empty(),
+            "dynamic usages: {:?}",
+            scan.dynamic_usages
+        );
+    }
+
+    #[test]
+    fn object_literal_callable_properties_remain_path_specific() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const args = [draw];
+                const holder = {
+                  mutating: () => { args[0] = runtimeFactory; },
+                  safe: ordinary,
+                };
+                external.callback = holder.safe;
                 return outer(inner.bind(null, ...args));
               }
             }
