@@ -6581,6 +6581,7 @@ struct ReactWrapperReturnCollector {
     memo_identifiers: BTreeSet<String>,
     state_identifiers: BTreeSet<String>,
     namespaces: BTreeSet<String>,
+    transparent_namespaces: BTreeSet<String>,
     wrapper_values: BTreeSet<String>,
     forward_values: BTreeMap<String, BTreeSet<TranslatorReturnForward>>,
     direct: bool,
@@ -6612,12 +6613,13 @@ impl ReactWrapperReturnCollector {
                 .object()
                 .get_identifier_reference()
                 .map(|identifier| identifier.name.as_str());
-            matches!(
-                (owner, member.static_property_name()),
-                (Some("Promise"), Some("resolve"))
-                    | (Some("Array"), Some("from" | "of"))
-                    | (Some("Object"), Some("freeze" | "seal"))
-            )
+            owner.is_some_and(|owner| self.transparent_namespaces.contains(owner))
+                && matches!(
+                    (owner, member.static_property_name()),
+                    (Some("Promise"), Some("resolve" | "all" | "allSettled"))
+                        | (Some("Array"), Some("from" | "of"))
+                        | (Some("Object"), Some("freeze" | "seal"))
+                )
         })
     }
 
@@ -6660,6 +6662,35 @@ impl ReactWrapperReturnCollector {
                         self.expression_returns_wrapper(&spread.argument)
                     }
                 })
+            }
+            Expression::StaticMemberExpression(member) => {
+                self.expression_returns_wrapper(&member.object)
+            }
+            Expression::ComputedMemberExpression(member) => {
+                self.expression_returns_wrapper(&member.object)
+            }
+            Expression::NewExpression(new_expression)
+                if new_expression
+                    .callee
+                    .get_identifier_reference()
+                    .is_some_and(|identifier| {
+                        matches!(identifier.name.as_str(), "Map" | "Set")
+                            && self
+                                .transparent_namespaces
+                                .contains(identifier.name.as_str())
+                    }) =>
+            {
+                new_expression
+                    .arguments
+                    .iter()
+                    .any(|argument| match argument {
+                        Argument::SpreadElement(spread) => {
+                            self.expression_returns_wrapper(&spread.argument)
+                        }
+                        _ => argument
+                            .as_expression()
+                            .is_some_and(|argument| self.expression_returns_wrapper(argument)),
+                    })
             }
             Expression::ConditionalExpression(conditional) => {
                 self.expression_returns_wrapper(&conditional.consequent)
@@ -6730,6 +6761,33 @@ impl ReactWrapperReturnCollector {
                         ObjectPropertyKind::SpreadProperty(spread) => &spread.argument,
                     };
                     forwards.extend(self.forwards_from_expression(expression));
+                }
+            }
+            Expression::StaticMemberExpression(member) => {
+                forwards.extend(self.forwards_from_expression(&member.object));
+            }
+            Expression::ComputedMemberExpression(member) => {
+                forwards.extend(self.forwards_from_expression(&member.object));
+            }
+            Expression::NewExpression(new_expression)
+                if new_expression
+                    .callee
+                    .get_identifier_reference()
+                    .is_some_and(|identifier| {
+                        matches!(identifier.name.as_str(), "Map" | "Set")
+                            && self
+                                .transparent_namespaces
+                                .contains(identifier.name.as_str())
+                    }) =>
+            {
+                for argument in &new_expression.arguments {
+                    let expression = match argument {
+                        Argument::SpreadElement(spread) => Some(&spread.argument),
+                        _ => argument.as_expression(),
+                    };
+                    if let Some(expression) = expression {
+                        forwards.extend(self.forwards_from_expression(expression));
+                    }
                 }
             }
             Expression::ConditionalExpression(conditional) => {
@@ -9612,6 +9670,11 @@ impl SourceIndexCollector {
             .map(|(name, _)| name.clone())
             .collect::<BTreeSet<_>>();
         let mut namespaces = self.react_namespaces();
+        let mut transparent_namespaces = ["Promise", "Array", "Object", "Map", "Set"]
+            .into_iter()
+            .filter(|name| !self.shadowed_builtins.contains(*name))
+            .map(ToOwned::to_owned)
+            .collect::<BTreeSet<_>>();
         for identifier in params
             .items
             .iter()
@@ -9620,16 +9683,19 @@ impl SourceIndexCollector {
             memo_identifiers.remove(identifier.name.as_str());
             state_identifiers.remove(identifier.name.as_str());
             namespaces.remove(identifier.name.as_str());
+            transparent_namespaces.remove(identifier.name.as_str());
         }
         for name in function_local_bindings(body) {
             memo_identifiers.remove(&name);
             state_identifiers.remove(&name);
             namespaces.remove(&name);
+            transparent_namespaces.remove(&name);
         }
         ReactWrapperReturnCollector {
             memo_identifiers,
             state_identifiers,
             namespaces,
+            transparent_namespaces,
             wrapper_values: BTreeSet::new(),
             forward_values: BTreeMap::new(),
             direct: false,
@@ -12229,6 +12295,12 @@ impl SourceUsageCollector {
             }
             BindingPattern::AssignmentPattern(assignment) => {
                 self.bind_pattern_potential_wrapper_paths(&assignment.left, paths, prefix);
+                let mut default_paths =
+                    self.potential_wrapper_callable_paths_from_expression(&assignment.right);
+                if self.expression_is_potential_wrapper_callable(&assignment.right) {
+                    default_paths.included.insert(String::new());
+                }
+                self.bind_pattern_potential_wrapper_paths(&assignment.left, &default_paths, &[]);
             }
             BindingPattern::ObjectPattern(object) => {
                 let mut consumed = BTreeSet::new();
@@ -12416,7 +12488,21 @@ impl SourceUsageCollector {
     ) {
         match target {
             AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(default) => {
-                self.bind_assignment_target_potential_wrapper_paths(&default.binding, paths, prefix)
+                self.bind_assignment_target_potential_wrapper_paths(
+                    &default.binding,
+                    paths,
+                    prefix,
+                );
+                let mut default_paths =
+                    self.potential_wrapper_callable_paths_from_expression(&default.init);
+                if self.expression_is_potential_wrapper_callable(&default.init) {
+                    default_paths.included.insert(String::new());
+                }
+                self.bind_assignment_target_potential_wrapper_paths(
+                    &default.binding,
+                    &default_paths,
+                    &[],
+                );
             }
             AssignmentTargetMaybeDefault::AssignmentTargetIdentifier(identifier) => {
                 self.bind_potential_wrapper_name(identifier.name.as_str(), paths, prefix);
@@ -16312,6 +16398,75 @@ impl SourceUsageCollector {
     }
 }
 
+impl SourceUsageCollector {
+    fn apply_object_assign_wrapper_paths(&mut self, call: &CallExpression<'_>) {
+        let Some(member) = call.callee.get_member_expr() else {
+            return;
+        };
+        if member.static_property_name() != Some("assign")
+            || !member
+                .object()
+                .get_identifier_reference()
+                .is_some_and(|identifier| identifier.name == "Object")
+            || self
+                .file_index
+                .as_ref()
+                .is_some_and(|file| file.shadowed_builtins.contains("Object"))
+        {
+            return;
+        }
+        let Some(target) = call
+            .arguments
+            .first()
+            .and_then(Argument::as_expression)
+            .and_then(Expression::get_identifier_reference)
+            .map(|identifier| identifier.name.to_string())
+        else {
+            return;
+        };
+        let mut paths = self
+            .potential_wrapper_callable_paths
+            .get(&target)
+            .cloned()
+            .unwrap_or_default();
+        let mut wrapper_value = self.potential_wrapper_values.contains(&target);
+        for source in call
+            .arguments
+            .iter()
+            .skip(1)
+            .filter_map(Argument::as_expression)
+        {
+            let source_paths = self.potential_wrapper_callable_paths_from_expression(source);
+            if let Some(bindings) = self.translator_object_bindings_from_expression(source) {
+                let overwritten = bindings
+                    .resolved_properties
+                    .iter()
+                    .filter_map(|path| path.split('.').next())
+                    .collect::<BTreeSet<_>>();
+                for property in overwritten {
+                    paths.remove_property(property);
+                    if !source_paths.contains(property) {
+                        paths.excluded.insert(property.to_string());
+                    }
+                }
+            }
+            if self.expression_is_potential_wrapper_value(source) {
+                wrapper_value = true;
+                paths.included.insert("*".to_string());
+            }
+            paths.included.extend(source_paths.included);
+            paths.excluded.extend(source_paths.excluded);
+        }
+        if !paths.is_empty() {
+            self.potential_wrapper_callable_paths
+                .insert(target.clone(), paths);
+        }
+        if wrapper_value {
+            self.potential_wrapper_values.insert(target);
+        }
+    }
+}
+
 fn summarized_dynamic_key_spans(file: &SourceFileIndex) -> BTreeSet<(usize, usize)> {
     let mut spans = BTreeSet::new();
     let mut add_helper = |summary: &HelperSummary| {
@@ -16878,6 +17033,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        self.apply_object_assign_wrapper_paths(call);
         if let Some(member) = call.callee.get_member_expr()
             && member.static_property_name() == Some("set")
             && let Some(identifier) = member.object().get_identifier_reference()
@@ -19951,6 +20107,109 @@ mod tests {
         assert!(!lines.contains(&9), "dynamic lines: {lines:?}");
         assert!(!lines.contains(&11), "dynamic lines: {lines:?}");
         assert!(lines.contains(&12), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn destructuring_defaults_preserve_wrapper_callables() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const values = useMemo(() => runtimeValues(), []);
+            const callable = values[0];
+            const source = {};
+            const {value = callable} = source;
+            value(runtimeKey);
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 7));
+    }
+
+    #[test]
+    fn wrapper_return_summaries_follow_selected_members() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() {
+              return useMemo(() => runtimeValues(), []);
+            }
+            function useSelectedValues() {
+              const state = {values: useBaseValues()};
+              return state.values;
+            }
+            const values = useSelectedValues();
+            values[0](runtimeKey);
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 11));
+    }
+
+    #[test]
+    fn wrapper_return_summaries_follow_promise_all_and_sets() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() {
+              return useMemo(() => runtimeValues(), []);
+            }
+            async function useAllValues() {
+              return Promise.all([useBaseValues()]);
+            }
+            function useSetValues() {
+              return new Set([useBaseValues()]);
+            }
+            async function run() {
+              const allValues = await useAllValues();
+              allValues[0][0](runtimeKey);
+              const setValues = useSetValues();
+              setValues[0](runtimeKey);
+            }
+            "#,
+        );
+
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&14), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&16), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn object_assign_updates_wrapper_callable_paths() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const values = useMemo(() => runtimeValues(), []);
+            const callable = values[0];
+            const target = {};
+            Object.assign(target, {value: callable});
+            target.value(runtimeKey);
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 7));
+    }
+
+    #[test]
+    fn wrapper_containers_respect_shadowed_builtins() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() {
+              return useMemo(() => runtimeValues(), []);
+            }
+            function useShadowedValues(Promise) {
+              return Promise.resolve(useBaseValues());
+            }
+            const values = useShadowedValues(runtimePromise);
+            values[0](runtimeKey);
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.is_empty(), "{:#?}", scan.dynamic_usages);
     }
 
     #[test]
