@@ -2829,6 +2829,18 @@ impl ProjectIndex {
         from: &Path,
         target: &ImportTarget,
     ) -> BTreeMap<usize, BTreeSet<usize>> {
+        self.wrapper_array_parameter_indexes_for_import_at_depth(from, target, 0)
+    }
+
+    fn wrapper_array_parameter_indexes_for_import_at_depth(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+        depth: usize,
+    ) -> BTreeMap<usize, BTreeSet<usize>> {
+        if depth > 16 {
+            return BTreeMap::new();
+        }
         let Some(path) = self.resolve_module(from, &target.source) else {
             return BTreeMap::new();
         };
@@ -2836,32 +2848,66 @@ impl ProjectIndex {
             return BTreeMap::new();
         };
         match &target.imported {
-            ImportedName::Named(name) => file
-                .translator_return_export_locals
-                .get(name)
-                .map(|local| self.wrapper_array_parameter_indexes_for_local(&path, local))
-                .unwrap_or_default(),
-            ImportedName::Default => file
-                .default_local_export
-                .as_ref()
-                .map(|local| self.wrapper_array_parameter_indexes_for_local(&path, local))
-                .unwrap_or_else(|| {
-                    file.default_wrapper_array_index_forwards
-                        .iter()
-                        .filter_map(|(index, candidates)| {
-                            let params = candidates
-                                .iter()
-                                .filter_map(|candidate| match candidate {
-                                    TranslatorReturnForward::ParameterCall {
-                                        param_index, ..
-                                    } => Some(*param_index),
-                                    _ => None,
-                                })
-                                .collect::<BTreeSet<_>>();
-                            (!params.is_empty()).then_some((*index, params))
-                        })
-                        .collect()
-                }),
+            ImportedName::Named(name) => {
+                if let Some(local) = file.translator_return_export_locals.get(name) {
+                    return self.wrapper_array_parameter_indexes_for_local(&path, local);
+                }
+                if let Some(target) = file.re_exports.get(name) {
+                    return self.wrapper_array_parameter_indexes_for_import_at_depth(
+                        &path,
+                        target,
+                        depth + 1,
+                    );
+                }
+                file.star_re_exports
+                    .iter()
+                    .find_map(|source| {
+                        let indexes = self.wrapper_array_parameter_indexes_for_import_at_depth(
+                            &path,
+                            &ImportTarget {
+                                source: source.clone(),
+                                imported: ImportedName::Named(name.clone()),
+                            },
+                            depth + 1,
+                        );
+                        (!indexes.is_empty()).then_some(indexes)
+                    })
+                    .unwrap_or_default()
+            }
+            ImportedName::Default => {
+                if let Some(local) = &file.default_local_export {
+                    return self.wrapper_array_parameter_indexes_for_local(&path, local);
+                }
+                let indexes = file
+                    .default_wrapper_array_index_forwards
+                    .iter()
+                    .filter_map(|(index, candidates)| {
+                        let params = candidates
+                            .iter()
+                            .filter_map(|candidate| match candidate {
+                                TranslatorReturnForward::ParameterCall { param_index, .. } => {
+                                    Some(*param_index)
+                                }
+                                _ => None,
+                            })
+                            .collect::<BTreeSet<_>>();
+                        (!params.is_empty()).then_some((*index, params))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                if !indexes.is_empty() {
+                    return indexes;
+                }
+                file.re_exports
+                    .get("default")
+                    .map(|target| {
+                        self.wrapper_array_parameter_indexes_for_import_at_depth(
+                            &path,
+                            target,
+                            depth + 1,
+                        )
+                    })
+                    .unwrap_or_default()
+            }
         }
     }
 
@@ -11649,6 +11695,78 @@ impl<'a> Visit<'a> for SourceIndexCollector {
 }
 
 impl SourceUsageCollector {
+    fn potential_wrapper_paths_for_pattern(pattern: &BindingPattern<'_>) -> PotentialWrapperPaths {
+        fn collect(
+            pattern: &BindingPattern<'_>,
+            prefix: &mut Vec<String>,
+            paths: &mut BTreeSet<String>,
+        ) {
+            match pattern {
+                BindingPattern::BindingIdentifier(_) => {
+                    paths.insert(prefix.join("."));
+                }
+                BindingPattern::AssignmentPattern(assignment) => {
+                    collect(&assignment.left, prefix, paths);
+                }
+                BindingPattern::ObjectPattern(object) => {
+                    for property in &object.properties {
+                        prefix.push(
+                            property
+                                .key
+                                .static_name()
+                                .map_or_else(|| "*".to_string(), |name| name.to_string()),
+                        );
+                        collect(&property.value, prefix, paths);
+                        prefix.pop();
+                    }
+                    if let Some(rest) = &object.rest {
+                        prefix.push("*".to_string());
+                        collect(&rest.argument, prefix, paths);
+                        prefix.pop();
+                    }
+                }
+                BindingPattern::ArrayPattern(array) => {
+                    for (index, element) in array.elements.iter().enumerate() {
+                        let Some(element) = element else {
+                            continue;
+                        };
+                        prefix.push(index.to_string());
+                        collect(element, prefix, paths);
+                        prefix.pop();
+                    }
+                    if let Some(rest) = &array.rest {
+                        prefix.push("*".to_string());
+                        collect(&rest.argument, prefix, paths);
+                        prefix.pop();
+                    }
+                }
+            }
+        }
+
+        let mut included = BTreeSet::new();
+        collect(pattern, &mut Vec::new(), &mut included);
+        PotentialWrapperPaths {
+            included,
+            excluded: BTreeSet::new(),
+        }
+    }
+
+    fn visit_for_each_non_callback_inputs(&mut self, call: &CallExpression<'_>) {
+        if let Some(member) = call.callee.get_member_expr() {
+            self.visit_expression(member.object());
+        }
+        for argument in call.arguments.iter().skip(1) {
+            match argument {
+                Argument::SpreadElement(spread) => self.visit_expression(&spread.argument),
+                _ => {
+                    if let Some(expression) = argument.as_expression() {
+                        self.visit_expression(expression);
+                    }
+                }
+            }
+        }
+    }
+
     fn visit_wrapper_for_each_callback(&mut self, call: &CallExpression<'_>) -> bool {
         let Some(member) = call.callee.get_member_expr() else {
             return false;
@@ -11661,15 +11779,11 @@ impl SourceUsageCollector {
         let Some(callback) = call.arguments.first() else {
             return false;
         };
-        let (pattern, body) = match callback {
-            Argument::ArrowFunctionExpression(arrow) => (
-                arrow.params.items.first().map(|param| &param.pattern),
-                Some(&arrow.body),
-            ),
-            Argument::FunctionExpression(function) => (
-                function.params.items.first().map(|param| &param.pattern),
-                function.body.as_ref(),
-            ),
+        let (params, body) = match callback {
+            Argument::ArrowFunctionExpression(arrow) => (Some(&arrow.params), Some(&arrow.body)),
+            Argument::FunctionExpression(function) => {
+                (Some(&function.params), function.body.as_ref())
+            }
             _ => {
                 let Some(expression) = callback.as_expression() else {
                     return false;
@@ -11688,29 +11802,40 @@ impl SourceUsageCollector {
                     &summary,
                     call.span.start,
                 );
+                self.visit_for_each_non_callback_inputs(call);
+                self.visit_expression(expression);
                 return true;
             }
         };
-        let Some(pattern) = pattern else {
+        let Some(params) = params else {
             return false;
         };
         let Some(body) = body else {
             return false;
         };
+        let Some(pattern) = params.items.first().map(|param| &param.pattern) else {
+            return false;
+        };
+        self.visit_for_each_non_callback_inputs(call);
         let environment = self.binding_environment();
-        self.mask_binding_pattern(pattern);
+        for param in &params.items {
+            self.mask_binding_pattern(&param.pattern);
+        }
+        if let Some(rest) = &params.rest {
+            self.mask_binding_pattern(&rest.rest.argument);
+        }
+        for param in &params.items {
+            self.visit_formal_parameter(param);
+        }
+        if let Some(rest) = &params.rest {
+            self.visit_formal_parameter_rest(rest);
+        }
         if let Some(name) = binding_identifier_name(pattern).map(str::to_string) {
             self.potential_wrapper_values.insert(name.clone());
             self.potential_wrapper_callables.insert(name);
         } else {
-            self.bind_pattern_potential_wrapper_paths(
-                pattern,
-                &PotentialWrapperPaths {
-                    included: BTreeSet::from(["*".to_string()]),
-                    excluded: BTreeSet::new(),
-                },
-                &[],
-            );
+            let paths = Self::potential_wrapper_paths_for_pattern(pattern);
+            self.bind_pattern_potential_wrapper_paths(pattern, &paths, &[]);
         }
         self.visit_function_body(body);
         self.restore_binding_environment(environment);
@@ -18844,6 +18969,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             && let Some(declarator) = declaration.declarations.first()
             && matches!(declarator.id, BindingPattern::ArrayPattern(_))
         {
+            self.visit_expression(&statement.right);
             let environment = self.binding_environment();
             self.mask_binding_pattern(&declarator.id);
             self.bind_pattern_potential_wrapper_paths(&declarator.id, &entry_paths, &[]);
@@ -18854,6 +18980,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         if potential_wrapper_iterable
             && let Some(name) = self.for_of_binding_name(statement).map(str::to_string)
         {
+            self.visit_expression(&statement.right);
             let environment = self.binding_environment();
             self.mask_binding_name(&name);
             if wrapper_entries {
@@ -21700,6 +21827,86 @@ mod tests {
 
         let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
         assert!(scan.dynamic_usages.is_empty(), "{:#?}", scan.dynamic_usages);
+    }
+
+    #[test]
+    fn wrapper_for_each_scans_executed_inputs_and_nested_patterns() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('common');
+            function useRows(label) { return useMemo(() => runtimeRows(label), []); }
+            useRows(t('collection')).forEach(
+              ({nested: {format}} = t('fallback')) => format(runtimeKey),
+              t('this-arg'),
+            );
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.collection"));
+        assert!(scan.used_ids.contains("common.fallback"), "{scan:#?}");
+        assert!(scan.used_ids.contains("common.this-arg"));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 7));
+    }
+
+    #[test]
+    fn wrapper_for_of_scans_iterable_construction() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            import {useTranslations} from 'next-intl';
+            const t = useTranslations('common');
+            function useRows(label) { return useMemo(() => runtimeRows(label), []); }
+            for (const row of useRows(t('iterable'))) {
+              row[0](runtimeKey);
+            }
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("common.iterable"));
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 7));
+    }
+
+    #[test]
+    fn higher_order_aggregate_indexes_cross_named_and_star_re_exports() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper = dir.path().join("helper.ts");
+        let named = dir.path().join("named.ts");
+        let barrel = dir.path().join("barrel.ts");
+        let main = dir.path().join("main.ts");
+        fs::write(
+            &helper,
+            r#"
+            export async function aggregate(factory) {
+              return Promise.all([factory(), draw]);
+            }
+            "#,
+        )
+        .expect("write helper");
+        fs::write(&named, "export {aggregate} from './helper';").expect("write named barrel");
+        fs::write(&barrel, "export * from './named';").expect("write star barrel");
+        fs::write(
+            &main,
+            r#"
+            import {useMemo} from 'react';
+            import {aggregate} from './barrel';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            const [values, cleanup] = await aggregate(useBaseValues);
+            values[0](runtimeKey);
+            cleanup('layer');
+            "#,
+        )
+        .expect("write main");
+
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&7), "dynamic lines: {lines:?}");
     }
 
     #[test]
