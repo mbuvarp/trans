@@ -3992,6 +3992,9 @@ struct SourceUsageCollector {
     potential_wrapper_values: BTreeSet<String>,
     potential_wrapper_callables: BTreeSet<String>,
     potential_wrapper_callable_paths: BTreeMap<String, PotentialWrapperPaths>,
+    local_wrapper_resolutions: BTreeMap<String, LocalWrapperResolution>,
+    shadowed_project_bindings: BTreeSet<String>,
+    shadowed_builtin_bindings: BTreeSet<String>,
     shadowed_react_bindings: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
     binding_scopes: Vec<BindingEnvironment>,
@@ -4000,6 +4003,13 @@ struct SourceUsageCollector {
     summarized_dynamic_key_spans: BTreeSet<(usize, usize)>,
     pending_var_bindings: Option<BTreeSet<String>>,
     scan: UsageScan,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LocalWrapperResolution {
+    direct: bool,
+    indexes: BTreeSet<usize>,
+    parameters: BTreeMap<usize, BTreeSet<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -4031,6 +4041,9 @@ struct BindingEnvironment {
     potential_wrapper_values: BTreeSet<String>,
     potential_wrapper_callables: BTreeSet<String>,
     potential_wrapper_callable_paths: BTreeMap<String, PotentialWrapperPaths>,
+    local_wrapper_resolutions: BTreeMap<String, LocalWrapperResolution>,
+    shadowed_project_bindings: BTreeSet<String>,
+    shadowed_builtin_bindings: BTreeSet<String>,
     shadowed_react_bindings: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
     next_intl_namespaces: BTreeSet<String>,
@@ -11854,7 +11867,12 @@ impl<'a> Visit<'a> for SourceIndexCollector {
         } else if let Some(bindings) = self.scope_binding_names.last_mut() {
             bindings.insert(identifier.name.to_string());
         }
-        if matches!(identifier.name.as_str(), "Object" | "Promise" | "Reflect") {
+        if self.scope_depth == 1
+            && matches!(
+                identifier.name.as_str(),
+                "Object" | "Promise" | "Reflect" | "undefined"
+            )
+        {
             self.shadowed_builtins.insert(identifier.name.to_string());
         }
     }
@@ -12519,6 +12537,9 @@ impl SourceUsageCollector {
             potential_wrapper_values: BTreeSet::new(),
             potential_wrapper_callables: BTreeSet::new(),
             potential_wrapper_callable_paths: BTreeMap::new(),
+            local_wrapper_resolutions: BTreeMap::new(),
+            shadowed_project_bindings: BTreeSet::new(),
+            shadowed_builtin_bindings: BTreeSet::new(),
             shadowed_react_bindings: BTreeSet::new(),
             message_key_helpers: BTreeMap::new(),
             binding_scopes: Vec::new(),
@@ -12559,6 +12580,9 @@ impl SourceUsageCollector {
             potential_wrapper_values: self.potential_wrapper_values.clone(),
             potential_wrapper_callables: self.potential_wrapper_callables.clone(),
             potential_wrapper_callable_paths: self.potential_wrapper_callable_paths.clone(),
+            local_wrapper_resolutions: self.local_wrapper_resolutions.clone(),
+            shadowed_project_bindings: self.shadowed_project_bindings.clone(),
+            shadowed_builtin_bindings: self.shadowed_builtin_bindings.clone(),
             shadowed_react_bindings: self.shadowed_react_bindings.clone(),
             message_key_helpers: self.message_key_helpers.clone(),
             next_intl_namespaces: self.next_intl_namespaces.clone(),
@@ -12594,6 +12618,9 @@ impl SourceUsageCollector {
         self.potential_wrapper_values = environment.potential_wrapper_values;
         self.potential_wrapper_callables = environment.potential_wrapper_callables;
         self.potential_wrapper_callable_paths = environment.potential_wrapper_callable_paths;
+        self.local_wrapper_resolutions = environment.local_wrapper_resolutions;
+        self.shadowed_project_bindings = environment.shadowed_project_bindings;
+        self.shadowed_builtin_bindings = environment.shadowed_builtin_bindings;
         self.shadowed_react_bindings = environment.shadowed_react_bindings;
         self.message_key_helpers = environment.message_key_helpers;
         self.next_intl_namespaces = environment.next_intl_namespaces;
@@ -12601,6 +12628,20 @@ impl SourceUsageCollector {
     }
 
     fn mask_binding_name(&mut self, name: &str) {
+        if matches!(name, "Object" | "Promise" | "Reflect" | "undefined") {
+            self.shadowed_builtin_bindings.insert(name.to_string());
+        }
+        if self.scope_depth > 1
+            && self.file_index.as_ref().is_some_and(|file| {
+                file.imports.contains_key(name)
+                    || file.wrapper_return_helpers.contains(name)
+                    || file.wrapper_return_forwards.contains_key(name)
+                    || file.wrapper_array_return_indexes.contains_key(name)
+                    || file.wrapper_array_index_forwards.contains_key(name)
+            })
+        {
+            self.shadowed_project_bindings.insert(name.to_string());
+        }
         if self.file_binding_is_react_import(name) {
             self.shadowed_react_bindings.insert(name.to_string());
         }
@@ -12629,9 +12670,64 @@ impl SourceUsageCollector {
         self.potential_wrapper_values.remove(name);
         self.potential_wrapper_callables.remove(name);
         self.potential_wrapper_callable_paths.remove(name);
+        self.local_wrapper_resolutions.remove(name);
         self.message_key_helpers.remove(name);
         self.next_intl_namespaces.remove(name);
         self.next_intl_server_namespaces.remove(name);
+    }
+
+    fn local_wrapper_resolution_for_function(
+        &self,
+        function: &Function<'_>,
+    ) -> LocalWrapperResolution {
+        let collector = self.local_wrapper_index_collector();
+        Self::local_wrapper_resolution_from_summary(
+            collector.function_wrapper_return_summary(function),
+        )
+    }
+
+    fn local_wrapper_resolution_for_arrow(
+        &self,
+        arrow: &ArrowFunctionExpression<'_>,
+    ) -> LocalWrapperResolution {
+        let collector = self.local_wrapper_index_collector();
+        Self::local_wrapper_resolution_from_summary(collector.arrow_wrapper_return_summary(arrow))
+    }
+
+    fn local_wrapper_index_collector(&self) -> SourceIndexCollector {
+        let mut collector = SourceIndexCollector::default();
+        if let Some(file) = &self.file_index {
+            collector.imports = file.imports.clone();
+            collector.namespace_imports = file.namespace_imports.clone();
+            collector.shadowed_builtins = file.shadowed_builtins.clone();
+            collector.wrapper_return_helpers = file.wrapper_return_helpers.clone();
+        }
+        collector
+    }
+
+    fn local_wrapper_resolution_from_summary(
+        summary: WrapperReturnSummary,
+    ) -> LocalWrapperResolution {
+        LocalWrapperResolution {
+            direct: summary.direct,
+            indexes: summary.array_indexes,
+            parameters: summary
+                .array_index_forwards
+                .into_iter()
+                .filter_map(|(index, forwards)| {
+                    let parameters = forwards
+                        .into_iter()
+                        .filter_map(|forward| match forward {
+                            TranslatorReturnForward::ParameterCall { param_index, .. } => {
+                                Some(param_index)
+                            }
+                            _ => None,
+                        })
+                        .collect::<BTreeSet<_>>();
+                    (!parameters.is_empty()).then_some((index, parameters))
+                })
+                .collect(),
+        }
     }
 
     fn remove_translator_array_alias(&mut self, name: &str) {
@@ -13567,6 +13663,7 @@ impl SourceUsageCollector {
         let mut target = &call.callee;
         let mut argument_offset = 0;
         let mut apply_arguments_index = None;
+        let mut nullish_apply_is_empty = false;
         if let Some(member) = call.callee.get_member_expr() {
             let reflect_apply = member.static_property_name() == Some("apply")
                 && member
@@ -13576,7 +13673,8 @@ impl SourceUsageCollector {
                 && self
                     .file_index
                     .as_ref()
-                    .is_none_or(|file| !file.shadowed_builtins.contains("Reflect"));
+                    .is_none_or(|file| !file.shadowed_builtins.contains("Reflect"))
+                && !self.shadowed_builtin_bindings.contains("Reflect");
             match (reflect_apply, member.static_property_name()) {
                 (true, _) => {
                     target = call.arguments.first().and_then(Argument::as_expression)?;
@@ -13589,6 +13687,7 @@ impl SourceUsageCollector {
                 (false, Some("apply")) => {
                     target = member.object();
                     apply_arguments_index = Some(1);
+                    nullish_apply_is_empty = true;
                 }
                 _ => {}
             }
@@ -13623,6 +13722,17 @@ impl SourceUsageCollector {
                                             self.expression_is_wrapper_returning_callable(argument)
                                         })
                                 })
+                            }
+                            Some(Expression::NullLiteral(_)) if nullish_apply_is_empty => false,
+                            Some(Expression::Identifier(identifier))
+                                if nullish_apply_is_empty
+                                    && identifier.name == "undefined"
+                                    && self.file_index.as_ref().is_none_or(|file| {
+                                        !file.shadowed_builtins.contains("undefined")
+                                    })
+                                    && !self.shadowed_builtin_bindings.contains("undefined") =>
+                            {
+                                false
                             }
                             Some(_) => true,
                             None => false,
@@ -13680,6 +13790,21 @@ impl SourceUsageCollector {
         &self,
         callee: &Expression<'_>,
     ) -> Option<(BTreeSet<usize>, BTreeMap<usize, BTreeSet<usize>>)> {
+        match callee.get_inner_expression() {
+            Expression::ConditionalExpression(conditional) => {
+                return Self::merge_wrapper_array_resolutions(
+                    self.wrapper_array_resolution_for_callee(&conditional.consequent),
+                    self.wrapper_array_resolution_for_callee(&conditional.alternate),
+                );
+            }
+            Expression::LogicalExpression(logical) => {
+                return Self::merge_wrapper_array_resolutions(
+                    self.wrapper_array_resolution_for_callee(&logical.left),
+                    self.wrapper_array_resolution_for_callee(&logical.right),
+                );
+            }
+            _ => {}
+        }
         if let Expression::CallExpression(bind) = callee.get_inner_expression()
             && let Some(member) = bind.callee.get_member_expr()
             && member.static_property_name() == Some("bind")
@@ -13719,6 +13844,12 @@ impl SourceUsageCollector {
         let (project, file) = (self.project.as_ref()?, self.file_index.as_ref()?);
         if let Some(identifier) = callee.get_identifier_reference() {
             let name = identifier.name.as_str();
+            if let Some(resolution) = self.local_wrapper_resolutions.get(name) {
+                return Some((resolution.indexes.clone(), resolution.parameters.clone()));
+            }
+            if self.shadowed_project_bindings.contains(name) {
+                return None;
+            }
             let imported = file.imports.get(name);
             let indexes = project
                 .wrapper_array_indexes_for_local(&self.path, name)
@@ -13750,6 +13881,23 @@ impl SourceUsageCollector {
         ))
     }
 
+    fn merge_wrapper_array_resolutions(
+        first: Option<(BTreeSet<usize>, BTreeMap<usize, BTreeSet<usize>>)>,
+        second: Option<(BTreeSet<usize>, BTreeMap<usize, BTreeSet<usize>>)>,
+    ) -> Option<(BTreeSet<usize>, BTreeMap<usize, BTreeSet<usize>>)> {
+        match (first, second) {
+            (Some((mut indexes, mut parameters)), Some((other_indexes, other_parameters))) => {
+                indexes.extend(other_indexes);
+                for (index, other) in other_parameters {
+                    parameters.entry(index).or_default().extend(other);
+                }
+                Some((indexes, parameters))
+            }
+            (Some(resolution), None) | (None, Some(resolution)) => Some(resolution),
+            (None, None) => None,
+        }
+    }
+
     fn invocation_parameter_may_be_wrapper(
         &self,
         arguments: &[Argument<'_>],
@@ -13772,11 +13920,28 @@ impl SourceUsageCollector {
     }
 
     fn expression_is_wrapper_returning_callable(&self, expression: &Expression<'_>) -> bool {
+        match expression.get_inner_expression() {
+            Expression::ConditionalExpression(conditional) => {
+                return self.expression_is_wrapper_returning_callable(&conditional.consequent)
+                    || self.expression_is_wrapper_returning_callable(&conditional.alternate);
+            }
+            Expression::LogicalExpression(logical) => {
+                return self.expression_is_wrapper_returning_callable(&logical.left)
+                    || self.expression_is_wrapper_returning_callable(&logical.right);
+            }
+            _ => {}
+        }
         let (Some(project), Some(file)) = (&self.project, &self.file_index) else {
             return false;
         };
         if let Some(identifier) = expression.get_identifier_reference() {
             let name = identifier.name.as_str();
+            if let Some(resolution) = self.local_wrapper_resolutions.get(name) {
+                return resolution.direct || !resolution.indexes.is_empty();
+            }
+            if self.shadowed_project_bindings.contains(name) {
+                return true;
+            }
             return project.wrapper_return_for_local(&self.path, name)
                 || file
                     .imports
@@ -13813,6 +13978,12 @@ impl SourceUsageCollector {
         };
         if let Some(identifier) = call.callee.get_identifier_reference() {
             let name = identifier.name.as_str();
+            if let Some(resolution) = self.local_wrapper_resolutions.get(name) {
+                return resolution.direct || !resolution.indexes.is_empty();
+            }
+            if self.shadowed_project_bindings.contains(name) {
+                return true;
+            }
             return project.wrapper_return_for_local(&self.path, name)
                 || file
                     .imports
@@ -18537,6 +18708,11 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             .then(|| self.binding_environment());
         if let Some(id) = &function.id {
             self.mask_binding_name(id.name.as_str());
+            if self.scope_depth > 1 {
+                let resolution = self.local_wrapper_resolution_for_function(function);
+                self.local_wrapper_resolutions
+                    .insert(id.name.to_string(), resolution);
+            }
             if let Some(param_index) = message_key_helper_from_function(function) {
                 self.message_key_helpers
                     .insert(id.name.to_string(), param_index);
@@ -18559,6 +18735,21 @@ impl<'a> Visit<'a> for SourceUsageCollector {
 
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
         let init = declarator.init.as_ref();
+        let local_wrapper_resolution = (self.scope_depth > 1)
+            .then(|| {
+                let name = binding_identifier_name(&declarator.id)?;
+                let resolution = match init?.get_inner_expression() {
+                    Expression::ArrowFunctionExpression(arrow) => {
+                        self.local_wrapper_resolution_for_arrow(arrow)
+                    }
+                    Expression::FunctionExpression(function) => {
+                        self.local_wrapper_resolution_for_function(function)
+                    }
+                    _ => return None,
+                };
+                Some((name.to_string(), resolution))
+            })
+            .flatten();
         let init_call = init.and_then(|init| match init.get_inner_expression() {
             Expression::CallExpression(call) => Some(call),
             _ => None,
@@ -18796,6 +18987,9 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             array
         });
         self.mask_binding_pattern(&declarator.id);
+        if let Some((name, resolution)) = local_wrapper_resolution {
+            self.local_wrapper_resolutions.insert(name, resolution);
+        }
         for (source, imported, local) in commonjs_declarator_imports(declarator) {
             if source != "next-intl" && source != "next-intl/server" {
                 continue;
@@ -23106,6 +23300,132 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(!lines.contains(&6), "dynamic lines: {lines:?}");
         assert!(!lines.contains(&9), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn conditional_and_logical_callees_merge_wrapper_resolutions() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            const conditional = await (enabled ? aggregate : draw)(useBaseValues);
+            conditional[0][0](conditionalKey);
+            conditional[1]('conditional-layer');
+            const logical = await (enabled && aggregate)(useBaseValues);
+            logical[0][0](logicalKey);
+            logical[1]('logical-layer');
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&7), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&9), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&10), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn local_wrapper_helpers_override_shadowed_project_bindings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper = dir.path().join("helper.ts");
+        let main = dir.path().join("main.ts");
+        fs::write(
+            &helper,
+            "export async function aggregate() { return [draw]; }",
+        )
+        .expect("write helper");
+        fs::write(
+            &main,
+            r#"
+            import {useMemo} from 'react';
+            import {aggregate} from './helper';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function ordinaryScope() {
+              async function aggregate(factory) { return [draw]; }
+              const [ordinary] = await aggregate(useBaseValues);
+              ordinary[0]('ordinary');
+            }
+            async function wrapperScope() {
+              async function aggregate(factory) { return Promise.all([factory(), draw]); }
+              const [values, cleanup] = await aggregate(useBaseValues);
+              values[0](runtimeKey);
+              cleanup('layer');
+            }
+            async function arrowOrdinaryScope() {
+              const aggregate = async factory => [draw];
+              const [ordinary] = await aggregate(useBaseValues);
+              ordinary[0]('arrow-ordinary');
+            }
+            async function arrowWrapperScope() {
+              const aggregate = async factory => Promise.all([factory(), draw]);
+              const [values, cleanup] = await aggregate(useBaseValues);
+              values[0](arrowKey);
+              cleanup('arrow-layer');
+            }
+            "#,
+        )
+        .expect("write main");
+
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(!lines.contains(&8), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&13), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&14), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&19), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&24), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&25), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn nested_reflect_bindings_do_not_hide_native_reflect_apply() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            function shadow(Reflect) { return Reflect.apply(draw, null, []); }
+            const result = await Reflect.apply(aggregate, null, [useBaseValues]);
+            result[0][0](runtimeKey);
+            result[1]('layer');
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&7), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&8), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn nullish_function_apply_arguments_are_empty() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            const [nullResult] = await aggregate.apply(null, null);
+            nullResult[0]('null-ordinary');
+            const [undefinedResult] = await aggregate.apply(null, undefined);
+            undefinedResult[0]('undefined-ordinary');
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(!lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&8), "dynamic lines: {lines:?}");
     }
 
     #[test]
