@@ -3307,6 +3307,96 @@ fn strip_json_comments(input: &str) -> String {
     output
 }
 
+#[derive(Debug, Clone, Default)]
+struct PotentialWrapperPaths {
+    included: BTreeSet<String>,
+    excluded: BTreeSet<String>,
+}
+
+impl PotentialWrapperPaths {
+    fn pattern_matches(pattern: &str, target: &str) -> bool {
+        let pattern = pattern.split('.').collect::<Vec<_>>();
+        let target = target.split('.').collect::<Vec<_>>();
+        pattern.len() == target.len()
+            && pattern
+                .iter()
+                .zip(target)
+                .all(|(pattern, target)| *pattern == "*" || *pattern == target)
+    }
+
+    fn specificity(pattern: &str) -> usize {
+        if pattern.is_empty() {
+            return 0;
+        }
+        pattern.split('.').filter(|segment| *segment != "*").count()
+    }
+
+    fn contains(&self, target: &str) -> bool {
+        let positive = self
+            .included
+            .iter()
+            .filter(|pattern| Self::pattern_matches(pattern, target))
+            .map(|pattern| Self::specificity(pattern))
+            .max();
+        let negative = self
+            .excluded
+            .iter()
+            .filter(|path| {
+                path.is_empty()
+                    || target == path.as_str()
+                    || target
+                        .strip_prefix(path.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+            })
+            .map(|path| Self::specificity(path))
+            .max();
+        positive.is_some_and(|positive| negative.is_none_or(|negative| positive > negative))
+    }
+
+    fn merge_alternative(mut self, alternate: Self) -> Self {
+        self.included.extend(alternate.included);
+        self.excluded = self
+            .excluded
+            .intersection(&alternate.excluded)
+            .cloned()
+            .collect();
+        self
+    }
+
+    fn remove_property(&mut self, property: &str) {
+        let prefix = format!("{property}.");
+        self.included
+            .retain(|path| path != property && !path.starts_with(&prefix));
+        self.excluded
+            .retain(|path| path != property && !path.starts_with(&prefix));
+    }
+
+    fn assign_property(&mut self, property: &str, direct: bool, nested: &Self) {
+        self.remove_property(property);
+        if direct {
+            self.included.insert(property.to_string());
+        } else {
+            self.excluded.insert(property.to_string());
+        }
+        self.included.extend(
+            nested
+                .included
+                .iter()
+                .map(|path| format!("{property}.{path}")),
+        );
+        self.excluded.extend(
+            nested
+                .excluded
+                .iter()
+                .map(|path| format!("{property}.{path}")),
+        );
+    }
+
+    fn is_empty(&self) -> bool {
+        self.included.is_empty() && self.excluded.is_empty()
+    }
+}
+
 #[derive(Debug)]
 struct SourceUsageCollector {
     path: PathBuf,
@@ -3342,7 +3432,7 @@ struct SourceUsageCollector {
     potential_translators: BTreeSet<String>,
     potential_wrapper_values: BTreeSet<String>,
     potential_wrapper_callables: BTreeSet<String>,
-    potential_wrapper_callable_paths: BTreeMap<String, BTreeSet<String>>,
+    potential_wrapper_callable_paths: BTreeMap<String, PotentialWrapperPaths>,
     shadowed_react_bindings: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
     binding_scopes: Vec<BindingEnvironment>,
@@ -3381,7 +3471,7 @@ struct BindingEnvironment {
     potential_translators: BTreeSet<String>,
     potential_wrapper_values: BTreeSet<String>,
     potential_wrapper_callables: BTreeSet<String>,
-    potential_wrapper_callable_paths: BTreeMap<String, BTreeSet<String>>,
+    potential_wrapper_callable_paths: BTreeMap<String, PotentialWrapperPaths>,
     shadowed_react_bindings: BTreeSet<String>,
     message_key_helpers: BTreeMap<String, usize>,
     next_intl_namespaces: BTreeSet<String>,
@@ -11785,7 +11875,7 @@ impl SourceUsageCollector {
             }
             Expression::StaticMemberExpression(member) => {
                 let paths = self.potential_wrapper_callable_paths_from_expression(&member.object);
-                Self::potential_wrapper_paths_contain(&paths, member.property.name.as_str())
+                paths.contains(member.property.name.as_str())
             }
             Expression::CallExpression(call) => {
                 call.callee.get_member_expr().is_some_and(|member| {
@@ -11811,7 +11901,7 @@ impl SourceUsageCollector {
     fn potential_wrapper_callable_paths_from_expression(
         &self,
         expression: &Expression<'_>,
-    ) -> BTreeSet<String> {
+    ) -> PotentialWrapperPaths {
         match expression.get_inner_expression() {
             Expression::Identifier(identifier) => self
                 .potential_wrapper_callable_paths
@@ -11819,40 +11909,37 @@ impl SourceUsageCollector {
                 .cloned()
                 .unwrap_or_default(),
             Expression::ConditionalExpression(conditional) => {
-                let mut paths =
+                let paths =
                     self.potential_wrapper_callable_paths_from_expression(&conditional.consequent);
-                paths.extend(
+                paths.merge_alternative(
                     self.potential_wrapper_callable_paths_from_expression(&conditional.alternate),
-                );
-                paths
+                )
             }
             Expression::LogicalExpression(logical) => {
-                let mut paths =
-                    self.potential_wrapper_callable_paths_from_expression(&logical.left);
-                paths.extend(self.potential_wrapper_callable_paths_from_expression(&logical.right));
-                paths
+                let paths = self.potential_wrapper_callable_paths_from_expression(&logical.left);
+                paths.merge_alternative(
+                    self.potential_wrapper_callable_paths_from_expression(&logical.right),
+                )
             }
             Expression::ObjectExpression(object) => {
-                let mut paths = BTreeSet::new();
+                let mut paths = PotentialWrapperPaths::default();
                 for property in &object.properties {
                     match property {
                         ObjectPropertyKind::ObjectProperty(property) if !property.computed => {
                             let Some(name) = property.key.static_name() else {
                                 continue;
                             };
-                            Self::remove_potential_wrapper_path(&mut paths, &name);
-                            if self.expression_is_potential_wrapper_callable(&property.value) {
-                                paths.insert(name.to_string());
-                            }
-                            paths.extend(
-                                self.potential_wrapper_callable_paths_from_expression(
-                                    &property.value,
-                                )
-                                .into_iter()
-                                .map(|path| format!("{name}.{path}")),
+                            let nested = self
+                                .potential_wrapper_callable_paths_from_expression(&property.value);
+                            paths.assign_property(
+                                &name,
+                                self.expression_is_potential_wrapper_callable(&property.value),
+                                &nested,
                             );
                         }
                         ObjectPropertyKind::SpreadProperty(spread) => {
+                            let spread_paths = self
+                                .potential_wrapper_callable_paths_from_expression(&spread.argument);
                             if let Some(bindings) =
                                 self.translator_object_bindings_from_expression(&spread.argument)
                             {
@@ -11862,36 +11949,66 @@ impl SourceUsageCollector {
                                     .filter_map(|path| path.split('.').next())
                                     .collect::<BTreeSet<_>>();
                                 for property in overwritten {
-                                    Self::remove_potential_wrapper_path(&mut paths, property);
+                                    paths.remove_property(property);
+                                    if !spread_paths.contains(property) {
+                                        paths.excluded.insert(property.to_string());
+                                    }
                                 }
                             }
-                            paths.extend(self.potential_wrapper_callable_paths_from_expression(
-                                &spread.argument,
-                            ));
+                            paths.included.extend(spread_paths.included);
+                            paths.excluded.extend(spread_paths.excluded);
                         }
                         _ => {}
                     }
                 }
                 paths
             }
-            Expression::StaticMemberExpression(member) => self
-                .potential_wrapper_callable_paths_from_expression(&member.object)
-                .into_iter()
-                .filter_map(|path| {
-                    let (head, tail) = path.split_once('.')?;
-                    (head == member.property.name.as_str() || head == "*").then(|| tail.to_string())
+            Expression::StaticMemberExpression(member) => self.potential_wrapper_subobject_paths(
+                &member.object,
+                &finite_string(member.property.name.to_string()),
+            ),
+            Expression::ComputedMemberExpression(member) => self
+                .finite_strings_from_expression(&member.expression)
+                .map(|properties| {
+                    self.potential_wrapper_subobject_paths(&member.object, &properties)
                 })
-                .collect(),
+                .unwrap_or_default(),
             Expression::AwaitExpression(await_expression) => {
                 self.potential_wrapper_callable_paths_from_expression(&await_expression.argument)
             }
-            _ => BTreeSet::new(),
+            _ => PotentialWrapperPaths::default(),
         }
     }
 
-    fn remove_potential_wrapper_path(paths: &mut BTreeSet<String>, property: &str) {
-        let prefix = format!("{property}.");
-        paths.retain(|path| path != property && !path.starts_with(&prefix));
+    fn potential_wrapper_subobject_paths(
+        &self,
+        object: &Expression<'_>,
+        properties: &FiniteStrings,
+    ) -> PotentialWrapperPaths {
+        let source = self.potential_wrapper_callable_paths_from_expression(object);
+        properties
+            .iter()
+            .map(|property| {
+                let mut result = PotentialWrapperPaths::default();
+                for path in &source.included {
+                    let Some((head, tail)) = path.split_once('.') else {
+                        continue;
+                    };
+                    if head == property || head == "*" {
+                        result.included.insert(tail.to_string());
+                    }
+                }
+                for path in &source.excluded {
+                    if path == property {
+                        result.excluded.insert(String::new());
+                    } else if let Some(tail) = path.strip_prefix(&format!("{property}.")) {
+                        result.excluded.insert(tail.to_string());
+                    }
+                }
+                result
+            })
+            .reduce(PotentialWrapperPaths::merge_alternative)
+            .unwrap_or_default()
     }
 
     fn computed_member_is_potential_wrapper_callable(
@@ -11902,12 +12019,8 @@ impl SourceUsageCollector {
         let path_matches = self
             .finite_strings_from_expression(&member.expression)
             .map_or_else(
-                || paths.iter().any(|path| !path.contains('.')),
-                |properties| {
-                    properties
-                        .iter()
-                        .any(|property| Self::potential_wrapper_paths_contain(&paths, property))
-                },
+                || paths.included.iter().any(|path| !path.contains('.')),
+                |properties| properties.iter().any(|property| paths.contains(property)),
             );
         path_matches || self.expression_is_potential_wrapper_value(&member.object)
     }
@@ -11920,62 +12033,109 @@ impl SourceUsageCollector {
         if path.is_empty() {
             return self.expression_is_potential_wrapper_callable(expression);
         }
-        Self::potential_wrapper_paths_contain(
-            &self.potential_wrapper_callable_paths_from_expression(expression),
-            &path.join("."),
-        )
+        self.potential_wrapper_callable_paths_from_expression(expression)
+            .contains(&path.join("."))
     }
 
-    fn potential_wrapper_paths_contain(paths: &BTreeSet<String>, target: &str) -> bool {
-        paths.contains(target)
-            || paths.iter().any(|path| {
-                let pattern = path.split('.').collect::<Vec<_>>();
-                let target = target.split('.').collect::<Vec<_>>();
-                pattern.len() == target.len()
-                    && pattern
-                        .iter()
-                        .zip(target)
-                        .all(|(pattern, target)| *pattern == "*" || *pattern == target)
-            })
-    }
-
-    fn potential_wrapper_path_relative(path: &str, prefix: &[String]) -> Option<String> {
-        let segments = path.split('.').collect::<Vec<_>>();
-        if segments.len() < prefix.len()
-            || !segments
-                .iter()
-                .zip(prefix)
-                .all(|(segment, prefix)| *segment == "*" || *segment == prefix)
-        {
-            return None;
+    fn potential_wrapper_paths_relative(
+        paths: &PotentialWrapperPaths,
+        prefix: &[String],
+    ) -> PotentialWrapperPaths {
+        let mut relative = PotentialWrapperPaths::default();
+        for path in &paths.included {
+            let segments = path.split('.').collect::<Vec<_>>();
+            if segments.len() >= prefix.len()
+                && segments
+                    .iter()
+                    .zip(prefix)
+                    .all(|(segment, prefix)| *segment == "*" || *segment == prefix)
+            {
+                relative.included.insert(segments[prefix.len()..].join("."));
+            }
         }
-        Some(segments[prefix.len()..].join("."))
+        let concrete_prefix = prefix.join(".");
+        for path in &paths.excluded {
+            if path.is_empty()
+                || concrete_prefix == *path
+                || concrete_prefix
+                    .strip_prefix(path)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+            {
+                relative.excluded.insert(String::new());
+            } else if prefix.is_empty() {
+                relative.excluded.insert(path.clone());
+            } else if let Some(suffix) = path.strip_prefix(&format!("{concrete_prefix}.")) {
+                relative.excluded.insert(suffix.to_string());
+            }
+        }
+        relative
+    }
+
+    fn bind_potential_wrapper_name(
+        &mut self,
+        name: &str,
+        paths: &PotentialWrapperPaths,
+        prefix: &[String],
+    ) {
+        let mut relative = Self::potential_wrapper_paths_relative(paths, prefix);
+        if relative.contains("") {
+            self.potential_wrapper_callables.insert(name.to_string());
+        }
+        relative.included.remove("");
+        if !relative.is_empty() {
+            self.potential_wrapper_callable_paths
+                .entry(name.to_string())
+                .and_modify(|current| {
+                    *current = current.clone().merge_alternative(relative.clone())
+                })
+                .or_insert(relative);
+        }
+    }
+
+    fn rebase_array_rest_paths(
+        paths: &PotentialWrapperPaths,
+        offset: usize,
+    ) -> PotentialWrapperPaths {
+        let rebase = |path: &str| {
+            let (head, tail) = path
+                .split_once('.')
+                .map_or((path, None), |(head, tail)| (head, Some(tail)));
+            if head == "*" {
+                return Some(path.to_string());
+            }
+            let index = head.parse::<usize>().ok()?;
+            (index >= offset).then(|| {
+                let mut path = (index - offset).to_string();
+                if let Some(tail) = tail {
+                    path.push('.');
+                    path.push_str(tail);
+                }
+                path
+            })
+        };
+        PotentialWrapperPaths {
+            included: paths
+                .included
+                .iter()
+                .filter_map(|path| rebase(path))
+                .collect(),
+            excluded: paths
+                .excluded
+                .iter()
+                .filter_map(|path| rebase(path))
+                .collect(),
+        }
     }
 
     fn bind_pattern_potential_wrapper_paths(
         &mut self,
         pattern: &BindingPattern<'_>,
-        paths: &BTreeSet<String>,
+        paths: &PotentialWrapperPaths,
         prefix: &[String],
     ) {
         match pattern {
             BindingPattern::BindingIdentifier(identifier) => {
-                let relative = paths
-                    .iter()
-                    .filter_map(|path| Self::potential_wrapper_path_relative(path, prefix))
-                    .collect::<BTreeSet<_>>();
-                if relative.contains("") {
-                    self.potential_wrapper_callables
-                        .insert(identifier.name.to_string());
-                }
-                let nested = relative
-                    .into_iter()
-                    .filter(|path| !path.is_empty())
-                    .collect::<BTreeSet<_>>();
-                if !nested.is_empty() {
-                    self.potential_wrapper_callable_paths
-                        .insert(identifier.name.to_string(), nested);
-                }
+                self.bind_potential_wrapper_name(identifier.name.as_str(), paths, prefix);
             }
             BindingPattern::AssignmentPattern(assignment) => {
                 self.bind_pattern_potential_wrapper_paths(&assignment.left, paths, prefix);
@@ -11983,25 +12143,39 @@ impl SourceUsageCollector {
             BindingPattern::ObjectPattern(object) => {
                 let mut consumed = BTreeSet::new();
                 for property in &object.properties {
-                    if property.computed {
-                        continue;
-                    }
-                    let Some(name) = property.key.static_name() else {
+                    let names = if property.computed {
+                        property
+                            .key
+                            .as_expression()
+                            .and_then(|key| self.finite_strings_from_expression(key))
+                    } else {
+                        property
+                            .key
+                            .static_name()
+                            .map(|name| finite_string(name.to_string()))
+                    };
+                    let Some(names) = names else {
                         continue;
                     };
-                    consumed.insert(name.to_string());
-                    let mut property_prefix = prefix.to_vec();
-                    property_prefix.push(name.to_string());
-                    self.bind_pattern_potential_wrapper_paths(
-                        &property.value,
-                        paths,
-                        &property_prefix,
-                    );
+                    if names.len() == 1 {
+                        consumed.extend(names.iter().cloned());
+                    }
+                    for name in names {
+                        let mut property_prefix = prefix.to_vec();
+                        property_prefix.push(name);
+                        self.bind_pattern_potential_wrapper_paths(
+                            &property.value,
+                            paths,
+                            &property_prefix,
+                        );
+                    }
                 }
                 if let Some(rest) = &object.rest {
                     let root = prefix.join(".");
                     let root_prefix = (!root.is_empty()).then(|| format!("{root}."));
-                    let remaining = paths
+                    let mut remaining = paths.clone();
+                    remaining.included = paths
+                        .included
                         .iter()
                         .filter_map(|path| {
                             let relative = match &root_prefix {
@@ -12012,6 +12186,18 @@ impl SourceUsageCollector {
                             (!consumed.contains(first)).then(|| relative.to_string())
                         })
                         .collect::<BTreeSet<_>>();
+                    remaining.excluded = paths
+                        .excluded
+                        .iter()
+                        .filter_map(|path| {
+                            let relative = match &root_prefix {
+                                Some(prefix) => path.strip_prefix(prefix)?,
+                                None => path.as_str(),
+                            };
+                            let first = relative.split('.').next().unwrap_or_default();
+                            (!consumed.contains(first)).then(|| relative.to_string())
+                        })
+                        .collect();
                     self.bind_pattern_potential_wrapper_paths(&rest.argument, &remaining, &[]);
                 }
             }
@@ -12025,9 +12211,120 @@ impl SourceUsageCollector {
                     self.bind_pattern_potential_wrapper_paths(element, paths, &element_prefix);
                 }
                 if let Some(rest) = &array.rest {
-                    self.bind_pattern_potential_wrapper_paths(&rest.argument, paths, prefix);
+                    let offset = array.elements.len();
+                    let relative = Self::potential_wrapper_paths_relative(paths, prefix);
+                    let rebased = Self::rebase_array_rest_paths(&relative, offset);
+                    self.bind_pattern_potential_wrapper_paths(&rest.argument, &rebased, &[]);
                 }
             }
+        }
+    }
+
+    fn bind_assignment_target_potential_wrapper_paths(
+        &mut self,
+        target: &AssignmentTarget<'_>,
+        paths: &PotentialWrapperPaths,
+        prefix: &[String],
+    ) {
+        match target {
+            AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                self.bind_potential_wrapper_name(identifier.name.as_str(), paths, prefix);
+            }
+            AssignmentTarget::ObjectAssignmentTarget(object) => {
+                for property in &object.properties {
+                    match property {
+                        AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(property) => {
+                            let mut property_prefix = prefix.to_vec();
+                            property_prefix.push(property.binding.name.to_string());
+                            self.bind_potential_wrapper_name(
+                                property.binding.name.as_str(),
+                                paths,
+                                &property_prefix,
+                            );
+                        }
+                        AssignmentTargetProperty::AssignmentTargetPropertyProperty(property) => {
+                            let names = if property.computed {
+                                property
+                                    .name
+                                    .as_expression()
+                                    .and_then(|key| self.finite_strings_from_expression(key))
+                            } else {
+                                property
+                                    .name
+                                    .static_name()
+                                    .map(|name| finite_string(name.to_string()))
+                            };
+                            let Some(names) = names else {
+                                continue;
+                            };
+                            for name in names {
+                                let mut property_prefix = prefix.to_vec();
+                                property_prefix.push(name);
+                                self.bind_assignment_maybe_default_potential_wrapper_paths(
+                                    &property.binding,
+                                    paths,
+                                    &property_prefix,
+                                );
+                            }
+                        }
+                    }
+                }
+                if let Some(rest) = &object.rest {
+                    self.bind_assignment_target_potential_wrapper_paths(
+                        &rest.target,
+                        paths,
+                        prefix,
+                    );
+                }
+            }
+            AssignmentTarget::ArrayAssignmentTarget(array) => {
+                for (index, element) in array.elements.iter().enumerate() {
+                    let Some(element) = element else {
+                        continue;
+                    };
+                    let mut element_prefix = prefix.to_vec();
+                    element_prefix.push(index.to_string());
+                    self.bind_assignment_maybe_default_potential_wrapper_paths(
+                        element,
+                        paths,
+                        &element_prefix,
+                    );
+                }
+                if let Some(rest) = &array.rest {
+                    let relative = Self::potential_wrapper_paths_relative(paths, prefix);
+                    let rebased = Self::rebase_array_rest_paths(&relative, array.elements.len());
+                    self.bind_assignment_target_potential_wrapper_paths(
+                        &rest.target,
+                        &rebased,
+                        &[],
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn bind_assignment_maybe_default_potential_wrapper_paths(
+        &mut self,
+        target: &AssignmentTargetMaybeDefault<'_>,
+        paths: &PotentialWrapperPaths,
+        prefix: &[String],
+    ) {
+        match target {
+            AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(default) => {
+                self.bind_assignment_target_potential_wrapper_paths(&default.binding, paths, prefix)
+            }
+            AssignmentTargetMaybeDefault::AssignmentTargetIdentifier(identifier) => {
+                self.bind_potential_wrapper_name(identifier.name.as_str(), paths, prefix);
+            }
+            AssignmentTargetMaybeDefault::ObjectAssignmentTarget(_)
+            | AssignmentTargetMaybeDefault::ArrayAssignmentTarget(_) => self
+                .bind_assignment_target_potential_wrapper_paths(
+                    target.to_assignment_target(),
+                    paths,
+                    prefix,
+                ),
+            _ => {}
         }
     }
 
@@ -12038,7 +12335,7 @@ impl SourceUsageCollector {
                 .contains(identifier.name.as_str()),
             Expression::StaticMemberExpression(member) => {
                 let paths = self.potential_wrapper_callable_paths_from_expression(&member.object);
-                Self::potential_wrapper_paths_contain(&paths, member.property.name.as_str())
+                paths.contains(member.property.name.as_str())
             }
             Expression::ComputedMemberExpression(member) => {
                 self.computed_member_is_potential_wrapper_callable(member)
@@ -16798,6 +17095,8 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         if expression.operator == AssignmentOperator::Assign {
             match &expression.left {
                 AssignmentTarget::ObjectAssignmentTarget(target) => {
+                    let wrapper_paths =
+                        self.potential_wrapper_callable_paths_from_expression(&expression.right);
                     self.bind_assignment_target_expression_path(
                         &expression.left,
                         &expression.right,
@@ -16806,8 +17105,18 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     let bindings =
                         self.translator_object_bindings_from_expression(&expression.right);
                     self.bind_object_assignment_target(target, bindings.as_ref());
+                    self.bind_assignment_target_potential_wrapper_paths(
+                        &expression.left,
+                        &wrapper_paths,
+                        &[],
+                    );
                 }
                 AssignmentTarget::ArrayAssignmentTarget(target) => {
+                    let mut wrapper_paths =
+                        self.potential_wrapper_callable_paths_from_expression(&expression.right);
+                    if self.expression_is_potential_wrapper_value(&expression.right) {
+                        wrapper_paths.included.insert("*".to_string());
+                    }
                     self.bind_assignment_target_expression_path(
                         &expression.left,
                         &expression.right,
@@ -16815,6 +17124,11 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     );
                     let array = self.translator_argument_array_from_expression(&expression.right);
                     self.bind_array_assignment_target(target, array.as_ref());
+                    self.bind_assignment_target_potential_wrapper_paths(
+                        &expression.left,
+                        &wrapper_paths,
+                        &[],
+                    );
                 }
                 _ => {}
             }
@@ -16872,11 +17186,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                     right_potential_callable_paths
                 }
                 AssignmentOperator::LogicalOr | AssignmentOperator::LogicalNullish => {
-                    let mut paths = current_potential_callable_paths;
-                    paths.extend(right_potential_callable_paths);
-                    paths
+                    current_potential_callable_paths
+                        .merge_alternative(right_potential_callable_paths)
                 }
-                _ => BTreeSet::new(),
+                _ => PotentialWrapperPaths::default(),
             };
             let current_translator = self.translators.get(name).cloned();
             let current_object_bindings = self.translator_object_bindings.get(name).cloned();
@@ -17060,16 +17373,19 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                 .potential_wrapper_callable_paths
                 .entry(name.to_string())
                 .or_default();
-            if !expression.operator.is_logical() {
-                let prefix = format!("{property}.");
-                paths.retain(|path| path != &property && !path.starts_with(&prefix));
-            }
-            if propagate_potential_assignment && assigned_potential_callable {
-                paths.insert(property.clone());
-            }
-            if propagate_potential_assignment {
-                paths.extend(
+            if expression.operator == AssignmentOperator::Assign {
+                paths.assign_property(
+                    &property,
+                    assigned_potential_callable,
+                    &assigned_potential_paths,
+                );
+            } else if expression.operator.is_logical() {
+                if assigned_potential_callable {
+                    paths.included.insert(property.clone());
+                }
+                paths.included.extend(
                     assigned_potential_paths
+                        .included
                         .iter()
                         .map(|path| format!("{property}.{path}")),
                 );
@@ -17108,16 +17424,19 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                         .potential_wrapper_callable_paths
                         .entry(name.to_string())
                         .or_default();
-                    if !expression.operator.is_logical() && exact_target {
-                        let prefix = format!("{property}.");
-                        paths.retain(|path| path != &property && !path.starts_with(&prefix));
-                    }
-                    if propagate_potential_assignment && assigned_potential_callable {
-                        paths.insert(property.clone());
-                    }
-                    if propagate_potential_assignment {
-                        paths.extend(
+                    if expression.operator == AssignmentOperator::Assign && exact_target {
+                        paths.assign_property(
+                            &property,
+                            assigned_potential_callable,
+                            &assigned_potential_paths,
+                        );
+                    } else if propagate_potential_assignment {
+                        if assigned_potential_callable {
+                            paths.included.insert(property.clone());
+                        }
+                        paths.included.extend(
                             assigned_potential_paths
+                                .included
                                 .iter()
                                 .map(|path| format!("{property}.{path}")),
                         );
@@ -17139,10 +17458,11 @@ impl<'a> Visit<'a> for SourceUsageCollector {
                         .entry(name.to_string())
                         .or_default();
                     if assigned_potential_callable {
-                        paths.insert("*".to_string());
+                        paths.included.insert("*".to_string());
                     }
-                    paths.extend(
+                    paths.included.extend(
                         assigned_potential_paths
+                            .included
                             .iter()
                             .map(|path| format!("*.{path}")),
                     );
@@ -19297,6 +19617,122 @@ mod tests {
         );
 
         assert!(scan.dynamic_usages.is_empty(), "{:#?}", scan.dynamic_usages);
+    }
+
+    #[test]
+    fn computed_subobjects_preserve_nested_wrapper_paths() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const values = useMemo(() => runtimeValues(), []);
+            const callable = values[0];
+            const bag = {};
+            bag.nested = {value: callable};
+            const nested = bag['nested'];
+            nested.value(runtimeKey);
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 8));
+    }
+
+    #[test]
+    fn finite_computed_destructuring_preserves_wrapper_paths() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const values = useMemo(() => runtimeValues(), []);
+            const callable = values[0];
+            const bag = {left: callable, right: draw};
+            const property = condition ? 'left' : 'right';
+            const {[property]: selected} = bag;
+            selected(runtimeKey);
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 8));
+    }
+
+    #[test]
+    fn array_rest_rebases_wrapper_callable_indexes() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const values = useMemo(() => runtimeValues(), []);
+            const callable = values[0];
+            const bag = [];
+            bag[2] = callable;
+            const [first, ...rest] = bag;
+            rest[1](runtimeKey);
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 8));
+    }
+
+    #[test]
+    fn destructuring_assignments_preserve_wrapper_paths() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const values = useMemo(() => runtimeValues(), []);
+            const callable = values[0];
+            const bag = {value: callable};
+            let selected;
+            ({value: selected} = bag);
+            selected(runtimeKey);
+            "#,
+        );
+
+        assert!(scan.dynamic_usages.iter().any(|usage| usage.line == 8));
+    }
+
+    #[test]
+    fn exact_overwrites_exclude_only_that_wildcard_path() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const values = useMemo(() => runtimeValues(), []);
+            const callable = values[0];
+            const bag = {};
+            bag[runtimeProperty] = callable;
+            bag.safe = draw;
+            bag.safe('layer');
+            bag.other(runtimeKey);
+            "#,
+        );
+
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(!lines.contains(&8), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&9), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn exact_overwrites_exclude_nested_wildcard_paths() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            const values = useMemo(() => runtimeValues(), []);
+            const callable = values[0];
+            const bag = {};
+            bag[runtimeProperty] = {value: callable};
+            bag.safe = {value: draw};
+            bag.safe.value('layer');
+            bag.other.value(runtimeKey);
+            "#,
+        );
+
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(!lines.contains(&8), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&9), "dynamic lines: {lines:?}");
     }
 
     #[test]
