@@ -8189,10 +8189,9 @@ impl ReactWrapperReturnCollector {
                 let member_captures = expression_static_member_path(expression, &mut path)
                     .and_then(|root| {
                         let binding = self.finite_bound_capture_binding(root);
-                        self.finite_bound_capture_member_dependencies
-                            .get(&(binding, path.join(".")))
+                        self.finite_bound_capture_member_state(&binding, &path.join("."))
                     })
-                    .map(|dependencies| dependencies.keys().cloned().collect::<BTreeSet<_>>());
+                    .map(|(dependencies, _)| dependencies.keys().cloned().collect::<BTreeSet<_>>());
                 member_captures.or_else(|| match expression.get_inner_expression() {
                     Expression::StaticMemberExpression(member) => {
                         self.finite_bound_capture_names_from_expression(&member.object)
@@ -8499,11 +8498,10 @@ impl ReactWrapperReturnCollector {
         let mut member_path = Vec::new();
         if let Some(root) = expression_static_member_path(expression, &mut member_path) {
             let binding = self.finite_bound_capture_binding(root);
-            if let Some(dependencies) = self
-                .finite_bound_capture_member_dependencies
-                .get(&(binding, member_path.join(".")))
+            if let Some((dependencies, _)) =
+                self.finite_bound_capture_member_state(&binding, &member_path.join("."))
             {
-                for (name, scope_ids) in dependencies {
+                for (name, scope_ids) in &dependencies {
                     exact_bindings
                         .extend(scope_ids.iter().map(|scope_id| (name.clone(), *scope_id)));
                 }
@@ -8571,9 +8569,8 @@ impl ReactWrapperReturnCollector {
     fn record_escaped_finite_bound_member(&mut self, root: &str, path: &str) {
         let binding = self.finite_bound_capture_binding(root);
         let dependencies = self
-            .finite_bound_capture_member_dependencies
-            .get(&(binding, path.to_string()))
-            .cloned()
+            .finite_bound_capture_member_state(&binding, path)
+            .map(|(dependencies, _)| dependencies)
             .unwrap_or_default();
         let names = dependencies.keys().cloned().collect();
         let exact_bindings = dependencies
@@ -8593,11 +8590,14 @@ impl ReactWrapperReturnCollector {
     ) -> BTreeMap<String, BTreeSet<usize>> {
         captures
             .iter()
-            .filter_map(|capture| {
-                self.finite_bound_capture_binding_depths
+            .map(|capture| {
+                let scope_ids = self
+                    .finite_bound_capture_binding_depths
                     .get(capture)
                     .copied()
-                    .map(|scope_id| (capture.clone(), BTreeSet::from([scope_id])))
+                    .map(|scope_id| BTreeSet::from([scope_id]))
+                    .unwrap_or_else(|| self.finite_bound_active_capture_scope_ids());
+                (capture.clone(), scope_ids)
             })
             .collect()
     }
@@ -8636,6 +8636,81 @@ impl ReactWrapperReturnCollector {
             .entry((binding, path))
             .or_default()
             .extend(provenance);
+    }
+
+    fn finite_bound_capture_member_state(
+        &self,
+        binding: &FiniteBoundCaptureBinding,
+        path: &str,
+    ) -> Option<(BTreeMap<String, BTreeSet<usize>>, BTreeSet<usize>)> {
+        let aliases = self
+            .finite_bound_capture_aliases
+            .get(binding)
+            .cloned()
+            .unwrap_or_else(|| BTreeSet::from([binding.clone()]));
+        let mut found = false;
+        let mut dependencies = BTreeMap::<String, BTreeSet<usize>>::new();
+        let mut provenance = BTreeSet::new();
+        for alias in aliases {
+            if !self.finite_bound_capture_binding_is_current(&alias) {
+                continue;
+            }
+            if let Some(source) = self
+                .finite_bound_capture_member_dependencies
+                .get(&(alias.clone(), path.to_string()))
+            {
+                found = true;
+                for (capture, scope_ids) in source {
+                    dependencies
+                        .entry(capture.clone())
+                        .or_default()
+                        .extend(scope_ids);
+                }
+                provenance.extend(
+                    self.finite_bound_capture_member_provenance
+                        .get(&(alias, path.to_string()))
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                );
+            }
+        }
+        found.then_some((dependencies, provenance))
+    }
+
+    fn clear_finite_bound_capture_member_state(&mut self, binding: &FiniteBoundCaptureBinding) {
+        self.finite_bound_capture_member_dependencies
+            .retain(|(candidate, _), _| candidate != binding);
+        self.finite_bound_capture_member_provenance
+            .retain(|(candidate, _), _| candidate != binding);
+    }
+
+    fn refresh_finite_bound_capture_member_binding(
+        &mut self,
+        name: &str,
+        scope_id: usize,
+        provenance: &BTreeSet<usize>,
+    ) {
+        let keys = self
+            .finite_bound_capture_member_dependencies
+            .iter()
+            .filter(|(_, dependencies)| {
+                dependencies
+                    .get(name)
+                    .is_some_and(|scope_ids| scope_ids.contains(&scope_id))
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(dependencies) = self.finite_bound_capture_member_dependencies.get_mut(&key)
+            {
+                dependencies.insert(name.to_string(), BTreeSet::from([scope_id]));
+            }
+            self.finite_bound_capture_member_provenance
+                .entry(key)
+                .or_default()
+                .extend(provenance.iter().copied());
+        }
     }
 
     fn seed_finite_bound_capture_object_dependencies(
@@ -8775,6 +8850,7 @@ impl ReactWrapperReturnCollector {
             let provenance = value.provenance.clone();
             self.finite_bound_argument_arrays
                 .insert(name.to_string(), value);
+            self.refresh_finite_bound_capture_member_binding(name, binding_scope_id, &provenance);
             let pending = self
                 .finite_bound_capture_callables
                 .iter()
@@ -9324,10 +9400,9 @@ impl ReactWrapperReturnCollector {
                 let member_provenance = expression_static_member_path(expression, &mut path)
                     .and_then(|root| {
                         let binding = self.finite_bound_capture_binding(root);
-                        self.finite_bound_capture_member_provenance
-                            .get(&(binding, path.join(".")))
+                        self.finite_bound_capture_member_state(&binding, &path.join("."))
                     })
-                    .cloned();
+                    .map(|(_, provenance)| provenance);
                 member_provenance.unwrap_or_else(|| match expression.get_inner_expression() {
                     Expression::StaticMemberExpression(member) => {
                         self.finite_bound_argument_provenance(&member.object)
@@ -11035,6 +11110,11 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
             && let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &expression.left
         {
             let name = identifier.name.to_string();
+            let binding = self.finite_bound_capture_binding(&name);
+            self.clear_finite_bound_capture_member_state(&binding);
+            if let Expression::ObjectExpression(object) = expression.right.get_inner_expression() {
+                self.seed_finite_bound_capture_object_dependencies(&binding, object, "");
+            }
             if self.finite_bound_capture_binding_is_escaped(&name) {
                 self.finite_bound_argument_arrays.remove(&name);
             } else if let Some(arguments) = self.finite_bound_argument_entry(&expression.right) {
@@ -11231,10 +11311,8 @@ impl<'a> Visit<'a> for ReactWrapperReturnCollector {
         };
         if let Some(root) = root {
             let binding = self.finite_bound_capture_binding(root);
-            if let Some(provenance) = self
-                .finite_bound_capture_member_provenance
-                .get(&(binding, path.join(".")))
-                .cloned()
+            if let Some((_, provenance)) =
+                self.finite_bound_capture_member_state(&binding, &path.join("."))
             {
                 self.invalidate_finite_bound_argument_provenance(provenance);
                 return;
@@ -29317,6 +29395,84 @@ mod tests {
                   mutating: () => { args[0] = runtimeFactory; },
                   safe: ordinary,
                 };
+                external.callback = holder.safe;
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        assert!(
+            scan.dynamic_usages.is_empty(),
+            "dynamic usages: {:?}",
+            scan.dynamic_usages
+        );
+    }
+
+    #[test]
+    fn forward_declared_member_capture_refreshes_property_provenance() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const holder = { mutating: () => { args[0] = runtimeFactory; } };
+                const args = [draw];
+                external.callback = holder.mutating;
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&4), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn member_property_summaries_follow_object_aliases() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const args = [draw];
+                const holder = { mutating: () => { args[0] = runtimeFactory; }, safe: ordinary };
+                const alias = holder;
+                external.callback = alias.safe;
+                return outer(inner.bind(null, ...args));
+              }
+            }
+            "#,
+        );
+        assert!(
+            scan.dynamic_usages.is_empty(),
+            "dynamic usages: {:?}",
+            scan.dynamic_usages
+        );
+    }
+
+    #[test]
+    fn whole_object_replacement_clears_stale_member_summaries() {
+        let scan = scan(
+            r#"
+            async function scope() {
+              const [value] = await forward();
+              value[0][0](runtimeKey);
+              async function inner(factory) { return Promise.all([factory(), draw]); }
+              async function outer(factory) { return Promise.all([factory(), draw]); }
+              async function forward() {
+                const args = [draw];
+                let holder = { safe: () => { args[0] = runtimeFactory; } };
+                holder = { safe: ordinary };
                 external.callback = holder.safe;
                 return outer(inner.bind(null, ...args));
               }
