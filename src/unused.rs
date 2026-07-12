@@ -542,6 +542,26 @@ enum ImportedName {
     Default,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextIntlFactory {
+    UseTranslations,
+    GetTranslations,
+    UseMessages,
+    GetMessages,
+}
+
+impl NextIntlFactory {
+    fn direct(source: &str, name: &str) -> Option<Self> {
+        match (source, name) {
+            ("next-intl", "useTranslations") => Some(Self::UseTranslations),
+            ("next-intl/server", "getTranslations") => Some(Self::GetTranslations),
+            ("next-intl", "useMessages") => Some(Self::UseMessages),
+            ("next-intl/server", "getMessages") => Some(Self::GetMessages),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct HelperSummary {
     param_usages: Vec<HelperParamUsage>,
@@ -1046,12 +1066,21 @@ impl UnusedExcludePattern {
             return self.segments[0] == id;
         }
 
-        let mut rest = id;
         let starts_with_wildcard = self.segments.first().is_some_and(String::is_empty);
         let ends_with_wildcard = self.segments.last().is_some_and(String::is_empty);
+        let mut rest = id;
+        let last_index = self.segments.len() - 1;
+
+        if !ends_with_wildcard {
+            let suffix = &self.segments[last_index];
+            let Some(prefix) = rest.strip_suffix(suffix) else {
+                return false;
+            };
+            rest = prefix;
+        }
 
         for (index, segment) in self.segments.iter().enumerate() {
-            if segment.is_empty() {
+            if segment.is_empty() || (!ends_with_wildcard && index == last_index) {
                 continue;
             }
             if index == 0 && !starts_with_wildcard {
@@ -1068,11 +1097,7 @@ impl UnusedExcludePattern {
             rest = &rest[position + segment.len()..];
         }
 
-        ends_with_wildcard
-            || self
-                .segments
-                .last()
-                .is_none_or(|segment| rest.is_empty() || segment.is_empty())
+        true
     }
 }
 
@@ -1592,6 +1617,71 @@ impl ProjectIndex {
         }
 
         Ok(project)
+    }
+
+    fn next_intl_factory_for_import(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+    ) -> Option<NextIntlFactory> {
+        self.next_intl_factory_for_import_at_depth(from, target, 0)
+    }
+
+    fn next_intl_factory_for_import_at_depth(
+        &self,
+        from: &Path,
+        target: &ImportTarget,
+        depth: usize,
+    ) -> Option<NextIntlFactory> {
+        if depth > 16 {
+            return None;
+        }
+        if let ImportedName::Named(name) = &target.imported
+            && let Some(factory) = NextIntlFactory::direct(&target.source, name)
+        {
+            return Some(factory);
+        }
+
+        let path = self.resolve_module(from, &target.source)?;
+        let file = self.files.get(&path)?;
+        match &target.imported {
+            ImportedName::Named(name) => file
+                .translator_return_export_locals
+                .get(name)
+                .and_then(|local| file.imports.get(local))
+                .and_then(|target| {
+                    self.next_intl_factory_for_import_at_depth(&path, target, depth + 1)
+                })
+                .or_else(|| {
+                    file.re_exports.get(name).and_then(|target| {
+                        self.next_intl_factory_for_import_at_depth(&path, target, depth + 1)
+                    })
+                })
+                .or_else(|| {
+                    file.star_re_exports.iter().find_map(|source| {
+                        self.next_intl_factory_for_import_at_depth(
+                            &path,
+                            &ImportTarget {
+                                source: source.clone(),
+                                imported: ImportedName::Named(name.clone()),
+                            },
+                            depth + 1,
+                        )
+                    })
+                }),
+            ImportedName::Default => file
+                .default_local_export
+                .as_ref()
+                .and_then(|local| file.imports.get(local))
+                .and_then(|target| {
+                    self.next_intl_factory_for_import_at_depth(&path, target, depth + 1)
+                })
+                .or_else(|| {
+                    file.re_exports.get("default").and_then(|target| {
+                        self.next_intl_factory_for_import_at_depth(&path, target, depth + 1)
+                    })
+                }),
+        }
     }
 
     fn helper_for_import(&self, from: &Path, target: &ImportTarget) -> Option<HelperSummary> {
@@ -4337,6 +4427,10 @@ struct SourceUsageCollector {
     file_index: Option<SourceFileIndex>,
     use_translations: BTreeSet<String>,
     get_translations: BTreeSet<String>,
+    use_messages: BTreeSet<String>,
+    get_messages: BTreeSet<String>,
+    message_object_paths: BTreeMap<String, FiniteStrings>,
+    covered_message_member_spans: Vec<(u32, u32)>,
     use_extracted: BTreeSet<String>,
     get_extracted: BTreeSet<String>,
     next_intl_namespaces: BTreeSet<String>,
@@ -4395,6 +4489,9 @@ struct LocalWrapperResolution {
 struct BindingEnvironment {
     use_translations: BTreeSet<String>,
     get_translations: BTreeSet<String>,
+    use_messages: BTreeSet<String>,
+    get_messages: BTreeSet<String>,
+    message_object_paths: BTreeMap<String, FiniteStrings>,
     use_extracted: BTreeSet<String>,
     get_extracted: BTreeSet<String>,
     finite_constants: BTreeMap<String, FiniteStrings>,
@@ -5465,6 +5562,14 @@ fn expression_member_root_name<'a>(expression: &'a Expression<'a>) -> Option<&'a
         Expression::StaticMemberExpression(member) => expression_member_root_name(&member.object),
         Expression::ComputedMemberExpression(member) => expression_member_root_name(&member.object),
         _ => None,
+    }
+}
+
+fn join_message_path(prefix: &str, property: &str) -> String {
+    if prefix.is_empty() {
+        property.to_string()
+    } else {
+        format!("{prefix}.{property}")
     }
 }
 
@@ -16393,11 +16498,20 @@ impl<'a> Visit<'a> for SourceIndexCollector {
             for specifier in specifiers {
                 match specifier {
                     ImportDeclarationSpecifier::ImportSpecifier(specifier) => {
-                        if module_export_name(&specifier.imported).is_some_and(|name| {
-                            matches!(name, "useTranslations" | "getTranslations")
-                        }) {
-                            self.translation_factories
-                                .insert(specifier.local.name.to_string());
+                        if let Some(name) = module_export_name(&specifier.imported)
+                            && NextIntlFactory::direct(source, name).is_some()
+                        {
+                            let local = specifier.local.name.to_string();
+                            self.imports.insert(
+                                local.clone(),
+                                ImportTarget {
+                                    source: source.to_string(),
+                                    imported: ImportedName::Named(name.to_string()),
+                                },
+                            );
+                            if matches!(name, "useTranslations" | "getTranslations") {
+                                self.translation_factories.insert(local);
+                            }
                         }
                     }
                     ImportDeclarationSpecifier::ImportNamespaceSpecifier(specifier) => {
@@ -16923,6 +17037,29 @@ impl SourceUsageCollector {
         let file_index = project
             .as_ref()
             .and_then(|project| project.files.get(path).cloned());
+        let mut use_translations = BTreeSet::new();
+        let mut get_translations = BTreeSet::new();
+        let mut use_messages = BTreeSet::new();
+        let mut get_messages = BTreeSet::new();
+        if let (Some(project), Some(file)) = (project.as_ref(), file_index.as_ref()) {
+            for (local, target) in &file.imports {
+                match project.next_intl_factory_for_import(path, target) {
+                    Some(NextIntlFactory::UseTranslations) => {
+                        use_translations.insert(local.clone());
+                    }
+                    Some(NextIntlFactory::GetTranslations) => {
+                        get_translations.insert(local.clone());
+                    }
+                    Some(NextIntlFactory::UseMessages) => {
+                        use_messages.insert(local.clone());
+                    }
+                    Some(NextIntlFactory::GetMessages) => {
+                        get_messages.insert(local.clone());
+                    }
+                    None => {}
+                }
+            }
+        }
         let summarized_dynamic_key_spans = file_index
             .as_ref()
             .map(summarized_dynamic_key_spans)
@@ -16933,8 +17070,12 @@ impl SourceUsageCollector {
             utf16_offset_corrections: utf16_offset_corrections(source),
             project,
             file_index,
-            use_translations: BTreeSet::new(),
-            get_translations: BTreeSet::new(),
+            use_translations,
+            get_translations,
+            use_messages,
+            get_messages,
+            message_object_paths: BTreeMap::new(),
+            covered_message_member_spans: Vec::new(),
             use_extracted: BTreeSet::new(),
             get_extracted: BTreeSet::new(),
             next_intl_namespaces: BTreeSet::new(),
@@ -16984,6 +17125,9 @@ impl SourceUsageCollector {
         BindingEnvironment {
             use_translations: self.use_translations.clone(),
             get_translations: self.get_translations.clone(),
+            use_messages: self.use_messages.clone(),
+            get_messages: self.get_messages.clone(),
+            message_object_paths: self.message_object_paths.clone(),
             use_extracted: self.use_extracted.clone(),
             get_extracted: self.get_extracted.clone(),
             finite_constants: self.finite_constants.clone(),
@@ -17023,6 +17167,9 @@ impl SourceUsageCollector {
     fn restore_binding_environment(&mut self, environment: BindingEnvironment) {
         self.use_translations = environment.use_translations;
         self.get_translations = environment.get_translations;
+        self.use_messages = environment.use_messages;
+        self.get_messages = environment.get_messages;
+        self.message_object_paths = environment.message_object_paths;
         self.use_extracted = environment.use_extracted;
         self.get_extracted = environment.get_extracted;
         self.finite_constants = environment.finite_constants;
@@ -17080,6 +17227,9 @@ impl SourceUsageCollector {
         self.finite_constants.remove(name);
         self.use_translations.remove(name);
         self.get_translations.remove(name);
+        self.use_messages.remove(name);
+        self.get_messages.remove(name);
+        self.message_object_paths.remove(name);
         self.use_extracted.remove(name);
         self.get_extracted.remove(name);
         self.finite_iterables.remove(name);
@@ -17698,6 +17848,12 @@ impl SourceUsageCollector {
             }
             ("next-intl/server", "getTranslations") => {
                 self.get_translations.insert(local.to_string());
+            }
+            ("next-intl", "useMessages") => {
+                self.use_messages.insert(local.to_string());
+            }
+            ("next-intl/server", "getMessages") => {
+                self.get_messages.insert(local.to_string());
             }
             ("next-intl", "useExtracted") => {
                 self.use_extracted.insert(local.to_string());
@@ -19499,23 +19655,169 @@ impl SourceUsageCollector {
     }
 
     fn is_translation_factory_callee(&self, expression: &Expression<'_>) -> bool {
+        matches!(
+            self.next_intl_factory_callee(expression),
+            Some(NextIntlFactory::UseTranslations | NextIntlFactory::GetTranslations)
+        )
+    }
+
+    fn is_message_factory_callee(&self, expression: &Expression<'_>) -> bool {
+        matches!(
+            self.next_intl_factory_callee(expression),
+            Some(NextIntlFactory::UseMessages | NextIntlFactory::GetMessages)
+        )
+    }
+
+    fn next_intl_factory_callee(&self, expression: &Expression<'_>) -> Option<NextIntlFactory> {
         if let Some(callee) = self.callee_identifier(expression) {
-            return self.use_translations.contains(callee)
-                || self.get_translations.contains(callee);
+            if self.use_translations.contains(callee) {
+                return Some(NextIntlFactory::UseTranslations);
+            }
+            if self.get_translations.contains(callee) {
+                return Some(NextIntlFactory::GetTranslations);
+            }
+            if self.use_messages.contains(callee) {
+                return Some(NextIntlFactory::UseMessages);
+            }
+            if self.get_messages.contains(callee) {
+                return Some(NextIntlFactory::GetMessages);
+            }
+            return None;
         }
-        let Some(member) = expression.get_member_expr() else {
-            return false;
+        let member = expression.get_member_expr()?;
+        let object = member.object().get_identifier_reference()?;
+        let name = member.static_property_name()?;
+        let direct = match name.as_ref() {
+            "useTranslations" if self.next_intl_namespaces.contains(object.name.as_str()) => {
+                Some(NextIntlFactory::UseTranslations)
+            }
+            "useMessages" if self.next_intl_namespaces.contains(object.name.as_str()) => {
+                Some(NextIntlFactory::UseMessages)
+            }
+            "getTranslations"
+                if self
+                    .next_intl_server_namespaces
+                    .contains(object.name.as_str()) =>
+            {
+                Some(NextIntlFactory::GetTranslations)
+            }
+            "getMessages"
+                if self
+                    .next_intl_server_namespaces
+                    .contains(object.name.as_str()) =>
+            {
+                Some(NextIntlFactory::GetMessages)
+            }
+            _ => None,
         };
-        let Some(object) = member.object().get_identifier_reference() else {
-            return false;
-        };
-        match member.static_property_name().as_deref() {
-            Some("useTranslations") => self.next_intl_namespaces.contains(object.name.as_str()),
-            Some("getTranslations") => self
-                .next_intl_server_namespaces
-                .contains(object.name.as_str()),
-            _ => false,
+        if direct.is_some() {
+            return direct;
         }
+        if self
+            .shadowed_project_bindings
+            .contains(object.name.as_str())
+        {
+            return None;
+        }
+        let project = self.project.as_ref()?;
+        let source = self
+            .file_index
+            .as_ref()?
+            .namespace_imports
+            .get(object.name.as_str())?;
+        project.next_intl_factory_for_import(
+            &self.path,
+            &ImportTarget {
+                source: source.clone(),
+                imported: ImportedName::Named(name.to_string()),
+            },
+        )
+    }
+
+    fn message_paths_from_expression(&self, expression: &Expression<'_>) -> Option<FiniteStrings> {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => self
+                .message_object_paths
+                .get(identifier.name.as_str())
+                .cloned(),
+            Expression::CallExpression(call) if self.is_message_factory_callee(&call.callee) => {
+                Some(BTreeSet::from([String::new()]))
+            }
+            Expression::AwaitExpression(await_expression) => {
+                self.message_paths_from_expression(&await_expression.argument)
+            }
+            Expression::StaticMemberExpression(member) => {
+                let paths = self.message_paths_from_expression(&member.object)?;
+                Some(
+                    paths
+                        .into_iter()
+                        .map(|path| join_message_path(&path, member.property.name.as_str()))
+                        .collect(),
+                )
+            }
+            Expression::ComputedMemberExpression(member) => {
+                let paths = self.message_paths_from_expression(&member.object)?;
+                let properties = self.finite_strings_from_expression(&member.expression)?;
+                Some(
+                    paths
+                        .into_iter()
+                        .flat_map(|path| {
+                            properties
+                                .iter()
+                                .map(move |property| join_message_path(&path, property))
+                        })
+                        .collect(),
+                )
+            }
+            Expression::ConditionalExpression(conditional) => {
+                let mut paths = self.message_paths_from_expression(&conditional.consequent)?;
+                paths.extend(self.message_paths_from_expression(&conditional.alternate)?);
+                Some(paths)
+            }
+            Expression::LogicalExpression(logical) => {
+                let mut paths = self.message_paths_from_expression(&logical.left)?;
+                paths.extend(self.message_paths_from_expression(&logical.right)?);
+                Some(paths)
+            }
+            _ => None,
+        }
+    }
+
+    fn dynamic_message_prefixes_from_expression(
+        &self,
+        expression: &Expression<'_>,
+    ) -> Option<FiniteStrings> {
+        match expression.get_inner_expression() {
+            Expression::ComputedMemberExpression(member) => self
+                .message_paths_from_expression(&member.object)
+                .or_else(|| self.dynamic_message_prefixes_from_expression(&member.object)),
+            Expression::StaticMemberExpression(member) => {
+                self.dynamic_message_prefixes_from_expression(&member.object)
+            }
+            _ => None,
+        }
+    }
+
+    fn record_message_member_paths(&mut self, paths: FiniteStrings) {
+        self.scan
+            .used_ids
+            .extend(paths.into_iter().filter(|path| !path.is_empty()));
+    }
+
+    fn record_dynamic_message_prefixes(&mut self, prefixes: FiniteStrings, start: u32) {
+        for prefix in prefixes {
+            self.record_dynamic_usage((!prefix.is_empty()).then_some(prefix.as_str()), start);
+        }
+    }
+
+    fn message_member_span_is_covered(&self, start: u32, end: u32) -> bool {
+        self.covered_message_member_spans
+            .iter()
+            .any(|(outer_start, outer_end)| *outer_start <= start && *outer_end >= end)
+    }
+
+    fn cover_message_member_span(&mut self, start: u32, end: u32) {
+        self.covered_message_member_spans.push((start, end));
     }
 
     fn translator_binding_from_expression(
@@ -23655,6 +23957,7 @@ impl<'a> Visit<'a> for SourceUsageCollector {
 
     fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
         let init = declarator.init.as_ref();
+        let message_paths = init.and_then(|init| self.message_paths_from_expression(init));
         let local_wrapper_resolution = (self.scope_depth > 1)
             .then(|| {
                 let name = binding_identifier_name(&declarator.id)?;
@@ -23907,6 +24210,10 @@ impl<'a> Visit<'a> for SourceUsageCollector {
             array
         });
         self.mask_binding_pattern(&declarator.id);
+        if let (Some(name), Some(paths)) = (binding_identifier_name(&declarator.id), message_paths)
+        {
+            self.message_object_paths.insert(name.to_string(), paths);
+        }
         if let Some((name, resolution)) = local_wrapper_resolution {
             self.register_local_wrapper_resolution(name, resolution);
         }
@@ -24422,6 +24729,52 @@ impl<'a> Visit<'a> for SourceUsageCollector {
         }
 
         walk::walk_call_expression(self, call);
+    }
+
+    fn visit_static_member_expression(&mut self, member: &StaticMemberExpression<'a>) {
+        if !self.message_member_span_is_covered(member.span.start, member.span.end) {
+            if let Some(paths) = self.message_paths_from_expression(&member.object) {
+                let paths = paths
+                    .into_iter()
+                    .map(|path| join_message_path(&path, member.property.name.as_str()))
+                    .collect();
+                self.record_message_member_paths(paths);
+                self.cover_message_member_span(member.span.start, member.span.end);
+            } else if let Some(prefixes) =
+                self.dynamic_message_prefixes_from_expression(&member.object)
+            {
+                self.record_dynamic_message_prefixes(prefixes, member.span.start);
+                self.cover_message_member_span(member.span.start, member.span.end);
+            }
+        }
+        walk::walk_static_member_expression(self, member);
+    }
+
+    fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
+        if !self.message_member_span_is_covered(member.span.start, member.span.end) {
+            if let Some(prefixes) = self.message_paths_from_expression(&member.object) {
+                if let Some(properties) = self.finite_strings_from_expression(&member.expression) {
+                    let paths = prefixes
+                        .into_iter()
+                        .flat_map(|prefix| {
+                            properties
+                                .iter()
+                                .map(move |property| join_message_path(&prefix, property))
+                        })
+                        .collect();
+                    self.record_message_member_paths(paths);
+                } else {
+                    self.record_dynamic_message_prefixes(prefixes, member.span.start);
+                }
+                self.cover_message_member_span(member.span.start, member.span.end);
+            } else if let Some(prefixes) =
+                self.dynamic_message_prefixes_from_expression(&member.object)
+            {
+                self.record_dynamic_message_prefixes(prefixes, member.span.start);
+                self.cover_message_member_span(member.span.start, member.span.end);
+            }
+        }
+        walk::walk_computed_member_expression(self, member);
     }
 
     fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
@@ -24941,6 +25294,98 @@ mod tests {
 
     fn scan(source: &str) -> UsageScan {
         collect_usage_from_source(source, Path::new("sample.tsx")).expect("scan")
+    }
+
+    #[test]
+    fn unused_exclude_wildcards_anchor_trailing_segments() {
+        let suffix = UnusedExcludePattern::new("*title");
+        assert!(suffix.matches("common.title.title"));
+        assert!(suffix.matches("common.title"));
+        assert!(!suffix.matches("common.title.detail"));
+
+        let surrounded = UnusedExcludePattern::new("common.*.title");
+        assert!(surrounded.matches("common.dialog.title"));
+        assert!(surrounded.matches("common.nested.dialog.title"));
+        assert!(!surrounded.matches("prefix.common.dialog.title"));
+        assert!(!surrounded.matches("common.dialog.title.trailing"));
+    }
+
+    #[test]
+    fn collects_direct_next_intl_message_object_reads() {
+        let scan = scan(
+            r#"
+            import {useMessages} from 'next-intl';
+            import {getMessages} from 'next-intl/server';
+            const messages = useMessages();
+            const navigation = messages.Navigation;
+            render(navigation.title);
+            render(useMessages().Footer.copy);
+            const serverMessages = await getMessages();
+            render(serverMessages.Admin.heading);
+            provide(await getMessages());
+            "#,
+        );
+
+        assert!(scan.used_ids.contains("Navigation.title"));
+        assert!(scan.used_ids.contains("Footer.copy"));
+        assert!(scan.used_ids.contains("Admin.heading"));
+        assert!(scan.dynamic_usages.is_empty());
+    }
+
+    #[test]
+    fn scopes_dynamic_next_intl_message_object_reads() {
+        let scan = scan(
+            r#"
+            import {useMessages} from 'next-intl';
+            const messages = useMessages();
+            render(messages.Navigation[runtimeKey]);
+            "#,
+        );
+
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| { usage.namespace == "Navigation" && !usage.namespace_unknown })
+        );
+    }
+
+    #[test]
+    fn resolves_re_exported_next_intl_factories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let barrel = dir.path().join("intl.ts");
+        let main = dir.path().join("main.tsx");
+        fs::write(
+            &barrel,
+            r#"
+            export {useTranslations, useMessages} from 'next-intl';
+            export {getTranslations, getMessages} from 'next-intl/server';
+            "#,
+        )
+        .expect("write barrel");
+        fs::write(
+            &main,
+            r#"
+            import {useTranslations as useT, useMessages} from './intl';
+            import * as intl from './intl';
+            const t = useT('common');
+            t(runtimeKey);
+            render(useMessages().Navigation.title);
+            const serverT = await intl.getTranslations('admin');
+            serverT('heading');
+            render((await intl.getMessages()).Footer.copy);
+            "#,
+        )
+        .expect("write main");
+
+        let scan = collect_usage_from_files(dir.path(), &[main]).expect("scan project");
+        assert!(
+            scan.dynamic_usages
+                .iter()
+                .any(|usage| usage.namespace == "common")
+        );
+        assert!(scan.used_ids.contains("Navigation.title"));
+        assert!(scan.used_ids.contains("admin.heading"));
+        assert!(scan.used_ids.contains("Footer.copy"));
     }
 
     #[test]
