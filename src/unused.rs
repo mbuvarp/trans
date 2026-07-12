@@ -11021,6 +11021,10 @@ impl SourceIndexCollector {
         } else {
             return summary;
         };
+        let unknown_layout = call
+            .arguments
+            .iter()
+            .any(|argument| matches!(argument, Argument::SpreadElement(_)));
         summary.bound_calls.push(WrapperBoundCall {
             namespace: namespace.clone(),
             name: target.clone(),
@@ -11035,11 +11039,7 @@ impl SourceIndexCollector {
                         .unwrap_or_default()
                 })
                 .collect(),
-            unknown_layout: call
-                .arguments
-                .iter()
-                .skip(1)
-                .any(|argument| matches!(argument, Argument::SpreadElement(_))),
+            unknown_layout,
         });
         if namespace.is_some() {
             return summary;
@@ -13558,33 +13558,68 @@ impl SourceUsageCollector {
         &self,
         call: &CallExpression<'_>,
     ) -> Option<BTreeSet<usize>> {
-        if let Some(identifier) = call.callee.get_identifier_reference()
-            && let (Some(project), Some(file)) = (&self.project, &self.file_index)
+        let mut target = &call.callee;
+        let mut argument_offset = 0;
+        let mut apply = false;
+        if let Some(member) = call.callee.get_member_expr() {
+            match member.static_property_name() {
+                Some("call") => {
+                    target = member.object();
+                    argument_offset = 1;
+                }
+                Some("apply") => {
+                    target = member.object();
+                    apply = true;
+                }
+                _ => {}
+            }
+        }
+        if let Some((mut indexes, parameter_indexes)) =
+            self.wrapper_array_resolution_for_callee(target)
         {
-            let name = identifier.name.as_str();
-            let target = file.imports.get(name);
-            let mut indexes = project
-                .wrapper_array_indexes_for_local(&self.path, name)
-                .or_else(|| {
-                    target.and_then(|target| {
-                        project.wrapper_array_indexes_for_import(&self.path, target)
-                    })
-                })
-                .unwrap_or_default();
-            let parameter_indexes = if let Some(target) = target {
-                project.wrapper_array_parameter_indexes_for_import(&self.path, target)
-            } else {
-                project.wrapper_array_parameter_indexes_for_local(&self.path, name)
-            };
+            let unknown_layout = call
+                .arguments
+                .iter()
+                .any(|argument| matches!(argument, Argument::SpreadElement(_)));
             for (index, params) in parameter_indexes {
-                if params.into_iter().any(|param_index| {
-                    call.arguments
-                        .get(param_index)
+                let wrapper_argument = if unknown_layout {
+                    true
+                } else if apply {
+                    match call
+                        .arguments
+                        .get(1)
                         .and_then(Argument::as_expression)
-                        .is_some_and(|argument| {
-                            self.expression_is_wrapper_returning_callable(argument)
-                        })
-                }) {
+                        .map(Expression::get_inner_expression)
+                    {
+                        Some(Expression::ArrayExpression(arguments))
+                            if !arguments.elements.iter().any(|argument| {
+                                matches!(argument, ArrayExpressionElement::SpreadElement(_))
+                            }) =>
+                        {
+                            params.into_iter().any(|param_index| {
+                                arguments
+                                    .elements
+                                    .get(param_index)
+                                    .and_then(ArrayExpressionElement::as_expression)
+                                    .is_some_and(|argument| {
+                                        self.expression_is_wrapper_returning_callable(argument)
+                                    })
+                            })
+                        }
+                        Some(_) => true,
+                        None => false,
+                    }
+                } else {
+                    params.into_iter().any(|param_index| {
+                        call.arguments
+                            .get(param_index + argument_offset)
+                            .and_then(Argument::as_expression)
+                            .is_some_and(|argument| {
+                                self.expression_is_wrapper_returning_callable(argument)
+                            })
+                    })
+                };
+                if wrapper_argument {
                     indexes.insert(index);
                 }
             }
@@ -13622,6 +13657,44 @@ impl SourceUsageCollector {
                 })
                 .collect(),
         )
+    }
+
+    fn wrapper_array_resolution_for_callee(
+        &self,
+        callee: &Expression<'_>,
+    ) -> Option<(BTreeSet<usize>, BTreeMap<usize, BTreeSet<usize>>)> {
+        let (project, file) = (self.project.as_ref()?, self.file_index.as_ref()?);
+        if let Some(identifier) = callee.get_identifier_reference() {
+            let name = identifier.name.as_str();
+            let imported = file.imports.get(name);
+            let indexes = project
+                .wrapper_array_indexes_for_local(&self.path, name)
+                .or_else(|| {
+                    imported.and_then(|target| {
+                        project.wrapper_array_indexes_for_import(&self.path, target)
+                    })
+                })
+                .unwrap_or_default();
+            let parameters = imported.map_or_else(
+                || project.wrapper_array_parameter_indexes_for_local(&self.path, name),
+                |target| project.wrapper_array_parameter_indexes_for_import(&self.path, target),
+            );
+            return Some((indexes, parameters));
+        }
+        let member = callee.get_member_expr()?;
+        let namespace = member.object().get_identifier_reference()?;
+        let name = member.static_property_name()?;
+        let source = file.namespace_imports.get(namespace.name.as_str())?;
+        let target = ImportTarget {
+            source: source.clone(),
+            imported: ImportedName::Named(name.to_string()),
+        };
+        Some((
+            project
+                .wrapper_array_indexes_for_import(&self.path, &target)
+                .unwrap_or_default(),
+            project.wrapper_array_parameter_indexes_for_import(&self.path, &target),
+        ))
     }
 
     fn expression_is_wrapper_returning_callable(&self, expression: &Expression<'_>) -> bool {
@@ -22820,6 +22893,75 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(lines.contains(&8), "dynamic lines: {lines:?}");
         assert!(!lines.contains(&9), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn first_position_bind_spreads_conservatively_preserve_wrapper_indexes() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            const bound = aggregate.bind(...[null, useBaseValues]);
+            const [values, cleanup] = await bound();
+            values[0](runtimeKey);
+            cleanup('layer');
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&7), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&8), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn call_time_spreads_conservatively_preserve_wrapper_indexes() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            const [values, cleanup] = await aggregate(...[useBaseValues]);
+            values[0](runtimeKey);
+            cleanup('layer');
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&7), "dynamic lines: {lines:?}");
+    }
+
+    #[test]
+    fn call_and_apply_preserve_wrapper_parameter_indexes() {
+        let scan = scan(
+            r#"
+            import {useMemo} from 'react';
+            function useBaseValues() { return useMemo(() => runtimeValues(), []); }
+            async function aggregate(factory) { return Promise.all([factory(), draw]); }
+            const [called, callCleanup] = await aggregate.call(null, useBaseValues);
+            called[0](callKey);
+            callCleanup('call-layer');
+            const appliedResult = await aggregate.apply(null, [useBaseValues]);
+            appliedResult[0][0](applyKey);
+            appliedResult[1]('apply-layer');
+            "#,
+        );
+        let lines = scan
+            .dynamic_usages
+            .iter()
+            .map(|usage| usage.line)
+            .collect::<BTreeSet<_>>();
+        assert!(lines.contains(&6), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&7), "dynamic lines: {lines:?}");
+        assert!(lines.contains(&9), "dynamic lines: {lines:?}");
+        assert!(!lines.contains(&10), "dynamic lines: {lines:?}");
     }
 
     #[test]
