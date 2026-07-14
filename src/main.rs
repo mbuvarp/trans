@@ -25,7 +25,7 @@ use trans::interactive::{
 };
 use trans::operations::{
     add_language, add_translation, change_message_id, delete_language, delete_translation,
-    update_translation,
+    sort_translation_files, update_translation,
 };
 use trans::query::{
     FindMatchKind, find_translations, get_translation, get_translations_all, has_message_id,
@@ -459,6 +459,13 @@ fn run() -> Result<()> {
                     process::exit(1);
                 }
             }
+        }
+        Some(Command::Sort) => {
+            let root = config_root(&effective_cwd)?;
+            let config = TransConfig::load_from_root(&root)?;
+            let sorted = sort_translation_files(&root, &config)?;
+            println!("Sorted {sorted} translation files.");
+            Ok(())
         }
         Some(Command::Unused {
             keys,

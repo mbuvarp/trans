@@ -312,6 +312,13 @@ pub fn replace_default_untranslated_value(
     Ok(replaced)
 }
 
+pub fn sort_translation_files(root: impl AsRef<Path>, config: &TransConfig) -> Result<usize> {
+    let root = root.as_ref();
+    let snapshot = snapshot_translations(root, config)?;
+    write_snapshot(root, config, &snapshot)?;
+    Ok(snapshot.len())
+}
+
 fn validate_values(
     config: &TransConfig,
     values: &TranslationValues,
@@ -523,6 +530,54 @@ mod tests {
 
         let nb = load_language_translations(root, &config, "nb").expect("load nb");
         assert_eq!(nb.get("app.title").map(String::as_str), Some("TODO"));
+    }
+
+    #[test]
+    fn sort_translation_files_sorts_mismatched_react_intl_files() {
+        let dir = tempdir().expect("tempdir");
+        let config = base_config();
+        let messages = dir.path().join("messages");
+        std::fs::create_dir_all(&messages).expect("mkdir messages");
+        std::fs::write(
+            messages.join("en.json"),
+            "{\n  \"app.zeta\": \"Zeta\",\n  \"app.alpha\": \"Alpha\"\n}\n",
+        )
+        .expect("write en");
+        std::fs::write(
+            messages.join("nb.json"),
+            "{\n  \"other.zeta\": \"Siste\",\n  \"other.alpha\": \"Første\"\n}\n",
+        )
+        .expect("write nb");
+
+        let sorted = sort_translation_files(dir.path(), &config).expect("sort");
+
+        assert_eq!(sorted, 2);
+        assert_eq!(
+            std::fs::read_to_string(messages.join("en.json")).expect("read en"),
+            "{\n  \"app.alpha\": \"Alpha\",\n  \"app.zeta\": \"Zeta\"\n}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(messages.join("nb.json")).expect("read nb"),
+            "{\n  \"other.alpha\": \"Første\",\n  \"other.zeta\": \"Siste\"\n}"
+        );
+    }
+
+    #[test]
+    fn sort_translation_files_loads_every_file_before_writing() {
+        let dir = tempdir().expect("tempdir");
+        let config = base_config();
+        let messages = dir.path().join("messages");
+        std::fs::create_dir_all(&messages).expect("mkdir messages");
+        let original_en = "{\n  \"app.zeta\": \"Zeta\",\n  \"app.alpha\": \"Alpha\"\n}\n";
+        std::fs::write(messages.join("en.json"), original_en).expect("write en");
+        std::fs::write(messages.join("nb.json"), "{ invalid json").expect("write nb");
+
+        sort_translation_files(dir.path(), &config).expect_err("sort should fail");
+
+        assert_eq!(
+            std::fs::read_to_string(messages.join("en.json")).expect("read en"),
+            original_en
+        );
     }
 
     #[test]
