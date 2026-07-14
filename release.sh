@@ -22,6 +22,8 @@ Notes:
   - If the `codex` CLI is available, it is used to draft the changelog; otherwise a local heuristic is used.
   - Successful command output is hidden; captured output is shown when a step fails.
   - After publishing, the script waits up to 120 seconds for the Homebrew update PR.
+  - When the Homebrew PR is available, you can wait for its bottle checks and publish it automatically.
+  - Bottle checks are polled every 10 seconds for up to 30 minutes by default.
   - Do not merge the Homebrew PR directly; publish it with the tap's brew pr-pull workflow.
 USAGE
 }
@@ -32,6 +34,10 @@ cursor_hidden="false"
 step_index=0
 release_url=""
 homebrew_pr_url=""
+homebrew_pr_number=""
+homebrew_pr_head_sha=""
+homebrew_pr_head_branch=""
+homebrew_publish_url=""
 homebrew_tap_repository="${HOMEBREW_TAP_REPOSITORY:-mbuvarp/homebrew-trans}"
 
 if [[ -t 2 && "${TERM:-}" != "dumb" ]]; then
@@ -574,13 +580,24 @@ wait_for_homebrew_pr() {
         --repo "$homebrew_tap_repository" \
         --head "$branch" \
         --state all \
-        --json url \
-        --jq '.[0].url'
+        --json number,url,headRefOid,headRefName \
+        --jq '.[0] | select(. != null) | [.number, .url, .headRefOid, .headRefName] | @tsv'
     )"; then
       return 1
     fi
     if [[ -n "$result" ]]; then
-      homebrew_pr_url="$result"
+      IFS=$'\t' read -r \
+        homebrew_pr_number \
+        homebrew_pr_url \
+        homebrew_pr_head_sha \
+        homebrew_pr_head_branch <<<"$result"
+      if [[ ! "$homebrew_pr_number" =~ ^[0-9]+$ \
+        || ! "$homebrew_pr_head_sha" =~ ^[0-9a-fA-F]{40}$ \
+        || -z "$homebrew_pr_url" \
+        || -z "$homebrew_pr_head_branch" ]]; then
+        echo "Homebrew PR metadata was incomplete: $result" >&2
+        return 1
+      fi
       return 0
     fi
     if ((SECONDS >= deadline)); then
@@ -589,6 +606,176 @@ wait_for_homebrew_pr() {
     sleep "$poll_seconds"
   done
   return 2
+}
+
+evaluate_homebrew_checks() {
+  local checks_json="$1"
+  python3 - "$checks_json" <<'PY'
+import json
+import sys
+
+expected = {
+    "test-bot-macos (macos-15-intel)",
+    "test-bot-macos (macos-26)",
+    "test-bot-linux",
+}
+
+try:
+    checks = json.loads(sys.argv[1])
+except json.JSONDecodeError as error:
+    raise SystemExit(f"Could not parse Homebrew check results: {error}")
+
+by_name = {check.get("name", ""): check.get("bucket", "") for check in checks}
+missing = sorted(expected - by_name.keys())
+failed = sorted(
+    name for name, bucket in by_name.items()
+    if bucket in {"fail", "cancel", "skipping"}
+)
+pending = sorted(name for name, bucket in by_name.items() if bucket != "pass")
+
+if failed:
+    print("failed\tHomebrew checks did not succeed: " + ", ".join(failed))
+elif missing:
+    print("pending\tWaiting for Homebrew checks to appear: " + ", ".join(missing))
+elif pending:
+    print("pending\tWaiting for Homebrew checks: " + ", ".join(pending))
+else:
+    print("passed")
+PY
+}
+
+wait_for_homebrew_checks() {
+  local wait_seconds="${HOMEBREW_CHECK_WAIT_SECONDS:-1800}"
+  local poll_seconds="${HOMEBREW_CHECK_POLL_SECONDS:-10}"
+  local checks=""
+  local evaluation=""
+  local last_message="Waiting for Homebrew checks to appear."
+
+  if [[ ! "$wait_seconds" =~ ^[0-9]+$ \
+    || ! "$poll_seconds" =~ ^[0-9]+$ \
+    || "$poll_seconds" == "0" ]]; then
+    echo "Homebrew check polling intervals must be positive integers." >&2
+    return 1
+  fi
+
+  local deadline=$((SECONDS + wait_seconds))
+  while ((SECONDS <= deadline)); do
+    local check_status=0
+    checks="$(
+      gh pr checks "$homebrew_pr_number" \
+        --repo "$homebrew_tap_repository" \
+        --json name,bucket,state 2>&1
+    )" || check_status=$?
+
+    if [[ "$check_status" -ne 0 && "$check_status" -ne 8 ]]; then
+      if [[ "$checks" == *"no checks reported"* ]]; then
+        checks="[]"
+      elif [[ "$checks" == \[* ]]; then
+        : # Failed checks still produce usable JSON with a non-zero exit status.
+      else
+        printf '%s\n' "$checks" >&2
+        return "$check_status"
+      fi
+    fi
+
+    evaluation="$(evaluate_homebrew_checks "$checks")" || return $?
+    case "${evaluation%%$'\t'*}" in
+      passed)
+        return 0
+        ;;
+      failed)
+        echo "${evaluation#*$'\t'}" >&2
+        return 1
+        ;;
+      pending)
+        last_message="${evaluation#*$'\t'}"
+        ;;
+      *)
+        echo "Unexpected Homebrew check evaluation: $evaluation" >&2
+        return 1
+        ;;
+    esac
+
+    if ((SECONDS >= deadline)); then
+      break
+    fi
+    sleep "$poll_seconds"
+  done
+
+  echo "Timed out after ${wait_seconds} seconds. $last_message" >&2
+  return 2
+}
+
+verify_homebrew_pr_head() {
+  local result
+  result="$(
+    gh pr view "$homebrew_pr_number" \
+      --repo "$homebrew_tap_repository" \
+      --json state,headRefOid,headRefName,headRepository \
+      --jq '[.state, .headRefOid, .headRefName, .headRepository.nameWithOwner] | @tsv'
+  )" || return $?
+
+  local state current_sha current_branch current_repository
+  IFS=$'\t' read -r state current_sha current_branch current_repository <<<"$result"
+  if [[ "$state" != "OPEN" ]]; then
+    echo "Homebrew PR #${homebrew_pr_number} is no longer open." >&2
+    return 1
+  fi
+  if [[ "$current_repository" != "$homebrew_tap_repository" ]]; then
+    echo "Homebrew PR #${homebrew_pr_number} no longer comes from ${homebrew_tap_repository}." >&2
+    return 1
+  fi
+  if [[ "$current_branch" != "$homebrew_pr_head_branch" ]]; then
+    echo "Homebrew PR #${homebrew_pr_number} changed head branch while checks were running." >&2
+    return 1
+  fi
+  if [[ "$current_sha" != "$homebrew_pr_head_sha" ]]; then
+    echo "Homebrew PR #${homebrew_pr_number} changed head SHA while checks were running." >&2
+    return 1
+  fi
+}
+
+dispatch_homebrew_publish() {
+  local output
+  output="$(
+    gh workflow run publish.yml \
+      --repo "$homebrew_tap_repository" \
+      --ref main \
+      --raw-field "pull_request=${homebrew_pr_number}" \
+      --raw-field "head_sha=${homebrew_pr_head_sha}"
+  )" || return $?
+
+  homebrew_publish_url="$(printf '%s\n' "$output" | sed -nE 's#.*(https://github.com/[^[:space:]]+/actions/runs/[0-9]+).*#\1#p' | tail -n 1)"
+  if [[ -z "$homebrew_publish_url" ]]; then
+    echo "The brew pr-pull workflow was dispatched, but its run URL was not returned." >&2
+    return 1
+  fi
+}
+
+watch_homebrew_publish() {
+  local poll_seconds="${HOMEBREW_CHECK_POLL_SECONDS:-10}"
+  local run_id="${homebrew_publish_url##*/}"
+  gh run watch "$run_id" \
+    --repo "$homebrew_tap_repository" \
+    --exit-status \
+    --compact \
+    --interval "$poll_seconds"
+}
+
+offer_homebrew_publish() {
+  local reply=""
+  echo
+  printf "Wait for bottle checks and publish with brew pr-pull? [y/N] " >&2
+  read -r reply || reply=""
+  if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+    print_warning "Leave Homebrew bottle publishing for manual completion"
+    return 0
+  fi
+
+  run_step "Wait for Homebrew bottle checks" wait_for_homebrew_checks
+  run_step "Verify reviewed Homebrew PR head" verify_homebrew_pr_head
+  run_step "Start brew pr-pull workflow" dispatch_homebrew_publish
+  run_step "Wait for brew pr-pull workflow" watch_homebrew_publish
 }
 
 find_homebrew_pr_step() {
@@ -634,9 +821,18 @@ if [[ -n "$homebrew_pr_url" ]]; then
 else
   echo "Homebrew PR: not available yet"
 fi
+
+if [[ -n "$homebrew_pr_url" ]]; then
+  offer_homebrew_publish
+fi
+
 echo
 echo "Homebrew bottle publishing:"
 echo "  Do not merge the Homebrew PR directly."
-echo "  After all bottle checks pass, run the brew pr-pull workflow:"
-echo "  https://github.com/${homebrew_tap_repository}/actions/workflows/publish.yml"
-echo "  Enter the Homebrew PR number and its reviewed head SHA."
+if [[ -n "$homebrew_publish_url" ]]; then
+  echo "  Published with brew pr-pull: $homebrew_publish_url"
+else
+  echo "  After all bottle checks pass, run the brew pr-pull workflow:"
+  echo "  https://github.com/${homebrew_tap_repository}/actions/workflows/publish.yml"
+  echo "  Enter the Homebrew PR number and its reviewed head SHA."
+fi
