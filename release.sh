@@ -619,9 +619,8 @@ else
   print_ok "Cargo version is already $cargo_version"
 fi
 
-run_step "Push release commit to main" git push origin main
 run_step "Create tag $version" git tag "$version"
-run_step "Push tag $version" git push origin "$version"
+run_step "Push release commit and tag" git push --atomic origin main "$version"
 run_step "Create GitHub release" create_github_release
 find_homebrew_pr_step
 
