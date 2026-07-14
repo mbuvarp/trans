@@ -273,9 +273,9 @@ if [[ "$dry_run" == "true" && (-n "$notes" || -n "$notes_file") ]]; then
 fi
 
 resolve_release_version() {
-  current_version="$(current_cargo_version)"
+  current_version="$(current_cargo_version)" || return $?
   if [[ "$requested_version" == "patch" || "$requested_version" == "minor" || "$requested_version" == "major" ]]; then
-    next_cargo_version="$(bump_cargo_version "$current_version" "$requested_version")"
+    next_cargo_version="$(bump_cargo_version "$current_version" "$requested_version")" || return $?
     version="v${next_cargo_version}"
   fi
 }
@@ -322,7 +322,7 @@ prepare_changelog() {
   fi
 
   local commits
-  commits="$(git log "$range" --pretty=%s --no-merges)"
+  commits="$(git log "$range" --pretty=%s --no-merges)" || return $?
 
   if command -v codex >/dev/null 2>&1; then
     local prompt
@@ -380,7 +380,7 @@ print("\n".join(out))
 PY
 )"
       if [[ -n "${cleaned// }" ]]; then
-        printf "%s\n" "$cleaned" >"$tmp_file"
+        printf "%s\n" "$cleaned" >"$tmp_file" || return $?
         return 0
       fi
     fi
@@ -511,22 +511,22 @@ PY
 }
 
 commit_release_version() {
-  git add Cargo.toml Cargo.lock
+  git add Cargo.toml Cargo.lock || return $?
   git commit -m "chore: release ${version}"
 }
 
 create_github_release() {
   local output
   if [[ -n "$notes_file" ]]; then
-    output="$(gh release create "$version" --title "$version" --notes-file "$notes_file")"
+    output="$(gh release create "$version" --title "$version" --notes-file "$notes_file")" || return $?
   elif [[ -n "$notes" ]]; then
-    output="$(gh release create "$version" --title "$version" --notes "$notes")"
+    output="$(gh release create "$version" --title "$version" --notes "$notes")" || return $?
   else
-    output="$(gh release create "$version" --title "$version" --generate-notes)"
+    output="$(gh release create "$version" --title "$version" --generate-notes)" || return $?
   fi
   release_url="${output##*$'\n'}"
   if [[ "$release_url" != http://* && "$release_url" != https://* ]]; then
-    release_url="$(gh release view "$version" --json url --jq .url)"
+    release_url="$(gh release view "$version" --json url --jq .url)" || return $?
   fi
 }
 
