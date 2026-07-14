@@ -38,6 +38,7 @@ homebrew_pr_number=""
 homebrew_pr_head_sha=""
 homebrew_pr_head_branch=""
 homebrew_publish_url=""
+homebrew_publish_dispatched="false"
 homebrew_tap_repository="${HOMEBREW_TAP_REPOSITORY:-mbuvarp/homebrew-trans}"
 
 if [[ -t 2 && "${TERM:-}" != "dumb" ]]; then
@@ -736,6 +737,24 @@ verify_homebrew_pr_head() {
 }
 
 dispatch_homebrew_publish() {
+  local actor=""
+  local existing_run_ids=""
+  local run_snapshot_available="false"
+  if actor="$(gh api user --jq .login 2>/dev/null)" \
+    && existing_run_ids="$(
+      gh run list \
+        --repo "$homebrew_tap_repository" \
+        --workflow publish.yml \
+        --event workflow_dispatch \
+        --branch main \
+        --user "$actor" \
+        --limit 20 \
+        --json databaseId \
+        --jq '.[].databaseId' 2>/dev/null
+    )"; then
+    run_snapshot_available="true"
+  fi
+
   local output
   output="$(
     gh workflow run publish.yml \
@@ -744,12 +763,68 @@ dispatch_homebrew_publish() {
       --raw-field "pull_request=${homebrew_pr_number}" \
       --raw-field "head_sha=${homebrew_pr_head_sha}"
   )" || return $?
+  homebrew_publish_dispatched="true"
 
   homebrew_publish_url="$(printf '%s\n' "$output" | sed -nE 's#.*(https://github.com/[^[:space:]]+/actions/runs/[0-9]+).*#\1#p' | tail -n 1)"
-  if [[ -z "$homebrew_publish_url" ]]; then
-    echo "The brew pr-pull workflow was dispatched, but its run URL was not returned." >&2
+  if [[ -z "$homebrew_publish_url" && "$run_snapshot_available" == "true" ]]; then
+    find_dispatched_homebrew_run "$actor" "$existing_run_ids" || true
+  fi
+}
+
+find_dispatched_homebrew_run() {
+  local actor="$1"
+  local existing_run_ids="$2"
+  local wait_seconds="${HOMEBREW_RUN_LOOKUP_WAIT_SECONDS:-30}"
+  local poll_seconds="${HOMEBREW_RUN_LOOKUP_POLL_SECONDS:-2}"
+
+  if [[ ! "$wait_seconds" =~ ^[0-9]+$ \
+    || ! "$poll_seconds" =~ ^[0-9]+$ \
+    || "$poll_seconds" == "0" ]]; then
     return 1
   fi
+
+  local deadline=$((SECONDS + wait_seconds))
+  while ((SECONDS <= deadline)); do
+    local runs
+    runs="$(
+      gh run list \
+        --repo "$homebrew_tap_repository" \
+        --workflow publish.yml \
+        --event workflow_dispatch \
+        --branch main \
+        --user "$actor" \
+        --limit 20 \
+        --json databaseId,url \
+        --jq '.[] | [.databaseId, .url] | @tsv'
+    )" || return $?
+
+    local new_run_count=0
+    local new_run_url=""
+    local run_id run_url
+    while IFS=$'\t' read -r run_id run_url; do
+      if [[ -z "$run_id" ]]; then
+        continue
+      fi
+      if ! printf '%s\n' "$existing_run_ids" | grep -Fxq "$run_id"; then
+        new_run_count=$((new_run_count + 1))
+        new_run_url="$run_url"
+      fi
+    done <<<"$runs"
+
+    if [[ "$new_run_count" -eq 1 && -n "$new_run_url" ]]; then
+      homebrew_publish_url="$new_run_url"
+      return 0
+    fi
+    if [[ "$new_run_count" -gt 1 ]]; then
+      return 2
+    fi
+    if ((SECONDS >= deadline)); then
+      break
+    fi
+    sleep "$poll_seconds"
+  done
+
+  return 3
 }
 
 watch_homebrew_publish() {
@@ -775,7 +850,11 @@ offer_homebrew_publish() {
   run_step "Wait for Homebrew bottle checks" wait_for_homebrew_checks
   run_step "Verify reviewed Homebrew PR head" verify_homebrew_pr_head
   run_step "Start brew pr-pull workflow" dispatch_homebrew_publish
-  run_step "Wait for brew pr-pull workflow" watch_homebrew_publish
+  if [[ -n "$homebrew_publish_url" ]]; then
+    run_step "Wait for brew pr-pull workflow" watch_homebrew_publish
+  else
+    print_warning "brew pr-pull started; run URL is not available"
+  fi
 }
 
 find_homebrew_pr_step() {
@@ -831,6 +910,9 @@ echo "Homebrew bottle publishing:"
 echo "  Do not merge the Homebrew PR directly."
 if [[ -n "$homebrew_publish_url" ]]; then
   echo "  Published with brew pr-pull: $homebrew_publish_url"
+elif [[ "$homebrew_publish_dispatched" == "true" ]]; then
+  echo "  The brew pr-pull workflow was dispatched, but its run URL is unavailable."
+  echo "  Check its status at https://github.com/${homebrew_tap_repository}/actions/workflows/publish.yml"
 else
   echo "  After all bottle checks pass, run the brew pr-pull workflow:"
   echo "  https://github.com/${homebrew_tap_repository}/actions/workflows/publish.yml"

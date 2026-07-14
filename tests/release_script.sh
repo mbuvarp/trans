@@ -110,8 +110,28 @@ case "${1:-} ${2:-}" in
       "${MOCK_PR_BRANCH:-update-trans-v0.1.1}" \
       "${MOCK_PR_REPOSITORY:-mbuvarp/homebrew-trans}"
     ;;
+  "api user")
+    echo "mbuvarp"
+    ;;
+  "run list")
+    if [[ " $* " == *" --json databaseId "* ]]; then
+      echo "111111111"
+    else
+      printf '%s\t%s\n' "111111111" "https://github.com/mbuvarp/homebrew-trans/actions/runs/111111111"
+      if [[ -n "${MOCK_DISPATCH_MARKER:-}" \
+        && -f "$MOCK_DISPATCH_MARKER" \
+        && "${MOCK_RUN_LOOKUP_MODE:-found}" == "found" ]]; then
+        printf '%s\t%s\n' "987654321" "https://github.com/mbuvarp/homebrew-trans/actions/runs/987654321"
+      fi
+    fi
+    ;;
   "workflow run")
-    echo "https://github.com/mbuvarp/homebrew-trans/actions/runs/987654321"
+    if [[ -n "${MOCK_DISPATCH_MARKER:-}" ]]; then
+      : >"$MOCK_DISPATCH_MARKER"
+    fi
+    if [[ "${MOCK_WORKFLOW_URL:-return}" == "return" ]]; then
+      echo "https://github.com/mbuvarp/homebrew-trans/actions/runs/987654321"
+    fi
     ;;
   "run watch")
     if [[ "${MOCK_PUBLISH_RESULT:-success}" == "failure" ]]; then
@@ -342,6 +362,65 @@ test_automated_homebrew_publish_waits_and_dispatches() {
     || fail "brew pr-pull workflow was not watched"
 }
 
+test_missing_dispatch_url_finds_and_watches_new_run() {
+  local fixture
+  fixture="$(create_fixture dispatch-url-fallback)"
+  local gh_log="$fixture/gh.log"
+  local dispatch_marker="$fixture/dispatched"
+  local output
+  output="$(
+    cd "$fixture"
+    printf 'y\n' | env \
+      MOCK_PR_URL="https://github.com/mbuvarp/homebrew-trans/pull/123" \
+      MOCK_WORKFLOW_URL=omit \
+      MOCK_DISPATCH_MARKER="$dispatch_marker" \
+      MOCK_GH_LOG="$gh_log" \
+      PATH="$fixture/mock-bin:$PATH" \
+      ./release.sh v0.1.1 --notes "Notes" 2>&1
+  )"
+
+  assert_contains "$output" "ok  Start brew pr-pull workflow"
+  assert_contains "$output" "ok  Wait for brew pr-pull workflow"
+  assert_contains "$output" "Published with brew pr-pull: https://github.com/mbuvarp/homebrew-trans/actions/runs/987654321"
+  grep -q "run watch 987654321" "$gh_log" \
+    || fail "fallback publish run was not watched"
+  if [[ "$(grep -c '^workflow run ' "$gh_log")" -ne 1 ]]; then
+    fail "fallback dispatched the brew pr-pull workflow more than once"
+  fi
+}
+
+test_unresolved_dispatch_url_reports_started_workflow() {
+  local fixture
+  fixture="$(create_fixture dispatch-url-unresolved)"
+  local gh_log="$fixture/gh.log"
+  local dispatch_marker="$fixture/dispatched"
+  local output
+  output="$(
+    cd "$fixture"
+    printf 'y\n' | env \
+      MOCK_PR_URL="https://github.com/mbuvarp/homebrew-trans/pull/123" \
+      MOCK_WORKFLOW_URL=omit \
+      MOCK_DISPATCH_MARKER="$dispatch_marker" \
+      MOCK_RUN_LOOKUP_MODE=missing \
+      MOCK_GH_LOG="$gh_log" \
+      HOMEBREW_RUN_LOOKUP_WAIT_SECONDS=0 \
+      PATH="$fixture/mock-bin:$PATH" \
+      ./release.sh v0.1.1 --notes "Notes" 2>&1
+  )"
+
+  assert_contains "$output" "ok  Start brew pr-pull workflow"
+  assert_contains "$output" "--  brew pr-pull started; run URL is not available"
+  assert_contains "$output" "The brew pr-pull workflow was dispatched, but its run URL is unavailable."
+  assert_contains "$output" "Check its status at https://github.com/mbuvarp/homebrew-trans/actions/workflows/publish.yml"
+  assert_not_contains "$output" "After all bottle checks pass, run the brew pr-pull workflow:"
+  if grep -q "run watch" "$gh_log"; then
+    fail "release attempted to watch an unidentified workflow run"
+  fi
+  if [[ "$(grep -c '^workflow run ' "$gh_log")" -ne 1 ]]; then
+    fail "missing run URL caused a duplicate brew pr-pull dispatch"
+  fi
+}
+
 test_failed_homebrew_check_prevents_publish() {
   local fixture
   fixture="$(create_fixture failed-check)"
@@ -414,6 +493,8 @@ test_remote_tag_is_rejected_before_main_push
 test_atomic_push_rejection_keeps_remote_unchanged
 test_release_hides_noise_and_prints_pr
 test_automated_homebrew_publish_waits_and_dispatches
+test_missing_dispatch_url_finds_and_watches_new_run
+test_unresolved_dispatch_url_reports_started_workflow
 test_failed_homebrew_check_prevents_publish
 test_changed_homebrew_head_prevents_publish
 test_missing_pr_is_non_fatal
