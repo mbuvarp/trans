@@ -416,6 +416,7 @@ pub enum ConfigField {
     RequiredLanguages,
     PrimaryLanguage,
     DefaultUntranslatedValue,
+    NewlineAtEndOfFile,
     DefaultExportFormat,
     ExcelPassword,
     RunUpdateCheck,

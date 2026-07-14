@@ -165,6 +165,8 @@ pub fn init_config_interactive(
         .interact_text()?;
     print_spacer();
 
+    let newline_at_end_of_file = prompt_newline_at_end_of_file(false)?;
+
     let default_export_format = prompt_default_export_format(ExportFormat::Excel)?;
 
     print_label("Run update check after successful commands");
@@ -188,7 +190,7 @@ pub fn init_config_interactive(
         required_languages,
         primary_language,
         default_untranslated_value,
-        newline_at_end_of_file: false,
+        newline_at_end_of_file,
         default_export_format,
         excel_password: "unlock".to_string(),
         run_update_check,
@@ -274,6 +276,8 @@ pub fn configure_root_interactive(root: impl AsRef<Path>) -> Result<()> {
         .interact_text()?;
     print_spacer();
 
+    let newline_at_end_of_file = prompt_newline_at_end_of_file(config.newline_at_end_of_file)?;
+
     let default_export_format = prompt_default_export_format(config.default_export_format)?;
 
     print_label("Run update check after successful commands");
@@ -289,6 +293,7 @@ pub fn configure_root_interactive(root: impl AsRef<Path>) -> Result<()> {
     config.required_languages = required_languages;
     config.primary_language = primary_language;
     config.default_untranslated_value = default_untranslated_value;
+    config.newline_at_end_of_file = newline_at_end_of_file;
     config.default_export_format = default_export_format;
     config.run_update_check = run_update_check;
 
@@ -530,6 +535,9 @@ pub fn configure_edit_interactive(
                 false
             };
 
+            let newline_at_end_of_file =
+                prompt_newline_at_end_of_file(config.newline_at_end_of_file)?;
+
             let default_export_format = prompt_default_export_format(config.default_export_format)?;
 
             print_label("Run update check after successful commands");
@@ -558,6 +566,7 @@ pub fn configure_edit_interactive(
             config.required_languages = required_languages;
             config.primary_language = primary_language;
             config.default_untranslated_value = default_untranslated_value;
+            config.newline_at_end_of_file = newline_at_end_of_file;
             config.default_export_format = default_export_format;
             config.run_update_check = run_update_check;
             config.ai = ai;
@@ -683,6 +692,10 @@ pub fn configure_edit_interactive(
                 )?;
                 println!("Replaced {replaced} values.");
             }
+        }
+        Some(ConfigField::NewlineAtEndOfFile) => {
+            config.newline_at_end_of_file =
+                prompt_newline_at_end_of_file(config.newline_at_end_of_file)?;
         }
         Some(ConfigField::DefaultExportFormat) => {
             config.default_export_format =
@@ -960,6 +973,16 @@ fn prompt_default_export_format(current: ExportFormat) -> Result<ExportFormat> {
         0 => ExportFormat::Excel,
         _ => ExportFormat::Csv,
     })
+}
+
+fn prompt_newline_at_end_of_file(current: bool) -> Result<bool> {
+    print_label("End saved translation files with a newline");
+    let enabled = Confirm::new()
+        .with_prompt(">")
+        .default(current)
+        .interact()?;
+    print_spacer();
+    Ok(enabled)
 }
 
 fn prompt_mode(current: ConfigMode) -> Result<ConfigMode> {
