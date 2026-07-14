@@ -19,7 +19,143 @@ Notes:
   - Cargo.toml and Cargo.lock are updated and committed automatically when needed.
   - If no notes are provided, a changelog draft is generated and you will be prompted to approve/edit it.
   - If the `codex` CLI is available, it is used to draft the changelog; otherwise a local heuristic is used.
+  - Successful command output is hidden; captured output is shown when a step fails.
+  - After publishing, the script waits up to 120 seconds for the Homebrew update PR.
 USAGE
+}
+
+progress_tmp_dir=""
+spinner_pid=""
+cursor_hidden="false"
+step_index=0
+release_url=""
+homebrew_pr_url=""
+
+if [[ -t 2 && "${TERM:-}" != "dumb" ]]; then
+  progress_is_tty="true"
+else
+  progress_is_tty="false"
+fi
+
+if [[ "$progress_is_tty" == "true" && -z "${NO_COLOR:-}" ]]; then
+  color_green=$'\033[32m'
+  color_red=$'\033[31m'
+  color_yellow=$'\033[33m'
+  color_cyan=$'\033[36m'
+  color_reset=$'\033[0m'
+else
+  color_green=""
+  color_red=""
+  color_yellow=""
+  color_cyan=""
+  color_reset=""
+fi
+
+cleanup_progress() {
+  if [[ -n "$spinner_pid" ]]; then
+    kill "$spinner_pid" >/dev/null 2>&1 || true
+    wait "$spinner_pid" 2>/dev/null || true
+    spinner_pid=""
+  fi
+  if [[ "$cursor_hidden" == "true" ]]; then
+    printf '\033[?25h' >&2
+    cursor_hidden="false"
+  fi
+  if [[ -n "$progress_tmp_dir" && -d "$progress_tmp_dir" ]]; then
+    rm -rf "$progress_tmp_dir"
+  fi
+}
+
+trap cleanup_progress EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+status_line() {
+  local status="$1"
+  local color="$2"
+  local label="$3"
+  printf "  %s%s%s  %s\n" "$color" "$status" "$color_reset" "$label" >&2
+}
+
+print_ok() {
+  status_line "ok" "$color_green" "$1"
+}
+
+print_warning() {
+  status_line "--" "$color_yellow" "$1"
+}
+
+print_failure() {
+  status_line "failed" "$color_red" "$1"
+}
+
+spinner_loop() {
+  local label="$1"
+  local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+  local index=0
+  trap 'exit 0' INT TERM
+  while true; do
+    printf "\r\033[2K  %s%s%s  %s" \
+      "$color_cyan" "${frames[$index]}" "$color_reset" "$label" >&2
+    index=$(((index + 1) % ${#frames[@]}))
+    sleep 0.08
+  done
+}
+
+start_step() {
+  local label="$1"
+  if [[ "$progress_is_tty" == "true" ]]; then
+    printf '\033[?25l' >&2
+    cursor_hidden="true"
+    spinner_loop "$label" &
+    spinner_pid=$!
+  else
+    status_line ".." "" "$label"
+  fi
+}
+
+finish_step() {
+  local status="$1"
+  local label="$2"
+  if [[ -n "$spinner_pid" ]]; then
+    kill "$spinner_pid" >/dev/null 2>&1 || true
+    wait "$spinner_pid" 2>/dev/null || true
+    spinner_pid=""
+  fi
+  if [[ "$progress_is_tty" == "true" ]]; then
+    printf '\r\033[2K\033[?25h' >&2
+    cursor_hidden="false"
+  fi
+  case "$status" in
+    ok) print_ok "$label" ;;
+    warning) print_warning "$label" ;;
+    failed) print_failure "$label" ;;
+  esac
+}
+
+show_step_log() {
+  local log_file="$1"
+  if [[ -s "$log_file" ]]; then
+    printf "\nStep output:\n" >&2
+    sed 's/^/  /' "$log_file" >&2
+  fi
+}
+
+run_step() {
+  local label="$1"
+  shift
+  step_index=$((step_index + 1))
+  local log_file="${progress_tmp_dir}/step-${step_index}.log"
+  start_step "$label"
+  if "$@" >"$log_file" 2>&1; then
+    finish_step ok "$label"
+    return 0
+  else
+    local status=$?
+    finish_step failed "$label"
+    show_step_log "$log_file"
+    return "$status"
+  fi
 }
 
 if [[ ${1:-} == "" || ${1:-} == "-h" || ${1:-} == "--help" ]]; then
@@ -57,20 +193,24 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if ! command -v gh >/dev/null 2>&1; then
-  echo "gh CLI is required. Install from https://cli.github.com" >&2
-  exit 1
-fi
+progress_tmp_dir="$(mktemp -d -t trans-release.XXXXXX)"
 
-if ! command -v git >/dev/null 2>&1; then
-  echo "git is required." >&2
-  exit 1
-fi
+validate_tools() {
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "gh CLI is required. Install from https://cli.github.com" >&2
+    return 1
+  fi
+  if ! command -v git >/dev/null 2>&1; then
+    echo "git is required." >&2
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required to update Cargo.toml." >&2
+    return 1
+  fi
+}
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 is required to update Cargo.toml." >&2
-  exit 1
-fi
+run_step "Check release tools" validate_tools
 
 current_cargo_version() {
   python3 - <<'PY'
@@ -132,11 +272,33 @@ if [[ "$dry_run" == "true" && (-n "$notes" || -n "$notes_file") ]]; then
   exit 1
 fi
 
-current_version="$(current_cargo_version)"
+resolve_release_version() {
+  current_version="$(current_cargo_version)" || return $?
+  if [[ "$requested_version" == "patch" || "$requested_version" == "minor" || "$requested_version" == "major" ]]; then
+    next_cargo_version="$(bump_cargo_version "$current_version" "$requested_version")" || return $?
+    version="v${next_cargo_version}"
+  fi
+}
+
+validate_release_state() {
+  if [[ -n "$notes_file" && ! -f "$notes_file" ]]; then
+    echo "Release notes file does not exist: $notes_file" >&2
+    return 1
+  fi
+  if [[ -n "$(git status --porcelain)" ]]; then
+    echo "Working tree is dirty. Commit or stash changes first." >&2
+    return 1
+  fi
+  if git rev-parse --verify "refs/tags/${version}" >/dev/null 2>&1; then
+    echo "Tag $version already exists." >&2
+    return 1
+  fi
+}
+
+run_step "Resolve release version" resolve_release_version
 
 if [[ "$requested_version" == "patch" || "$requested_version" == "minor" || "$requested_version" == "major" ]]; then
-  next_cargo_version="$(bump_cargo_version "$current_version" "$requested_version")"
-  version="v${next_cargo_version}"
+  echo
   echo "Bump mode: $requested_version"
   echo "Current version: v${current_version}"
   echo "Version to release: ${version}"
@@ -148,15 +310,7 @@ if [[ "$requested_version" == "patch" || "$requested_version" == "minor" || "$re
   fi
 fi
 
-if [[ -n "$(git status --porcelain)" ]]; then
-  echo "Working tree is dirty. Commit or stash changes first." >&2
-  exit 1
-fi
-
-if git rev-parse "$version" >/dev/null 2>&1; then
-  echo "Tag $version already exists." >&2
-  exit 1
-fi
+run_step "Validate release state" validate_release_state
 
 prepare_changelog() {
   local tmp_file="$1"
@@ -168,7 +322,7 @@ prepare_changelog() {
   fi
 
   local commits
-  commits="$(git log "$range" --pretty=%s --no-merges)"
+  commits="$(git log "$range" --pretty=%s --no-merges)" || return $?
 
   if command -v codex >/dev/null 2>&1; then
     local prompt
@@ -186,10 +340,10 @@ PROMPT
     ai_output="$(codex exec "${prompt}"$'\n'"${commits}")" || true
     if [[ -n "${ai_output// }" ]]; then
       local cleaned
-      cleaned="$(printf "%s\n" "$ai_output" | python3 - <<'PY'
+      cleaned="$(python3 - "$ai_output" <<'PY'
 import sys
 
-lines = sys.stdin.read().splitlines()
+lines = sys.argv[1].splitlines()
 start = None
 for idx, line in enumerate(lines):
   if line.startswith("#"):
@@ -226,7 +380,7 @@ print("\n".join(out))
 PY
 )"
       if [[ -n "${cleaned// }" ]]; then
-        printf "%s\n" "$cleaned" >"$tmp_file"
+        printf "%s\n" "$cleaned" >"$tmp_file" || return $?
         return 0
       fi
     fi
@@ -307,22 +461,26 @@ approve_changelog() {
 }
 
 if [[ -z "$notes" && -z "$notes_file" ]]; then
-  tmp_notes="$(mktemp -t trans-release-notes.XXXXXX)"
-  trap 'rm -f "$tmp_notes"' EXIT
-  prepare_changelog "$tmp_notes"
+  tmp_notes="${progress_tmp_dir}/release-notes.md"
+  run_step "Prepare changelog" prepare_changelog "$tmp_notes"
   approve_changelog "$tmp_notes"
   notes_file="$tmp_notes"
+elif [[ -n "$notes_file" ]]; then
+  print_ok "Use release notes from $notes_file"
+else
+  print_ok "Use supplied release notes"
 fi
 
 if [[ "$dry_run" == "true" ]]; then
+  print_ok "Complete dry run"
+  echo
   echo "Dry run complete. No version bump, tag, or release created."
   exit 0
 fi
 
 cargo_version="${version#v}"
 
-if [[ "$current_version" != "$cargo_version" ]]; then
-  echo "Updating Cargo.toml version $current_version -> $cargo_version"
+update_cargo_version() {
   python3 - <<PY
 from pathlib import Path
 
@@ -350,20 +508,104 @@ if not updated:
   raise SystemExit("version not found in Cargo.toml")
 path.write_text("\n".join(out) + "\n", encoding="utf-8")
 PY
-  cargo check -q
-  git add Cargo.toml Cargo.lock
+}
+
+commit_release_version() {
+  git add Cargo.toml Cargo.lock || return $?
   git commit -m "chore: release ${version}"
-fi
+}
 
-git tag "$version"
-git push origin "$version"
+create_github_release() {
+  local output
+  if [[ -n "$notes_file" ]]; then
+    output="$(gh release create "$version" --title "$version" --notes-file "$notes_file")" || return $?
+  elif [[ -n "$notes" ]]; then
+    output="$(gh release create "$version" --title "$version" --notes "$notes")" || return $?
+  else
+    output="$(gh release create "$version" --title "$version" --generate-notes)" || return $?
+  fi
+  release_url="${output##*$'\n'}"
+  if [[ "$release_url" != http://* && "$release_url" != https://* ]]; then
+    release_url="$(gh release view "$version" --json url --jq .url)" || return $?
+  fi
+}
 
-if [[ -n "$notes_file" ]]; then
-  gh release create "$version" --title "$version" --notes-file "$notes_file"
-elif [[ -n "$notes" ]]; then
-  gh release create "$version" --title "$version" --notes "$notes"
+wait_for_homebrew_pr() {
+  local wait_seconds="${HOMEBREW_PR_WAIT_SECONDS:-120}"
+  local poll_seconds="${HOMEBREW_PR_POLL_SECONDS:-5}"
+  local tap_repo="${HOMEBREW_TAP_REPOSITORY:-mbuvarp/homebrew-trans}"
+  local branch="update-trans-${version}"
+  local result
+
+  if [[ ! "$wait_seconds" =~ ^[0-9]+$ || ! "$poll_seconds" =~ ^[0-9]+$ || "$poll_seconds" == "0" ]]; then
+    echo "Homebrew PR polling intervals must be positive integers." >&2
+    return 1
+  fi
+
+  local deadline=$((SECONDS + wait_seconds))
+  while ((SECONDS <= deadline)); do
+    if ! result="$(
+      gh pr list \
+        --repo "$tap_repo" \
+        --head "$branch" \
+        --state all \
+        --json url \
+        --jq '.[0].url'
+    )"; then
+      return 1
+    fi
+    if [[ -n "$result" ]]; then
+      homebrew_pr_url="$result"
+      return 0
+    fi
+    if ((SECONDS >= deadline)); then
+      break
+    fi
+    sleep "$poll_seconds"
+  done
+  return 2
+}
+
+find_homebrew_pr_step() {
+  local label="Find Homebrew update PR"
+  step_index=$((step_index + 1))
+  local log_file="${progress_tmp_dir}/step-${step_index}.log"
+  start_step "$label"
+  if wait_for_homebrew_pr >"$log_file" 2>&1; then
+    finish_step ok "$label"
+    return 0
+  else
+    local status=$?
+    if [[ "$status" -eq 2 ]]; then
+      finish_step warning "Homebrew PR is not available yet"
+    else
+      finish_step warning "Could not query the Homebrew PR"
+      show_step_log "$log_file"
+    fi
+    return 0
+  fi
+}
+
+if [[ "$current_version" != "$cargo_version" ]]; then
+  run_step "Update Cargo version to $cargo_version" update_cargo_version
+  run_step "Check updated Cargo package" cargo check -q
+  run_step "Commit release version" commit_release_version
 else
-  gh release create "$version" --title "$version" --generate-notes
+  print_ok "Cargo version is already $cargo_version"
 fi
 
+run_step "Create tag $version" git tag "$version"
+run_step "Push tag $version" git push origin "$version"
+run_step "Create GitHub release" create_github_release
+find_homebrew_pr_step
+
+echo
 echo "Release $version created."
+if [[ -n "$release_url" ]]; then
+  echo "Release: $release_url"
+fi
+if [[ -n "$homebrew_pr_url" ]]; then
+  echo "Homebrew PR: $homebrew_pr_url"
+else
+  echo "Homebrew PR: not available yet"
+fi
