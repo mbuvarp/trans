@@ -1,8 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::Path;
 
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
 use crate::config::{ConfigMode, TransConfig};
@@ -41,6 +43,109 @@ pub fn load_translations_for_mode(
             let value: Value = serde_json::from_str(&contents)?;
             flatten_next_intl_json(path, &value)
         }
+    }
+}
+
+pub fn validate_no_duplicate_json_keys(path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
+    let contents = read_file(path)?;
+    let mut deserializer = serde_json::Deserializer::from_str(&contents);
+    UniqueJsonValue { path }.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(())
+}
+
+struct UniqueJsonValue<'a> {
+    path: &'a Path,
+}
+
+impl<'de> DeserializeSeed<'de> for UniqueJsonValue<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonVisitor { path: self.path })
+    }
+}
+
+struct UniqueJsonVisitor<'a> {
+    path: &'a Path,
+}
+
+impl<'de> Visitor<'de> for UniqueJsonVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("valid JSON without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_string<E>(self, _value: String) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        UniqueJsonValue { path: self.path }.deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence
+            .next_element_seed(UniqueJsonValue { path: self.path })?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = BTreeSet::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if !keys.insert(key.clone()) {
+                return Err(de::Error::custom(format!(
+                    "translation file '{}' contains duplicate JSON key '{key}'",
+                    self.path.display()
+                )));
+            }
+            object.next_value_seed(UniqueJsonValue { path: self.path })?;
+        }
+        Ok(())
     }
 }
 
@@ -661,6 +766,22 @@ mod tests {
         fs::write(&path, serde_json::to_string_pretty(&value).expect("json")).expect("write");
 
         assert!(load_translations_for_mode(&path, ConfigMode::NextIntl).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_json_keys_at_any_depth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("en.json");
+        fs::write(
+            &path,
+            "{\n  \"app\": {\n    \"title\": \"First\",\n    \"title\": \"Second\"\n  }\n}\n",
+        )
+        .expect("write");
+
+        let err = validate_no_duplicate_json_keys(&path).expect_err("duplicate should fail");
+
+        assert!(err.to_string().contains("duplicate JSON key 'title'"));
+        assert!(err.to_string().contains(&path.display().to_string()));
     }
 
     #[test]

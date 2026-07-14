@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::TransConfig;
 use crate::error::{Result, TransError};
 use crate::message_id::validate_message_id;
+use crate::message_store::validate_no_duplicate_json_keys;
 use crate::translations::{
     Translations, language_file_path, load_language_translations, save_language_translations,
 };
@@ -314,9 +315,56 @@ pub fn replace_default_untranslated_value(
 
 pub fn sort_translation_files(root: impl AsRef<Path>, config: &TransConfig) -> Result<usize> {
     let root = root.as_ref();
+    let raw_snapshot = snapshot_raw_translation_files(root, config)?;
     let snapshot = snapshot_translations(root, config)?;
-    write_snapshot(root, config, &snapshot)?;
+    write_sort_snapshot(
+        config,
+        &snapshot,
+        &raw_snapshot,
+        |language, translations| save_language_translations(root, config, language, translations),
+    )?;
     Ok(snapshot.len())
+}
+
+fn snapshot_raw_translation_files(
+    root: &Path,
+    config: &TransConfig,
+) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+    let mut snapshot = BTreeMap::new();
+    for language in &config.available_languages {
+        let path = language_file_path(root, config, language);
+        validate_no_duplicate_json_keys(&path)?;
+        snapshot.insert(path.clone(), std::fs::read(path)?);
+    }
+    Ok(snapshot)
+}
+
+fn write_sort_snapshot<F>(
+    config: &TransConfig,
+    snapshot: &TranslationSnapshot,
+    raw_snapshot: &BTreeMap<PathBuf, Vec<u8>>,
+    mut save: F,
+) -> Result<()>
+where
+    F: FnMut(&str, &Translations) -> Result<()>,
+{
+    for language in &config.available_languages {
+        let Some(translations) = snapshot.get(language) else {
+            restore_raw_translation_files(raw_snapshot);
+            return Err(missing_language_in_snapshot(language));
+        };
+        if let Err(err) = save(language, translations) {
+            restore_raw_translation_files(raw_snapshot);
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+fn restore_raw_translation_files(snapshot: &BTreeMap<PathBuf, Vec<u8>>) {
+    for (path, contents) in snapshot {
+        let _ = std::fs::write(path, contents);
+    }
 }
 
 fn validate_values(
@@ -577,6 +625,71 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(messages.join("en.json")).expect("read en"),
             original_en
+        );
+    }
+
+    #[test]
+    fn sort_translation_files_rejects_duplicate_keys_without_writing() {
+        let dir = tempdir().expect("tempdir");
+        let config = base_config();
+        let messages = dir.path().join("messages");
+        std::fs::create_dir_all(&messages).expect("mkdir messages");
+        let original_en = "{\n  \"app.title\": \"First\",\n  \"app.title\": \"Second\"\n}\n";
+        let original_nb = "{\n  \"app.zeta\": \"Siste\",\n  \"app.alpha\": \"Første\"\n}\n";
+        std::fs::write(messages.join("en.json"), original_en).expect("write en");
+        std::fs::write(messages.join("nb.json"), original_nb).expect("write nb");
+
+        let err = sort_translation_files(dir.path(), &config).expect_err("sort should fail");
+
+        assert!(err.to_string().contains("duplicate JSON key 'app.title'"));
+        assert_eq!(
+            std::fs::read_to_string(messages.join("en.json")).expect("read en"),
+            original_en
+        );
+        assert_eq!(
+            std::fs::read_to_string(messages.join("nb.json")).expect("read nb"),
+            original_nb
+        );
+    }
+
+    #[test]
+    fn sort_write_failure_restores_original_file_bytes() {
+        let dir = tempdir().expect("tempdir");
+        let config = base_config();
+        let messages = dir.path().join("messages");
+        std::fs::create_dir_all(&messages).expect("mkdir messages");
+        let original_en = "{\n    \"app.zeta\": \"Zeta\",\n    \"app.alpha\": \"Alpha\"\n}\n";
+        let original_nb = "{\n    \"app.zeta\": \"Siste\",\n    \"app.alpha\": \"Første\"\n}\n";
+        std::fs::write(messages.join("en.json"), original_en).expect("write en");
+        std::fs::write(messages.join("nb.json"), original_nb).expect("write nb");
+        let raw_snapshot =
+            snapshot_raw_translation_files(dir.path(), &config).expect("raw snapshot");
+        let snapshot = snapshot_translations(dir.path(), &config).expect("snapshot");
+        let mut writes = 0usize;
+
+        write_sort_snapshot(
+            &config,
+            &snapshot,
+            &raw_snapshot,
+            |language, translations| {
+                writes += 1;
+                if writes == 2 {
+                    std::fs::write(language_file_path(dir.path(), &config, language), "")
+                        .expect("truncate failing file");
+                    return Err(std::io::Error::other("simulated write failure").into());
+                }
+                save_language_translations(dir.path(), &config, language, translations)
+            },
+        )
+        .expect_err("write should fail");
+
+        assert_eq!(
+            std::fs::read_to_string(messages.join("en.json")).expect("read en"),
+            original_en
+        );
+        assert_eq!(
+            std::fs::read_to_string(messages.join("nb.json")).expect("read nb"),
+            original_nb
         );
     }
 

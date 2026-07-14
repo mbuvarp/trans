@@ -676,6 +676,35 @@ fn sort_command_does_not_write_when_a_translation_file_is_invalid() {
 }
 
 #[test]
+fn sort_command_rejects_duplicate_json_keys_without_writing() {
+    let dir = tempdir().expect("tempdir");
+    let config = base_config();
+    config.save_to_root(dir.path()).expect("save config");
+    let messages = dir.path().join("messages");
+    std::fs::create_dir_all(&messages).expect("mkdir messages");
+    let original_en = "{\n  \"app.title\": \"First\",\n  \"app.title\": \"Second\"\n}\n";
+    let original_nb = "{\n  \"app.zeta\": \"Siste\",\n  \"app.alpha\": \"Første\"\n}\n";
+    std::fs::write(messages.join("en.json"), original_en).expect("write en");
+    std::fs::write(messages.join("nb.json"), original_nb).expect("write nb");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("sort")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("duplicate JSON key 'app.title'"));
+
+    assert_eq!(
+        std::fs::read_to_string(messages.join("en.json")).expect("read en"),
+        original_en
+    );
+    assert_eq!(
+        std::fs::read_to_string(messages.join("nb.json")).expect("read nb"),
+        original_nb
+    );
+}
+
+#[test]
 fn add_update_show_delete_flow() {
     let dir = tempdir().expect("tempdir");
     let config = setup_project(dir.path());
