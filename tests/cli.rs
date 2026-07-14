@@ -563,6 +563,148 @@ fn unused_help_documents_no_ts_checker_flag() {
 }
 
 #[test]
+fn sort_help_describes_configured_translation_files() {
+    trans_cmd()
+        .args(["sort", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Sort all configured translation files by key",
+        ));
+}
+
+#[test]
+fn sort_command_sorts_only_available_react_intl_languages() {
+    let dir = tempdir().expect("tempdir");
+    let config = base_config();
+    config.save_to_root(dir.path()).expect("save config");
+    let messages = dir.path().join("messages");
+    std::fs::create_dir_all(&messages).expect("mkdir messages");
+    std::fs::write(
+        messages.join("en.json"),
+        "{\n  \"app.zeta\": \"Zeta\",\n  \"app.alpha\": \"Alpha\"\n}\n",
+    )
+    .expect("write en");
+    std::fs::write(
+        messages.join("nb.json"),
+        "{\n  \"other.zeta\": \"Siste\",\n  \"other.alpha\": \"Første\"\n}\n",
+    )
+    .expect("write nb");
+    let unconfigured = "not translation json\n";
+    std::fs::write(messages.join("fr.json"), unconfigured).expect("write fr");
+    let child = dir.path().join("src/components");
+    std::fs::create_dir_all(&child).expect("mkdir child");
+
+    trans_cmd()
+        .current_dir(&child)
+        .arg("sort")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Sorted 2 translation files."));
+
+    assert_eq!(
+        std::fs::read_to_string(messages.join("en.json")).expect("read en"),
+        "{\n  \"app.alpha\": \"Alpha\",\n  \"app.zeta\": \"Zeta\"\n}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(messages.join("nb.json")).expect("read nb"),
+        "{\n  \"other.alpha\": \"Første\",\n  \"other.zeta\": \"Siste\"\n}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(messages.join("fr.json")).expect("read fr"),
+        unconfigured
+    );
+}
+
+#[test]
+fn sort_command_sorts_next_intl_files_and_is_idempotent() {
+    let dir = tempdir().expect("tempdir");
+    let mut config = base_config();
+    config.mode = trans::config::ConfigMode::NextIntl;
+    config.save_to_root(dir.path()).expect("save config");
+    let messages = dir.path().join("messages");
+    std::fs::create_dir_all(&messages).expect("mkdir messages");
+    let unsorted = "{\n  \"zeta\": {\n    \"title\": \"Title\"\n  },\n  \"alpha\": {\n    \"second\": \"Second\",\n    \"first\": \"First\"\n  }\n}\n";
+    std::fs::write(messages.join("en.json"), unsorted).expect("write en");
+    std::fs::write(messages.join("nb.json"), unsorted).expect("write nb");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("sort")
+        .assert()
+        .success();
+
+    let expected = "{\n  \"alpha\": {\n    \"first\": \"First\",\n    \"second\": \"Second\"\n  },\n  \"zeta\": {\n    \"title\": \"Title\"\n  }\n}";
+    assert_eq!(
+        std::fs::read_to_string(messages.join("en.json")).expect("read en"),
+        expected
+    );
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("sort")
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(messages.join("en.json")).expect("read en"),
+        expected
+    );
+}
+
+#[test]
+fn sort_command_does_not_write_when_a_translation_file_is_invalid() {
+    let dir = tempdir().expect("tempdir");
+    let config = base_config();
+    config.save_to_root(dir.path()).expect("save config");
+    let messages = dir.path().join("messages");
+    std::fs::create_dir_all(&messages).expect("mkdir messages");
+    let original_en = "{\n  \"app.zeta\": \"Zeta\",\n  \"app.alpha\": \"Alpha\"\n}\n";
+    std::fs::write(messages.join("en.json"), original_en).expect("write en");
+    std::fs::write(messages.join("nb.json"), "{ invalid json").expect("write nb");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("sort")
+        .assert()
+        .failure();
+
+    assert_eq!(
+        std::fs::read_to_string(messages.join("en.json")).expect("read en"),
+        original_en
+    );
+}
+
+#[test]
+fn sort_command_rejects_duplicate_json_keys_without_writing() {
+    let dir = tempdir().expect("tempdir");
+    let config = base_config();
+    config.save_to_root(dir.path()).expect("save config");
+    let messages = dir.path().join("messages");
+    std::fs::create_dir_all(&messages).expect("mkdir messages");
+    let original_en = "{\n  \"app.title\": \"First\",\n  \"app.title\": \"Second\"\n}\n";
+    let original_nb = "{\n  \"app.zeta\": \"Siste\",\n  \"app.alpha\": \"Første\"\n}\n";
+    std::fs::write(messages.join("en.json"), original_en).expect("write en");
+    std::fs::write(messages.join("nb.json"), original_nb).expect("write nb");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .arg("sort")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("duplicate JSON key 'app.title'"));
+
+    assert_eq!(
+        std::fs::read_to_string(messages.join("en.json")).expect("read en"),
+        original_en
+    );
+    assert_eq!(
+        std::fs::read_to_string(messages.join("nb.json")).expect("read nb"),
+        original_nb
+    );
+}
+
+#[test]
 fn add_update_show_delete_flow() {
     let dir = tempdir().expect("tempdir");
     let config = setup_project(dir.path());

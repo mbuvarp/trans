@@ -268,6 +268,8 @@ pub enum Command {
         #[arg(long = "ai", help = "Use AI to suggest fixes for verification errors")]
         ai: bool,
     },
+    #[command(about = "Sort all configured translation files by key")]
+    Sort,
     #[command(about = "List or remove unused next-intl translation ids")]
     Unused {
         #[arg(

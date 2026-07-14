@@ -15,7 +15,7 @@ The tool covers interactive editing, non-interactive batch updates, verification
 - Interactive add/edit/delete flow when running `trans` with no subcommand
 - Support for `.trans.config.json` and `.trans.config.yaml`
 - `react-intl` and `next-intl` storage modes
-- Add, update, delete, show, rename, sync, import, export, and verify commands
+- Add, update, delete, show, rename, sort, sync, import, export, and verify commands
 - CSV and Excel export
 - CSV and Excel import
 - Add and remove language files
@@ -169,6 +169,7 @@ Main commands:
 - `trans show --id <id> [--lang <lang>]`: show one message in all or one language
 - `trans change-id <old_id> <new_id>`: rename a message across all languages
 - `trans verify [--ai]`: check for key mismatches and format issues
+- `trans sort`: sort all configured translation files by key
 - `trans sync`: add missing IDs from the primary language into other languages
 - `trans export [--format csv|excel]`: export all translations
 - `trans import <file>`: import translations from CSV or Excel
@@ -272,6 +273,7 @@ They also verify again after writing files. If post-write verification fails, th
 Other safety-related behavior:
 
 - JSON output is written in sorted key order
+- `sort` rewrites every language in `availableLanguages` using the configured storage mode
 - `verify` reports missing keys, extra keys, invalid JSON, and message format problems
 - `sync` fills missing IDs in non-primary languages using `defaultUntranslatedValue`
 - `del-lang` refuses to delete the primary language
