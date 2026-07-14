@@ -188,6 +188,7 @@ pub fn init_config_interactive(
         required_languages,
         primary_language,
         default_untranslated_value,
+        newline_at_end_of_file: false,
         default_export_format,
         excel_password: "unlock".to_string(),
         run_update_check,
