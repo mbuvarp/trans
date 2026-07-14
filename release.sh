@@ -15,12 +15,14 @@ Examples:
   ./release.sh v0.1.1 --dry-run
 
 Notes:
+  - Releases must be created from the main branch.
   - If the tag starts with "v", Cargo.toml is set to the version without the prefix.
-  - Cargo.toml and Cargo.lock are updated and committed automatically when needed.
+  - Cargo.toml and Cargo.lock are updated, committed, and pushed to origin/main when needed.
   - If no notes are provided, a changelog draft is generated and you will be prompted to approve/edit it.
   - If the `codex` CLI is available, it is used to draft the changelog; otherwise a local heuristic is used.
   - Successful command output is hidden; captured output is shown when a step fails.
   - After publishing, the script waits up to 120 seconds for the Homebrew update PR.
+  - Do not merge the Homebrew PR directly; publish it with the tap's brew pr-pull workflow.
 USAGE
 }
 
@@ -30,6 +32,7 @@ cursor_hidden="false"
 step_index=0
 release_url=""
 homebrew_pr_url=""
+homebrew_tap_repository="${HOMEBREW_TAP_REPOSITORY:-mbuvarp/homebrew-trans}"
 
 if [[ -t 2 && "${TERM:-}" != "dumb" ]]; then
   progress_is_tty="true"
@@ -281,6 +284,15 @@ resolve_release_version() {
 }
 
 validate_release_state() {
+  local current_branch
+  current_branch="$(git branch --show-current)" || return $?
+  if [[ "$current_branch" != "main" ]]; then
+    if [[ -z "$current_branch" ]]; then
+      current_branch="detached HEAD"
+    fi
+    echo "Releases must be created from the main branch (current: $current_branch)." >&2
+    return 1
+  fi
   if [[ -n "$notes_file" && ! -f "$notes_file" ]]; then
     echo "Release notes file does not exist: $notes_file" >&2
     return 1
@@ -293,9 +305,25 @@ validate_release_state() {
     echo "Tag $version already exists." >&2
     return 1
   fi
+
+  local remote_tag_status=0
+  git ls-remote --exit-code --tags origin "refs/tags/${version}" >/dev/null 2>&1 \
+    || remote_tag_status=$?
+  case "$remote_tag_status" in
+    0)
+      echo "Tag $version already exists on origin." >&2
+      return 1
+      ;;
+    2) ;;
+    *)
+      echo "Could not check whether tag $version exists on origin." >&2
+      return "$remote_tag_status"
+      ;;
+  esac
 }
 
 run_step "Resolve release version" resolve_release_version
+run_step "Validate release state" validate_release_state
 
 if [[ "$requested_version" == "patch" || "$requested_version" == "minor" || "$requested_version" == "major" ]]; then
   echo
@@ -309,8 +337,6 @@ if [[ "$requested_version" == "patch" || "$requested_version" == "minor" || "$re
     exit 1
   fi
 fi
-
-run_step "Validate release state" validate_release_state
 
 prepare_changelog() {
   local tmp_file="$1"
@@ -533,7 +559,6 @@ create_github_release() {
 wait_for_homebrew_pr() {
   local wait_seconds="${HOMEBREW_PR_WAIT_SECONDS:-120}"
   local poll_seconds="${HOMEBREW_PR_POLL_SECONDS:-5}"
-  local tap_repo="${HOMEBREW_TAP_REPOSITORY:-mbuvarp/homebrew-trans}"
   local branch="update-trans-${version}"
   local result
 
@@ -546,7 +571,7 @@ wait_for_homebrew_pr() {
   while ((SECONDS <= deadline)); do
     if ! result="$(
       gh pr list \
-        --repo "$tap_repo" \
+        --repo "$homebrew_tap_repository" \
         --head "$branch" \
         --state all \
         --json url \
@@ -595,7 +620,7 @@ else
 fi
 
 run_step "Create tag $version" git tag "$version"
-run_step "Push tag $version" git push origin "$version"
+run_step "Push release commit and tag" git push --atomic origin main "$version"
 run_step "Create GitHub release" create_github_release
 find_homebrew_pr_step
 
@@ -609,3 +634,9 @@ if [[ -n "$homebrew_pr_url" ]]; then
 else
   echo "Homebrew PR: not available yet"
 fi
+echo
+echo "Homebrew bottle publishing:"
+echo "  Do not merge the Homebrew PR directly."
+echo "  After all bottle checks pass, run the brew pr-pull workflow:"
+echo "  https://github.com/${homebrew_tap_repository}/actions/workflows/publish.yml"
+echo "  Enter the Homebrew PR number and its reviewed head SHA."

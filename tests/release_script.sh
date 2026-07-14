@@ -152,6 +152,81 @@ test_failed_version_bump_stops_release() {
   assert_not_contains "$output" "Version to release: v"
 }
 
+test_non_main_branch_is_rejected() {
+  local fixture
+  fixture="$(create_fixture feature-branch)"
+  git -C "$fixture" switch --quiet -c feature/not-main
+
+  local output
+  if output="$(
+    cd "$fixture"
+    PATH="$fixture/mock-bin:$PATH" ./release.sh v0.1.1 --notes "Notes" 2>&1
+  )"; then
+    fail "release from a feature branch unexpectedly succeeded"
+  fi
+
+  assert_contains "$output" "failed  Validate release state"
+  assert_contains "$output" "Releases must be created from the main branch (current: feature/not-main)."
+  if git -C "$fixture" rev-parse --verify refs/tags/v0.1.1 >/dev/null 2>&1; then
+    fail "feature-branch release created a tag"
+  fi
+}
+
+test_remote_tag_is_rejected_before_main_push() {
+  local fixture
+  fixture="$(create_fixture remote-tag)"
+  git -C "$fixture" tag v0.1.1
+  git -C "$fixture" push --quiet origin refs/tags/v0.1.1
+  git -C "$fixture" tag --delete v0.1.1 >/dev/null
+
+  local output
+  if output="$(
+    cd "$fixture"
+    PATH="$fixture/mock-bin:$PATH" ./release.sh v0.1.1 --notes "Notes" 2>&1
+  )"; then
+    fail "release with an existing remote tag unexpectedly succeeded"
+  fi
+
+  assert_contains "$output" "failed  Validate release state"
+  assert_contains "$output" "Tag v0.1.1 already exists on origin."
+  grep -q 'version = "0.1.0"' "$fixture/Cargo.toml" \
+    || fail "remote-tag rejection changed the Cargo version"
+  if git --git-dir="$tmp_dir/remote-tag.git" show-ref --verify refs/heads/main >/dev/null 2>&1; then
+    fail "remote-tag rejection pushed the main branch"
+  fi
+}
+
+test_atomic_push_rejection_keeps_remote_unchanged() {
+  local fixture
+  fixture="$(create_fixture atomic-rejection)"
+  cat >"$tmp_dir/atomic-rejection.git/hooks/update" <<'HOOK'
+#!/usr/bin/env bash
+if [[ "$1" == refs/tags/* ]]; then
+  echo "tag updates are rejected for this test" >&2
+  exit 1
+fi
+HOOK
+  chmod +x "$tmp_dir/atomic-rejection.git/hooks/update"
+
+  local output
+  if output="$(
+    cd "$fixture"
+    PATH="$fixture/mock-bin:$PATH" ./release.sh v0.1.1 --notes "Notes" 2>&1
+  )"; then
+    fail "release with a rejected tag push unexpectedly succeeded"
+  fi
+
+  assert_contains "$output" "failed  Push release commit and tag"
+  assert_contains "$output" "tag updates are rejected for this test"
+  assert_not_contains "$output" "ok  Create GitHub release"
+  if git --git-dir="$tmp_dir/atomic-rejection.git" show-ref --verify refs/heads/main >/dev/null 2>&1; then
+    fail "atomic push rejection updated the remote main branch"
+  fi
+  if git --git-dir="$tmp_dir/atomic-rejection.git" show-ref --verify refs/tags/v0.1.1 >/dev/null 2>&1; then
+    fail "atomic push rejection created the remote tag"
+  fi
+}
+
 test_release_hides_noise_and_prints_pr() {
   local fixture
   fixture="$(create_fixture success)"
@@ -164,13 +239,23 @@ test_release_hides_noise_and_prints_pr() {
   )"
 
   assert_contains "$output" "ok  Check updated Cargo package"
+  assert_contains "$output" "ok  Push release commit and tag"
   assert_contains "$output" "ok  Create GitHub release"
   assert_contains "$output" "ok  Find Homebrew update PR"
   assert_contains "$output" "Release: https://github.com/example/trans/releases/tag/v0.1.1"
   assert_contains "$output" "Homebrew PR: $pr_url"
+  assert_contains "$output" "Do not merge the Homebrew PR directly."
+  assert_contains "$output" "After all bottle checks pass, run the brew pr-pull workflow:"
+  assert_contains "$output" "https://github.com/mbuvarp/homebrew-trans/actions/workflows/publish.yml"
+  assert_contains "$output" "Enter the Homebrew PR number and its reviewed head SHA."
   assert_not_contains "$output" "mock cargo command output"
   assert_not_contains "$output" "mock release command output"
   grep -q 'version = "0.1.1"' "$fixture/Cargo.toml" || fail "Cargo version was not updated"
+  git --git-dir="$tmp_dir/success.git" show refs/heads/main:Cargo.toml \
+    | grep -q 'version = "0.1.1"' \
+    || fail "release commit was not pushed to the remote main branch"
+  git --git-dir="$tmp_dir/success.git" rev-parse --verify refs/tags/v0.1.1 >/dev/null \
+    || fail "release tag was not pushed to the remote"
   git -C "$fixture" rev-parse --verify refs/tags/v0.1.1 >/dev/null || fail "release tag was not created"
 }
 
@@ -192,6 +277,9 @@ test_missing_pr_is_non_fatal() {
 test_dry_run_progress
 test_failure_shows_captured_output
 test_failed_version_bump_stops_release
+test_non_main_branch_is_rejected
+test_remote_tag_is_rejected_before_main_push
+test_atomic_push_rejection_keeps_remote_unchanged
 test_release_hides_noise_and_prints_pr
 test_missing_pr_is_non_fatal
 
