@@ -492,6 +492,7 @@ mod tests {
             required_languages: vec!["en".to_string()],
             primary_language: "en".to_string(),
             default_untranslated_value: "".to_string(),
+            newline_at_end_of_file: false,
             default_export_format: crate::config::ExportFormat::Excel,
             excel_password: "unlock".to_string(),
             run_update_check: false,

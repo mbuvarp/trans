@@ -128,6 +128,8 @@ pub struct TransConfig {
     pub primary_language: String,
     #[serde(default = "default_untranslated_value")]
     pub default_untranslated_value: String,
+    #[serde(default)]
+    pub newline_at_end_of_file: bool,
     #[serde(default = "default_export_format")]
     pub default_export_format: ExportFormat,
     #[serde(default = "default_excel_password")]
@@ -375,6 +377,10 @@ pub fn format_config_list(config: &TransConfig, config_path: Option<&Path>) -> V
         &format_value(&config.default_untranslated_value),
     ));
     lines.push(format_label_value(
+        "newlineAtEndOfFile",
+        &config.newline_at_end_of_file.to_string(),
+    ));
+    lines.push(format_label_value(
         "defaultExportFormat",
         config.default_export_format.as_str(),
     ));
@@ -410,6 +416,7 @@ pub enum ConfigField {
     RequiredLanguages,
     PrimaryLanguage,
     DefaultUntranslatedValue,
+    NewlineAtEndOfFile,
     DefaultExportFormat,
     ExcelPassword,
     RunUpdateCheck,
@@ -479,6 +486,7 @@ mod tests {
             required_languages: vec!["en".to_string()],
             primary_language: "en".to_string(),
             default_untranslated_value: "".to_string(),
+            newline_at_end_of_file: false,
             default_export_format: ExportFormat::Excel,
             excel_password: "unlock".to_string(),
             run_update_check: false,
@@ -499,10 +507,46 @@ mod tests {
         let config: TransConfig = serde_json::from_str(json).expect("valid json");
         assert_eq!(config.mode, ConfigMode::ReactIntl);
         assert_eq!(config.default_untranslated_value, "");
+        assert!(!config.newline_at_end_of_file);
         assert_eq!(config.default_export_format, ExportFormat::Excel);
         assert_eq!(config.excel_password, "unlock");
         assert!(!config.run_update_check);
         assert!(config.ai.is_none());
+    }
+
+    #[test]
+    fn loads_newline_at_end_of_file_from_json_and_yaml() {
+        let json = r#"
+        {
+            "languageFilesPath": "translations",
+            "availableLanguages": ["en"],
+            "requiredLanguages": ["en"],
+            "primaryLanguage": "en",
+            "newlineAtEndOfFile": true
+        }
+        "#;
+        let json_config: TransConfig = serde_json::from_str(json).expect("valid json");
+        assert!(json_config.newline_at_end_of_file);
+
+        let yaml = r#"
+        languageFilesPath: translations
+        availableLanguages: [en]
+        requiredLanguages: [en]
+        primaryLanguage: en
+        newlineAtEndOfFile: true
+        "#;
+        let yaml_config: TransConfig = serde_yaml::from_str(yaml).expect("valid yaml");
+        assert!(yaml_config.newline_at_end_of_file);
+
+        let yaml_without_option = r#"
+        languageFilesPath: translations
+        availableLanguages: [en]
+        requiredLanguages: [en]
+        primaryLanguage: en
+        "#;
+        let default_yaml_config: TransConfig =
+            serde_yaml::from_str(yaml_without_option).expect("valid yaml");
+        assert!(!default_yaml_config.newline_at_end_of_file);
     }
 
     #[test]
@@ -517,6 +561,7 @@ mod tests {
                 .trim_start()
                 .starts_with("{\n  \"mode\": \"react-intl\"")
         );
+        assert!(payload.contains("\"newlineAtEndOfFile\": false"));
     }
 
     #[test]

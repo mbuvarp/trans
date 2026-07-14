@@ -811,6 +811,7 @@ fn map_config_key(key: ConfigKey) -> ConfigField {
         ConfigKey::RequiredLanguages => ConfigField::RequiredLanguages,
         ConfigKey::PrimaryLanguage => ConfigField::PrimaryLanguage,
         ConfigKey::DefaultUntranslatedValue => ConfigField::DefaultUntranslatedValue,
+        ConfigKey::NewlineAtEndOfFile => ConfigField::NewlineAtEndOfFile,
         ConfigKey::DefaultExportFormat => ConfigField::DefaultExportFormat,
         ConfigKey::ExcelPassword => ConfigField::ExcelPassword,
         ConfigKey::RunUpdateCheck => ConfigField::RunUpdateCheck,

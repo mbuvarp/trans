@@ -4,7 +4,10 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::{
+    Serialize,
+    de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor},
+};
 use serde_json::{Map, Value};
 
 use crate::config::{ConfigMode, TransConfig};
@@ -154,20 +157,40 @@ pub fn save_translations_for_mode(
     mode: ConfigMode,
     translations: &FlatTranslations,
 ) -> Result<()> {
+    save_translations_for_mode_with_newline(path, mode, translations, false)
+}
+
+pub(crate) fn save_translations_for_mode_with_newline(
+    path: impl AsRef<Path>,
+    mode: ConfigMode,
+    translations: &FlatTranslations,
+    newline_at_end_of_file: bool,
+) -> Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
     let payload = match mode {
-        ConfigMode::ReactIntl => serde_json::to_string_pretty(translations)?,
+        ConfigMode::ReactIntl => pretty_json_payload(translations, newline_at_end_of_file)?,
         ConfigMode::NextIntl => {
             let nested = unflatten_to_next_intl(translations)?;
-            serde_json::to_string_pretty(&nested)?
+            pretty_json_payload(&nested, newline_at_end_of_file)?
         }
     };
     fs::write(path, payload)?;
     Ok(())
+}
+
+fn pretty_json_payload<T>(value: &T, newline_at_end_of_file: bool) -> Result<String>
+where
+    T: Serialize + ?Sized,
+{
+    let mut payload = serde_json::to_string_pretty(value)?;
+    if newline_at_end_of_file {
+        payload.push('\n');
+    }
+    Ok(payload)
 }
 
 pub fn collect_non_string_values(root: &Path, config: &TransConfig) -> Result<NonStringValues> {
@@ -208,7 +231,10 @@ pub fn coerce_non_string_values(root: &Path, config: &TransConfig) -> Result<usi
         let mut changed = false;
         coerce_next_intl_value(&mut value, &mut Vec::new(), &mut changed)?;
         if changed {
-            fs::write(&path, serde_json::to_string_pretty(&value)?)?;
+            fs::write(
+                &path,
+                pretty_json_payload(&value, config.newline_at_end_of_file)?,
+            )?;
             total += 1;
         }
     }
@@ -273,7 +299,12 @@ pub fn migrate_mode_to_dir(
         let Some(translations) = by_language.get(language) else {
             continue;
         };
-        if let Err(err) = save_translations_for_mode(&path, target_mode, translations) {
+        if let Err(err) = save_translations_for_mode_with_newline(
+            &path,
+            target_mode,
+            translations,
+            config.newline_at_end_of_file,
+        ) {
             if in_place {
                 restore_snapshots(root, config, &snapshots);
             } else {
@@ -741,6 +772,27 @@ mod tests {
     }
 
     #[test]
+    fn saves_configured_trailing_newline_for_both_modes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let translations = map(&[("app.title", "Title")]);
+
+        for mode in [ConfigMode::ReactIntl, ConfigMode::NextIntl] {
+            let path = dir.path().join(format!("{}.json", mode.as_str()));
+
+            save_translations_for_mode_with_newline(&path, mode, &translations, false)
+                .expect("save without newline");
+            let without_newline = fs::read_to_string(&path).expect("read without newline");
+            assert!(!without_newline.ends_with('\n'));
+
+            save_translations_for_mode_with_newline(&path, mode, &translations, true)
+                .expect("save with newline");
+            let with_newline = fs::read_to_string(&path).expect("read with newline");
+            assert!(with_newline.ends_with("}\n"));
+            assert!(!with_newline.ends_with("}\n\n"));
+        }
+    }
+
+    #[test]
     fn unflatten_then_flatten_round_trip() {
         let flat = map(&[("app.header.title", "Title"), ("app.footer.help", "Help")]);
         let value = unflatten_to_next_intl(&flat).expect("nested");
@@ -806,6 +858,7 @@ mod tests {
             required_languages: vec!["en".to_string()],
             primary_language: "en".to_string(),
             default_untranslated_value: String::new(),
+            newline_at_end_of_file: true,
             default_export_format: crate::config::ExportFormat::Excel,
             excel_password: "unlock".to_string(),
             run_update_check: false,
@@ -834,6 +887,9 @@ mod tests {
         assert_eq!(loaded.get("app.n"), Some(&"3".to_string()));
         assert_eq!(loaded.get("app.arr"), Some(&"[1,2]".to_string()));
         assert_eq!(loaded.get("app.nested.ok"), Some(&"x".to_string()));
+        let raw = fs::read_to_string(&path).expect("read coerced file");
+        assert!(raw.ends_with("}\n"));
+        assert!(!raw.ends_with("}\n\n"));
     }
 
     #[test]
@@ -877,6 +933,7 @@ mod tests {
             required_languages: vec!["en".to_string()],
             primary_language: "en".to_string(),
             default_untranslated_value: String::new(),
+            newline_at_end_of_file: true,
             default_export_format: crate::config::ExportFormat::Excel,
             excel_password: "unlock".to_string(),
             run_update_check: false,
@@ -887,6 +944,8 @@ mod tests {
         let text = fs::read_to_string(root.join("messages/en.json")).expect("read");
         assert!(text.contains("\"app\""));
         assert!(text.contains("\"header\""));
+        assert!(text.ends_with("}\n"));
+        assert!(!text.ends_with("}\n\n"));
     }
 
     #[test]
@@ -907,6 +966,7 @@ mod tests {
             required_languages: vec!["en".to_string()],
             primary_language: "en".to_string(),
             default_untranslated_value: String::new(),
+            newline_at_end_of_file: false,
             default_export_format: crate::config::ExportFormat::Excel,
             excel_password: "unlock".to_string(),
             run_update_check: false,
@@ -942,6 +1002,7 @@ mod tests {
             required_languages: vec!["en".to_string()],
             primary_language: "en".to_string(),
             default_untranslated_value: String::new(),
+            newline_at_end_of_file: false,
             default_export_format: crate::config::ExportFormat::Excel,
             excel_password: "unlock".to_string(),
             run_update_check: false,
@@ -972,6 +1033,7 @@ mod tests {
             required_languages: vec!["en".to_string()],
             primary_language: "en".to_string(),
             default_untranslated_value: String::new(),
+            newline_at_end_of_file: false,
             default_export_format: crate::config::ExportFormat::Excel,
             excel_password: "unlock".to_string(),
             run_update_check: false,

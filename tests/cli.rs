@@ -16,6 +16,7 @@ fn base_config() -> TransConfig {
         required_languages: vec!["en".to_string()],
         primary_language: "en".to_string(),
         default_untranslated_value: "".to_string(),
+        newline_at_end_of_file: false,
         default_export_format: trans::config::ExportFormat::Excel,
         excel_password: "unlock".to_string(),
         run_update_check: false,
@@ -741,6 +742,59 @@ fn add_update_show_delete_flow() {
 
     let en_after = load_language_translations(dir.path(), &config, "en").expect("load en");
     assert!(!en_after.contains_key("app.new"));
+}
+
+#[test]
+fn mutation_writes_exactly_one_trailing_newline_when_configured() {
+    let dir = tempdir().expect("tempdir");
+    let mut config = base_config();
+    config.newline_at_end_of_file = true;
+    config.save_to_root(dir.path()).expect("save config");
+    save_language_translations(
+        dir.path(),
+        &config,
+        "en",
+        &translations(&[("app.title", "Title")]),
+    )
+    .expect("save en");
+    save_language_translations(
+        dir.path(),
+        &config,
+        "nb",
+        &translations(&[("app.title", "Tittel")]),
+    )
+    .expect("save nb");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["add", "--id", "app.new", "--values", "en:Hello"])
+        .assert()
+        .success();
+
+    for language in ["en", "nb"] {
+        let raw = std::fs::read_to_string(dir.path().join(format!("messages/{language}.json")))
+            .expect("read translation file");
+        assert!(raw.ends_with("}\n"));
+        assert!(!raw.ends_with("}\n\n"));
+    }
+}
+
+#[test]
+fn config_show_displays_newline_at_end_of_file_without_editing_it() {
+    let dir = tempdir().expect("tempdir");
+    let mut config = base_config();
+    config.newline_at_end_of_file = true;
+    config.save_to_root(dir.path()).expect("save config");
+
+    trans_cmd()
+        .current_dir(dir.path())
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("newlineAtEndOfFile: true"));
+
+    let saved = TransConfig::load_from_root(dir.path()).expect("reload config");
+    assert!(saved.newline_at_end_of_file);
 }
 
 #[test]

@@ -165,6 +165,8 @@ pub fn init_config_interactive(
         .interact_text()?;
     print_spacer();
 
+    let newline_at_end_of_file = prompt_newline_at_end_of_file(false)?;
+
     let default_export_format = prompt_default_export_format(ExportFormat::Excel)?;
 
     print_label("Run update check after successful commands");
@@ -188,6 +190,7 @@ pub fn init_config_interactive(
         required_languages,
         primary_language,
         default_untranslated_value,
+        newline_at_end_of_file,
         default_export_format,
         excel_password: "unlock".to_string(),
         run_update_check,
@@ -273,6 +276,8 @@ pub fn configure_root_interactive(root: impl AsRef<Path>) -> Result<()> {
         .interact_text()?;
     print_spacer();
 
+    let newline_at_end_of_file = prompt_newline_at_end_of_file(config.newline_at_end_of_file)?;
+
     let default_export_format = prompt_default_export_format(config.default_export_format)?;
 
     print_label("Run update check after successful commands");
@@ -288,11 +293,12 @@ pub fn configure_root_interactive(root: impl AsRef<Path>) -> Result<()> {
     config.required_languages = required_languages;
     config.primary_language = primary_language;
     config.default_untranslated_value = default_untranslated_value;
+    config.newline_at_end_of_file = newline_at_end_of_file;
     config.default_export_format = default_export_format;
     config.run_update_check = run_update_check;
 
     config.validate()?;
-    maybe_migrate_mode(root, &original_config, config.mode)?;
+    maybe_migrate_mode(root, &original_config, &config)?;
     config.save_to_root(root)?;
     Ok(())
 }
@@ -529,6 +535,9 @@ pub fn configure_edit_interactive(
                 false
             };
 
+            let newline_at_end_of_file =
+                prompt_newline_at_end_of_file(config.newline_at_end_of_file)?;
+
             let default_export_format = prompt_default_export_format(config.default_export_format)?;
 
             print_label("Run update check after successful commands");
@@ -557,12 +566,13 @@ pub fn configure_edit_interactive(
             config.required_languages = required_languages;
             config.primary_language = primary_language;
             config.default_untranslated_value = default_untranslated_value;
+            config.newline_at_end_of_file = newline_at_end_of_file;
             config.default_export_format = default_export_format;
             config.run_update_check = run_update_check;
             config.ai = ai;
 
             config.validate()?;
-            maybe_migrate_mode(root, &original_config, config.mode)?;
+            maybe_migrate_mode(root, &original_config, &config)?;
             if replace_default {
                 let replaced = replace_default_untranslated_value(
                     root,
@@ -683,6 +693,10 @@ pub fn configure_edit_interactive(
                 println!("Replaced {replaced} values.");
             }
         }
+        Some(ConfigField::NewlineAtEndOfFile) => {
+            config.newline_at_end_of_file =
+                prompt_newline_at_end_of_file(config.newline_at_end_of_file)?;
+        }
         Some(ConfigField::DefaultExportFormat) => {
             config.default_export_format =
                 prompt_default_export_format(config.default_export_format)?;
@@ -771,7 +785,7 @@ pub fn configure_edit_interactive(
     }
 
     config.validate()?;
-    maybe_migrate_mode(root, &original_config, config.mode)?;
+    maybe_migrate_mode(root, &original_config, &config)?;
     config.save_to_root(root)?;
     Ok(())
 }
@@ -959,6 +973,16 @@ fn prompt_default_export_format(current: ExportFormat) -> Result<ExportFormat> {
         0 => ExportFormat::Excel,
         _ => ExportFormat::Csv,
     })
+}
+
+fn prompt_newline_at_end_of_file(current: bool) -> Result<bool> {
+    print_label("End saved translation files with a newline");
+    let enabled = Confirm::new()
+        .with_prompt(">")
+        .default(current)
+        .interact()?;
+    print_spacer();
+    Ok(enabled)
 }
 
 fn prompt_mode(current: ConfigMode) -> Result<ConfigMode> {
@@ -1391,15 +1415,15 @@ pub fn ensure_next_intl_strings(root: &Path, config: &TransConfig) -> Result<()>
     Ok(())
 }
 
-fn maybe_migrate_mode(root: &Path, original: &TransConfig, target_mode: ConfigMode) -> Result<()> {
-    if original.mode == target_mode {
+fn maybe_migrate_mode(root: &Path, original: &TransConfig, updated: &TransConfig) -> Result<()> {
+    if original.mode == updated.mode {
         return Ok(());
     }
 
     print_label(&format!(
         "Mode changed from {} to {}.",
         original.mode.as_str(),
-        target_mode.as_str()
+        updated.mode.as_str()
     ));
     let migrate = Confirm::new()
         .with_prompt("Migrate language files now?")
@@ -1410,14 +1434,20 @@ fn maybe_migrate_mode(root: &Path, original: &TransConfig, target_mode: ConfigMo
         return Ok(());
     }
 
+    migrate_mode_files(root, original, updated)?;
+    println!("Migrated language files to {} mode.", updated.mode.as_str());
+    print_spacer();
+    Ok(())
+}
+
+fn migrate_mode_files(root: &Path, original: &TransConfig, updated: &TransConfig) -> Result<()> {
     if original.mode == ConfigMode::NextIntl {
         ensure_next_intl_strings(root, original)?;
     }
 
-    migrate_language_files(root, original, target_mode)?;
-    println!("Migrated language files to {} mode.", target_mode.as_str());
-    print_spacer();
-    Ok(())
+    let mut migration_config = original.clone();
+    migration_config.newline_at_end_of_file = updated.newline_at_end_of_file;
+    migrate_language_files(root, &migration_config, updated.mode)
 }
 
 fn print_label(text: &str) {
@@ -1434,7 +1464,12 @@ fn print_spacer() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ai_command;
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{migrate_mode_files, parse_ai_command};
+    use crate::config::{ConfigMode, ExportFormat, TransConfig};
 
     #[test]
     fn parse_ai_command_without_feedback() {
@@ -1454,5 +1489,41 @@ mod tests {
     fn parse_ai_command_rejects_non_ai_input() {
         assert_eq!(parse_ai_command("hello"), None);
         assert_eq!(parse_ai_command("/air"), None);
+    }
+
+    #[test]
+    fn migration_uses_updated_newline_setting() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let original = TransConfig {
+            mode: ConfigMode::ReactIntl,
+            language_files_path: "messages".into(),
+            available_languages: vec!["en".to_string()],
+            required_languages: vec!["en".to_string()],
+            primary_language: "en".to_string(),
+            default_untranslated_value: String::new(),
+            newline_at_end_of_file: false,
+            default_export_format: ExportFormat::Excel,
+            excel_password: "unlock".to_string(),
+            run_update_check: false,
+            ai: None,
+        };
+        let mut updated = original.clone();
+        updated.mode = ConfigMode::NextIntl;
+        updated.newline_at_end_of_file = true;
+
+        fs::create_dir_all(root.join("messages")).expect("mkdir");
+        fs::write(
+            root.join("messages/en.json"),
+            "{\n  \"app.title\": \"Title\"\n}",
+        )
+        .expect("write source");
+
+        migrate_mode_files(root, &original, &updated).expect("migrate");
+
+        let migrated = fs::read_to_string(root.join("messages/en.json")).expect("read migrated");
+        assert!(migrated.contains("\"app\""));
+        assert!(migrated.ends_with("}\n"));
+        assert!(!migrated.ends_with("}\n\n"));
     }
 }

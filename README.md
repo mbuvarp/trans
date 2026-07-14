@@ -102,6 +102,7 @@ Example JSON config:
   "requiredLanguages": ["en", "nb"],
   "primaryLanguage": "en",
   "defaultUntranslatedValue": "",
+  "newlineAtEndOfFile": false,
   "defaultExportFormat": "excel",
   "excelPassword": "unlock",
   "runUpdateCheck": false,
@@ -123,6 +124,7 @@ Key fields:
 - `requiredLanguages`: languages prompted for during add/update flows
 - `primaryLanguage`: source language and reference set for verification
 - `defaultUntranslatedValue`: value written for non-required or missing translations
+- `newlineAtEndOfFile`: if `true`, saved translation JSON files end with a newline; defaults to `false`
 - `defaultExportFormat`: `csv` or `excel`
 - `excelPassword`: password used for Excel sheet protection
 - `runUpdateCheck`: if `true`, successful commands may prompt for `brew upgrade trans`
