@@ -54,6 +54,10 @@ LOCK
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -n "${MOCK_GH_LOG:-}" ]]; then
+  printf '%s\n' "$*" >>"$MOCK_GH_LOG"
+fi
+
 case "${1:-} ${2:-}" in
   "release create")
     echo "mock release command output" >&2
@@ -67,7 +71,74 @@ case "${1:-} ${2:-}" in
       echo "Homebrew PR query used an unexpected head branch: $*" >&2
       exit 1
     fi
-    printf '%s\n' "${MOCK_PR_URL:-}"
+    if [[ -n "${MOCK_PR_URL:-}" ]]; then
+      printf '%s\t%s\t%s\t%s\n' \
+        "${MOCK_PR_NUMBER:-123}" \
+        "$MOCK_PR_URL" \
+        "${MOCK_PR_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+        "${MOCK_PR_BRANCH:-update-trans-v0.1.1}"
+    fi
+    ;;
+  "pr checks")
+    case "${MOCK_CHECKS_MODE:-pass}" in
+      pass)
+        printf '%s\n' '[{"name":"test-bot-macos (macos-15-intel)","bucket":"pass","state":"SUCCESS"},{"name":"test-bot-macos (macos-26)","bucket":"pass","state":"SUCCESS"},{"name":"test-bot-linux","bucket":"pass","state":"SUCCESS"}]'
+        ;;
+      fail)
+        printf '%s\n' '[{"name":"test-bot-macos (macos-15-intel)","bucket":"pass","state":"SUCCESS"},{"name":"test-bot-macos (macos-26)","bucket":"fail","state":"FAILURE"},{"name":"test-bot-linux","bucket":"pass","state":"SUCCESS"}]'
+        exit 1
+        ;;
+      pending-then-pass)
+        state_file="${MOCK_GH_STATE_FILE:?MOCK_GH_STATE_FILE is required}"
+        if [[ ! -f "$state_file" ]]; then
+          : >"$state_file"
+          printf '%s\n' '[{"name":"test-bot-macos (macos-15-intel)","bucket":"pass","state":"SUCCESS"},{"name":"test-bot-macos (macos-26)","bucket":"pending","state":"IN_PROGRESS"},{"name":"test-bot-linux","bucket":"pass","state":"SUCCESS"}]'
+          exit 8
+        fi
+        printf '%s\n' '[{"name":"test-bot-macos (macos-15-intel)","bucket":"pass","state":"SUCCESS"},{"name":"test-bot-macos (macos-26)","bucket":"pass","state":"SUCCESS"},{"name":"test-bot-linux","bucket":"pass","state":"SUCCESS"}]'
+        ;;
+      *)
+        echo "unexpected MOCK_CHECKS_MODE: $MOCK_CHECKS_MODE" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  "pr view")
+    printf '%s\t%s\t%s\t%s\n' \
+      "${MOCK_PR_STATE:-OPEN}" \
+      "${MOCK_CURRENT_PR_SHA:-${MOCK_PR_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}" \
+      "${MOCK_PR_BRANCH:-update-trans-v0.1.1}" \
+      "${MOCK_PR_REPOSITORY:-mbuvarp/homebrew-trans}"
+    ;;
+  "api user")
+    echo "mbuvarp"
+    ;;
+  "run list")
+    if [[ " $* " == *" --json databaseId "* ]]; then
+      echo "111111111"
+    else
+      printf '%s\t%s\n' "111111111" "https://github.com/mbuvarp/homebrew-trans/actions/runs/111111111"
+      if [[ -n "${MOCK_DISPATCH_MARKER:-}" \
+        && -f "$MOCK_DISPATCH_MARKER" \
+        && "${MOCK_RUN_LOOKUP_MODE:-found}" == "found" ]]; then
+        printf '%s\t%s\n' "987654321" "https://github.com/mbuvarp/homebrew-trans/actions/runs/987654321"
+      fi
+    fi
+    ;;
+  "workflow run")
+    if [[ -n "${MOCK_DISPATCH_MARKER:-}" ]]; then
+      : >"$MOCK_DISPATCH_MARKER"
+    fi
+    if [[ "${MOCK_WORKFLOW_URL:-return}" == "return" ]]; then
+      echo "https://github.com/mbuvarp/homebrew-trans/actions/runs/987654321"
+    fi
+    ;;
+  "run watch")
+    if [[ "${MOCK_PUBLISH_RESULT:-success}" == "failure" ]]; then
+      echo "mock brew pr-pull failure" >&2
+      exit 1
+    fi
+    echo "mock brew pr-pull success"
     ;;
   *)
     echo "unexpected gh invocation: $*" >&2
@@ -244,6 +315,8 @@ test_release_hides_noise_and_prints_pr() {
   assert_contains "$output" "ok  Find Homebrew update PR"
   assert_contains "$output" "Release: https://github.com/example/trans/releases/tag/v0.1.1"
   assert_contains "$output" "Homebrew PR: $pr_url"
+  assert_contains "$output" "Wait for bottle checks and publish with brew pr-pull? [y/N]"
+  assert_contains "$output" "--  Leave Homebrew bottle publishing for manual completion"
   assert_contains "$output" "Do not merge the Homebrew PR directly."
   assert_contains "$output" "After all bottle checks pass, run the brew pr-pull workflow:"
   assert_contains "$output" "https://github.com/mbuvarp/homebrew-trans/actions/workflows/publish.yml"
@@ -259,6 +332,143 @@ test_release_hides_noise_and_prints_pr() {
   git -C "$fixture" rev-parse --verify refs/tags/v0.1.1 >/dev/null || fail "release tag was not created"
 }
 
+test_automated_homebrew_publish_waits_and_dispatches() {
+  local fixture
+  fixture="$(create_fixture automated-publish)"
+  local pr_url="https://github.com/mbuvarp/homebrew-trans/pull/123"
+  local gh_log="$fixture/gh.log"
+  local gh_state="$fixture/gh-state"
+  local output
+  output="$(
+    cd "$fixture"
+    printf 'y\n' | env \
+      MOCK_PR_URL="$pr_url" \
+      MOCK_CHECKS_MODE=pending-then-pass \
+      MOCK_GH_STATE_FILE="$gh_state" \
+      MOCK_GH_LOG="$gh_log" \
+      HOMEBREW_CHECK_POLL_SECONDS=1 \
+      PATH="$fixture/mock-bin:$PATH" \
+      ./release.sh v0.1.1 --notes "Notes" 2>&1
+  )"
+
+  assert_contains "$output" "ok  Wait for Homebrew bottle checks"
+  assert_contains "$output" "ok  Verify reviewed Homebrew PR head"
+  assert_contains "$output" "ok  Start brew pr-pull workflow"
+  assert_contains "$output" "ok  Wait for brew pr-pull workflow"
+  assert_contains "$output" "Published with brew pr-pull: https://github.com/mbuvarp/homebrew-trans/actions/runs/987654321"
+  grep -q "workflow run publish.yml --repo mbuvarp/homebrew-trans --ref main --raw-field pull_request=123 --raw-field head_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$gh_log" \
+    || fail "brew pr-pull workflow was not dispatched with the reviewed PR head"
+  grep -q "run watch 987654321 --repo mbuvarp/homebrew-trans --exit-status --compact --interval 1" "$gh_log" \
+    || fail "brew pr-pull workflow was not watched"
+}
+
+test_missing_dispatch_url_finds_and_watches_new_run() {
+  local fixture
+  fixture="$(create_fixture dispatch-url-fallback)"
+  local gh_log="$fixture/gh.log"
+  local dispatch_marker="$fixture/dispatched"
+  local output
+  output="$(
+    cd "$fixture"
+    printf 'y\n' | env \
+      MOCK_PR_URL="https://github.com/mbuvarp/homebrew-trans/pull/123" \
+      MOCK_WORKFLOW_URL=omit \
+      MOCK_DISPATCH_MARKER="$dispatch_marker" \
+      MOCK_GH_LOG="$gh_log" \
+      PATH="$fixture/mock-bin:$PATH" \
+      ./release.sh v0.1.1 --notes "Notes" 2>&1
+  )"
+
+  assert_contains "$output" "ok  Start brew pr-pull workflow"
+  assert_contains "$output" "ok  Wait for brew pr-pull workflow"
+  assert_contains "$output" "Published with brew pr-pull: https://github.com/mbuvarp/homebrew-trans/actions/runs/987654321"
+  grep -q "run watch 987654321" "$gh_log" \
+    || fail "fallback publish run was not watched"
+  if [[ "$(grep -c '^workflow run ' "$gh_log")" -ne 1 ]]; then
+    fail "fallback dispatched the brew pr-pull workflow more than once"
+  fi
+}
+
+test_unresolved_dispatch_url_reports_started_workflow() {
+  local fixture
+  fixture="$(create_fixture dispatch-url-unresolved)"
+  local gh_log="$fixture/gh.log"
+  local dispatch_marker="$fixture/dispatched"
+  local output
+  output="$(
+    cd "$fixture"
+    printf 'y\n' | env \
+      MOCK_PR_URL="https://github.com/mbuvarp/homebrew-trans/pull/123" \
+      MOCK_WORKFLOW_URL=omit \
+      MOCK_DISPATCH_MARKER="$dispatch_marker" \
+      MOCK_RUN_LOOKUP_MODE=missing \
+      MOCK_GH_LOG="$gh_log" \
+      HOMEBREW_RUN_LOOKUP_WAIT_SECONDS=0 \
+      PATH="$fixture/mock-bin:$PATH" \
+      ./release.sh v0.1.1 --notes "Notes" 2>&1
+  )"
+
+  assert_contains "$output" "ok  Start brew pr-pull workflow"
+  assert_contains "$output" "--  brew pr-pull started; run URL is not available"
+  assert_contains "$output" "The brew pr-pull workflow was dispatched, but its run URL is unavailable."
+  assert_contains "$output" "Check its status at https://github.com/mbuvarp/homebrew-trans/actions/workflows/publish.yml"
+  assert_not_contains "$output" "After all bottle checks pass, run the brew pr-pull workflow:"
+  if grep -q "run watch" "$gh_log"; then
+    fail "release attempted to watch an unidentified workflow run"
+  fi
+  if [[ "$(grep -c '^workflow run ' "$gh_log")" -ne 1 ]]; then
+    fail "missing run URL caused a duplicate brew pr-pull dispatch"
+  fi
+}
+
+test_failed_homebrew_check_prevents_publish() {
+  local fixture
+  fixture="$(create_fixture failed-check)"
+  local gh_log="$fixture/gh.log"
+  local output
+  if output="$(
+    cd "$fixture"
+    printf 'y\n' | env \
+      MOCK_PR_URL="https://github.com/mbuvarp/homebrew-trans/pull/123" \
+      MOCK_CHECKS_MODE=fail \
+      MOCK_GH_LOG="$gh_log" \
+      PATH="$fixture/mock-bin:$PATH" \
+      ./release.sh v0.1.1 --notes "Notes" 2>&1
+  )"; then
+    fail "release published Homebrew bottles after a failed check"
+  fi
+
+  assert_contains "$output" "failed  Wait for Homebrew bottle checks"
+  assert_contains "$output" "Homebrew checks did not succeed: test-bot-macos (macos-26)"
+  if grep -q "workflow run" "$gh_log"; then
+    fail "brew pr-pull workflow was dispatched after a failed check"
+  fi
+}
+
+test_changed_homebrew_head_prevents_publish() {
+  local fixture
+  fixture="$(create_fixture changed-head)"
+  local gh_log="$fixture/gh.log"
+  local output
+  if output="$(
+    cd "$fixture"
+    printf 'y\n' | env \
+      MOCK_PR_URL="https://github.com/mbuvarp/homebrew-trans/pull/123" \
+      MOCK_CURRENT_PR_SHA="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
+      MOCK_GH_LOG="$gh_log" \
+      PATH="$fixture/mock-bin:$PATH" \
+      ./release.sh v0.1.1 --notes "Notes" 2>&1
+  )"; then
+    fail "release published Homebrew bottles after the PR head changed"
+  fi
+
+  assert_contains "$output" "failed  Verify reviewed Homebrew PR head"
+  assert_contains "$output" "changed head SHA while checks were running"
+  if grep -q "workflow run" "$gh_log"; then
+    fail "brew pr-pull workflow was dispatched after the PR head changed"
+  fi
+}
+
 test_missing_pr_is_non_fatal() {
   local fixture
   fixture="$(create_fixture missing-pr)"
@@ -272,6 +482,7 @@ test_missing_pr_is_non_fatal() {
   assert_contains "$output" "--  Homebrew PR is not available yet"
   assert_contains "$output" "Homebrew PR: not available yet"
   assert_contains "$output" "Release v0.1.1 created."
+  assert_not_contains "$output" "Wait for bottle checks and publish with brew pr-pull?"
 }
 
 test_dry_run_progress
@@ -281,6 +492,11 @@ test_non_main_branch_is_rejected
 test_remote_tag_is_rejected_before_main_push
 test_atomic_push_rejection_keeps_remote_unchanged
 test_release_hides_noise_and_prints_pr
+test_automated_homebrew_publish_waits_and_dispatches
+test_missing_dispatch_url_finds_and_watches_new_run
+test_unresolved_dispatch_url_reports_started_workflow
+test_failed_homebrew_check_prevents_publish
+test_changed_homebrew_head_prevents_publish
 test_missing_pr_is_non_fatal
 
 echo "release script tests passed"
