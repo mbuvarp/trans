@@ -305,6 +305,21 @@ validate_release_state() {
     echo "Tag $version already exists." >&2
     return 1
   fi
+
+  local remote_tag_status=0
+  git ls-remote --exit-code --tags origin "refs/tags/${version}" >/dev/null 2>&1 \
+    || remote_tag_status=$?
+  case "$remote_tag_status" in
+    0)
+      echo "Tag $version already exists on origin." >&2
+      return 1
+      ;;
+    2) ;;
+    *)
+      echo "Could not check whether tag $version exists on origin." >&2
+      return "$remote_tag_status"
+      ;;
+  esac
 }
 
 run_step "Resolve release version" resolve_release_version

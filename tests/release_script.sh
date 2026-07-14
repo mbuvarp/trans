@@ -172,6 +172,30 @@ test_non_main_branch_is_rejected() {
   fi
 }
 
+test_remote_tag_is_rejected_before_main_push() {
+  local fixture
+  fixture="$(create_fixture remote-tag)"
+  git -C "$fixture" tag v0.1.1
+  git -C "$fixture" push --quiet origin refs/tags/v0.1.1
+  git -C "$fixture" tag --delete v0.1.1 >/dev/null
+
+  local output
+  if output="$(
+    cd "$fixture"
+    PATH="$fixture/mock-bin:$PATH" ./release.sh v0.1.1 --notes "Notes" 2>&1
+  )"; then
+    fail "release with an existing remote tag unexpectedly succeeded"
+  fi
+
+  assert_contains "$output" "failed  Validate release state"
+  assert_contains "$output" "Tag v0.1.1 already exists on origin."
+  grep -q 'version = "0.1.0"' "$fixture/Cargo.toml" \
+    || fail "remote-tag rejection changed the Cargo version"
+  if git --git-dir="$tmp_dir/remote-tag.git" show-ref --verify refs/heads/main >/dev/null 2>&1; then
+    fail "remote-tag rejection pushed the main branch"
+  fi
+}
+
 test_release_hides_noise_and_prints_pr() {
   local fixture
   fixture="$(create_fixture success)"
@@ -221,6 +245,7 @@ test_dry_run_progress
 test_failure_shows_captured_output
 test_failed_version_bump_stops_release
 test_non_main_branch_is_rejected
+test_remote_tag_is_rejected_before_main_push
 test_release_hides_noise_and_prints_pr
 test_missing_pr_is_non_fatal
 
